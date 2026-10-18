@@ -36,7 +36,7 @@ def kill_other_instances():
     pass
 
 
-kill_other_instances()
+#kill_other_instances()
 
 # --- НАСТРОЙКИ И КЛЮЧИ ---
 TOKEN = '8458915232:AAHyS1jj_Oq6vy1_ILK73Rzxllfd0UiRVTA'
