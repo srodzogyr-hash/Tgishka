@@ -47,6 +47,7 @@ CONFIG = {
     'blacklist': {}
 }
 LAST_OWNER_ACTIVITY = {}
+LAST_REQUEST_TIME = {} # Кулдаун на 5 секунд
 CHAT_MEMORY = {}
 BOT_BUSINESS_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
@@ -79,6 +80,13 @@ def save_config():
 
 init_firebase()
 
+def check_cooldown(chat_id):
+    now = time.time()
+    if now - LAST_REQUEST_TIME.get(chat_id, 0) < 5:
+        return False
+    LAST_REQUEST_TIME[chat_id] = now
+    return True
+
 # --- МАРШРУТИЗАТОР ИИ ---
 def ask_ai(chat_id, prompt, image_list=None):
     if ACTIVE_MODEL.startswith('groq/'):
@@ -92,8 +100,6 @@ def get_gemini_headers():
 
 def fetch_all_models():
     all_models = []
-    
-    # 1. Загрузка моделей Gemini
     url = f"{GEMINI_API_BASE}/models"
     try:
         r = session.get(url, headers=get_gemini_headers(), timeout=10)
@@ -104,7 +110,6 @@ def fetch_all_models():
     except Exception as e:
         print(f"Ошибка получения моделей Gemini: {e}")
 
-    # 2. Загрузка моделей Groq
     if GROQ_API_KEY:
         url = f"{GROQ_API_BASE}/models"
         try:
@@ -118,7 +123,6 @@ def fetch_all_models():
 
     if not all_models:
         return MODEL_HIERARCHY
-
     return sorted(list(set(all_models)))
 
 def ask_gemini(chat_id, prompt, image_list=None):
@@ -129,7 +133,6 @@ def ask_gemini(chat_id, prompt, image_list=None):
         print(f"♻️ Квота восстановлена. Возврат к {ACTIVE_MODEL}")
 
     history = CHAT_MEMORY.get(chat_id, []).copy()
-    
     contents = []
     for msg in history:
         role = 'user' if msg['role'] == 'user' else 'model'
@@ -175,9 +178,7 @@ def ask_gemini(chat_id, prompt, image_list=None):
                 return None, "Модель заблокировала ответ (Safety Filter).", model, 0
                 
             reply_text = data['candidates'][0]['content']['parts'][0]['text']
-            
-            if model in MODEL_HIERARCHY:
-                ACTIVE_MODEL = model
+            if model in MODEL_HIERARCHY: ACTIVE_MODEL = model
                 
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": reply_text})
@@ -186,10 +187,8 @@ def ask_gemini(chat_id, prompt, image_list=None):
                 
             CHAT_MEMORY[chat_id] = history
             return reply_text, None, model, len(history)
-            
         except Exception as e:
             return None, f"Сетевая ошибка: {str(e)}", model, 0
-            
     return None, "Все доступные модели исчерпали лимиты. Попробуйте позже.", ACTIVE_MODEL, 0
 
 # --- GROQ API ---
@@ -198,7 +197,6 @@ def ask_groq(chat_id, prompt, image_list=None):
         return "я не вижу картинки братан выбери другую модель", None, ACTIVE_MODEL, len(CHAT_MEMORY.get(chat_id, []))
         
     history = CHAT_MEMORY.get(chat_id, []).copy()
-    
     system_prompt = (
         "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
         "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
@@ -208,21 +206,11 @@ def ask_groq(chat_id, prompt, image_list=None):
     messages_payload = [{"role": "system", "content": system_prompt}]
     for msg in history:
         messages_payload.append({"role": msg["role"], "content": msg["content"]})
-        
     messages_payload.append({"role": "user", "content": prompt})
     
-    # Получаем чистое имя модели без префикса 'groq/'
     model_id = ACTIVE_MODEL.replace('groq/', '')
-    
-    headers = {
-        'Authorization': f'Bearer {GROQ_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    payload = {
-        'model': model_id,
-        'messages': messages_payload,
-        'temperature': 0.9
-    }
+    headers = {'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'}
+    payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.9}
     
     try:
         r = session.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=60)
@@ -246,7 +234,6 @@ def ask_groq(chat_id, prompt, image_list=None):
 def generate_image(prompt):
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
     url = f"{GEMINI_API_BASE}/models/{model}:predict" if 'imagen' in model else f"{GEMINI_API_BASE}/models/{model}:generateContent"
-    
     payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
               {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
 
@@ -345,6 +332,10 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🧹 Память очищена.\ncontext: 0/{CONFIG.get('context_limit', 100)}")
         return
     if text.startswith('гпт '):
+        if not check_cooldown(chat_id):
+            bot.reply_to(message, "жди пока первый запрос загрузится нищук")
+            return
+            
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event)).start()
@@ -397,6 +388,12 @@ def process_business_album(media_group_id):
             trigger = True
             
     if not trigger: return
+    
+    if not check_cooldown(chat_id):
+        msg = bot.send_message(chat_id, "жди пока первый запрос загрузится нищук", business_connection_id=base_msg.business_connection_id)
+        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        return
+
     if is_owner: LAST_OWNER_ACTIVITY[chat_id] = time.time()
     if is_gpt: text = text[4:].strip()
     if not text: text = "Опиши подробно, что на этих фотографиях."
@@ -460,6 +457,12 @@ def handle_business_message(message):
             if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600: trigger = True
 
     if not trigger: return
+
+    if not check_cooldown(chat_id):
+        msg = bot.send_message(chat_id, "жди пока первый запрос загрузится нищук", business_connection_id=message.business_connection_id)
+        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        return
+
     if is_gpt: text = text[4:].strip()
 
     if is_draw:
@@ -506,5 +509,5 @@ def handle_business_message(message):
 try: bot.delete_webhook(drop_pending_updates=True) 
 except Exception: pass
 
-print('⚡ БОТ (GEMINI + GROQ ALL MODELS) ЗАПУЩЕН!')
+print('⚡ БОТ (GEMINI + GROQ + 5s CD) ЗАПУЩЕН!')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
