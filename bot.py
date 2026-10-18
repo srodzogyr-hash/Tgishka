@@ -136,15 +136,10 @@ def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
 def generate_image(prompt):
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
     
-    # Разные модели используют разные эндпоинты
     if 'imagen' in model:
         url = f"{GEMINI_API_BASE}/models/{model}:predict?key={GEMINI_KEY}"
-        payload = {
-            "instances": [{"prompt": prompt}],
-            "parameters": {"sampleCount": 1}
-        }
+        payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}}
     else:
-        # Для моделей типа gemini-2.5-flash-image
         url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -157,12 +152,9 @@ def generate_image(prompt):
             return None, f"HTTP {r.status_code}\n{r.text[:300]}"
             
         data = r.json()
-        
-        # Парсинг ответа в зависимости от модели
         if 'imagen' in model:
             if 'predictions' in data and data['predictions']:
-                img_b64 = data['predictions'][0]['bytesBase64Encoded']
-                return base64.b64decode(img_b64), None
+                return base64.b64decode(data['predictions'][0]['bytesBase64Encoded']), None
         else:
             if 'candidates' in data and data['candidates']:
                 for part in data['candidates'][0]['content']['parts']:
@@ -209,12 +201,11 @@ def handle_admin_text(message):
             f"<code>сброс</code> — очистить память (сейчас {ctx_now}/{limit})\n"
             f"<code>гпт [текст]</code> — вызов ИИ\n"
             f"<code>нарисуй [текст]</code> — сгенерировать фото\n"
-            f"<i>Можно просто отправить фото, чтобы ИИ его описал.</i>"
+            f"<i>Для анализа фото: отправь его с подписью</i> <code>гпт опиши</code>"
         )
         bot.reply_to(message, help_text)
         return
 
-    # Выбор текстовой модели
     if lower_text == 'модели':
         models = fetch_gemini_models()
         kb = InlineKeyboardMarkup(row_width=1)
@@ -224,7 +215,6 @@ def handle_admin_text(message):
         bot.reply_to(message, f"Текстовые модели (всего {len(models)}):", reply_markup=kb)
         return
 
-    # Выбор модели для рисования
     if lower_text in ['фото-модели', 'фото модели']:
         image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
         kb = InlineKeyboardMarkup(row_width=1)
@@ -272,6 +262,18 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🧹 Память очищена.\ncontext: 0/{limit}")
         return
 
+    is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot.get_me().id
+    is_gpt = lower_text.startswith('гпт ') or lower_text.startswith('алл ')
+    is_draw = lower_text.startswith('нарисуй ')
+    
+    # Защита от реагирования на всё подряд в ЛС
+    if message.content_type == 'photo' and not is_gpt and not is_reply_to_bot:
+        bot.reply_to(message, "⚠️ Чтобы ИИ посмотрел фото, отправь его с подписью <code>гпт опиши</code> или свайпни на сообщение бота.")
+        return
+        
+    if message.content_type == 'text' and not (is_gpt or is_draw or is_reply_to_bot):
+        return
+
     # --- ОБРАБОТКА ФОТО В ЛС ---
     if message.content_type == 'photo':
         loading_msg = bot.reply_to(message, "🕐 Смотрю фото...")
@@ -282,10 +284,8 @@ def handle_admin_text(message):
         try:
             file_info = bot.get_file(message.photo[-1].file_id)
             img_bytes = bot.download_file(file_info.file_path)
-            mime = 'image/jpeg'
-            
-            prompt = message.caption if message.caption else "Опиши, что на этом фото."
-            reply, err, ctx_len = ask_gemini(chat_id, prompt, img_bytes, mime)
+            prompt = text.replace('гпт ', '').replace('алл ', '').strip() if is_gpt else (message.caption or "Опиши, что на этом фото.")
+            reply, err, ctx_len = ask_gemini(chat_id, prompt, img_bytes, 'image/jpeg')
         except Exception as e:
             reply, err, ctx_len = None, str(e), 0
             
@@ -294,14 +294,13 @@ def handle_admin_text(message):
         
         limit = CONFIG.get('context_limit', 100)
         if reply:
-            final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
-            bot.edit_message_text(final_text, message.chat.id, loading_msg.message_id)
+            bot.edit_message_text(f"{reply}\n\ncontext: {ctx_len}/{limit}", message.chat.id, loading_msg.message_id)
         else:
             bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
     # --- ГЕНЕРАЦИЯ КАРТИНКИ В ЛС ---
-    if lower_text.startswith('нарисуй '):
+    if is_draw:
         prompt = text[8:]
         loading_msg = bot.reply_to(message, "🕐 Рисую...")
         stop_event = threading.Event()
@@ -323,8 +322,8 @@ def handle_admin_text(message):
         return
 
     # --- ТЕКСТОВЫЙ ЗАПРОС В ЛС ---
-    if lower_text.startswith('гпт ') or lower_text.startswith('алл '):
-        prompt = text[4:].strip()
+    if is_gpt or is_reply_to_bot:
+        prompt = text[4:].strip() if is_gpt else text
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
         anim = threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event))
@@ -337,8 +336,7 @@ def handle_admin_text(message):
         
         limit = CONFIG.get('context_limit', 100)
         if reply:
-            final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
-            bot.edit_message_text(final_text, message.chat.id, loading_msg.message_id)
+            bot.edit_message_text(f"{reply}\n\ncontext: {ctx_len}/{limit}", message.chat.id, loading_msg.message_id)
         else:
             bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
@@ -371,23 +369,35 @@ def handle_business_message(message):
     
     is_owner = (message.from_user.username or '').lower() == CREATOR_USERNAME
     is_gpt = lower_text.startswith('гпт ')
-    is_reply = bool(message.reply_to_message)
+    is_draw = lower_text.startswith('нарисуй ')
+    
+    # ИСПРАВЛЕНИЕ: Проверяем, что реплай именно на сообщение БОТА
+    is_reply_to_bot = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        is_reply_to_bot = (message.reply_to_message.from_user.id == bot.get_me().id)
     
     user_uname = (message.from_user.username or '').lower()
     if not is_owner and user_uname in CONFIG.get('blacklist', {}):
         return
 
+    trigger = False
+    if is_gpt or is_draw or is_reply_to_bot:
+        trigger = True
+    elif is_owner:
+        pass # Владелец должен использовать триггеры
+    else:
+        # Автоответ для собеседников (только для текста!)
+        if message.content_type == 'text' and CONFIG['auto_reply_enabled']:
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
+                trigger = True
+                
+    # Если ни одно условие не сработало — просто игнорируем
+    if not trigger:
+        return
+
     if is_owner:
         CREATOR_ID = message.from_user.id
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
-        if not (is_gpt or is_reply or lower_text.startswith('нарисуй ') or message.content_type == 'photo'):
-            return
-    else:
-        if not (is_gpt or is_reply or lower_text.startswith('нарисуй ') or message.content_type == 'photo'):
-            if not CONFIG['auto_reply_enabled']:
-                return
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) < 600:
-                return
 
     if is_gpt:
         text = text[4:].strip() 
@@ -395,15 +405,11 @@ def handle_business_message(message):
     if text.lower() in ['сброс', '/reset']:
         CHAT_MEMORY[chat_id] = []
         limit = CONFIG.get('context_limit', 100)
-        bot.send_message(
-            chat_id, 
-            f"Память очищена.\ncontext: 0/{limit}", 
-            business_connection_id=message.business_connection_id
-        )
+        bot.send_message(chat_id, f"Память очищена.\ncontext: 0/{limit}", business_connection_id=message.business_connection_id)
         return
 
     # --- ГЕНЕРАЦИЯ В БИЗНЕС-ЧАТЕ ---
-    if text.lower().startswith('нарисуй '):
+    if is_draw:
         loading_msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         stop_event = threading.Event()
         anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id, "Рисую..."))
@@ -419,7 +425,7 @@ def handle_business_message(message):
                 bot.send_photo(chat_id, img, business_connection_id=message.business_connection_id)
             except Exception: pass
         else:
-            bot.edit_message_text(f"⚠️ Ошибка генерации:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+            bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
         return
         
     # --- ТЕКСТ ИЛИ ПРОСМОТР ФОТО В БИЗНЕС-ЧАТЕ ---
