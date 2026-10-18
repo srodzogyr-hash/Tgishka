@@ -22,7 +22,7 @@ FIREBASE_URL = os.environ.get('FIREBASE_URL')
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
 
-DEFAULT_MODEL = 'gemini-3.8-flash' 
+DEFAULT_MODEL = 'gemini-3.8-flash'
 DEFAULT_CONTEXT_LIMIT = 100
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 
@@ -87,8 +87,6 @@ def fetch_gemini_models():
                 if 'generateContent' in m.get('supportedGenerationMethods', []):
                     models.append(m['name'].replace('models/', ''))
             return models
-        else:
-            print(f"ListModels error: {r.text[:200]}")
     except Exception as e:
         print(f"Ошибка получения моделей: {e}")
     return [DEFAULT_MODEL]
@@ -114,21 +112,25 @@ def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
     try:
         r = session.post(url, json=payload, timeout=40)
         if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: {r.text[:200]}"
+            return None, f"HTTP {r.status_code}: {r.text[:200]}", 0
         
         data = r.json()
         if 'candidates' not in data or not data['candidates']:
-            return None, "Модель заблокировала ответ (Safety Filter)."
+            return None, "Модель заблокировала ответ (Safety Filter).", 0
             
         reply_text = data['candidates'][0]['content']['parts'][0]['text']
         
         contents.append({"role": "model", "parts": [{"text": reply_text}]})
-        limit = CONFIG.get('context_limit', 100)
-        CHAT_MEMORY[chat_id] = contents[-limit:] if len(contents) > limit else contents
         
-        return reply_text, None
+        # Логика контекстного окна
+        limit = CONFIG.get('context_limit', 100)
+        if len(contents) > limit:
+            contents = contents[-limit:]  # Оставляем только последние N сообщений
+            
+        CHAT_MEMORY[chat_id] = contents
+        return reply_text, None, len(contents)
     except Exception as e:
-        return None, str(e)
+        return None, str(e), 0
 
 def generate_image(prompt):
     model = 'gemini-2.5-flash-image'
@@ -149,23 +151,42 @@ def generate_image(prompt):
     except Exception as e:
         return None, str(e)
 
-# --- ПАНЕЛЬ УПРАВЛЕНИЯ ---
+# --- ПАНЕЛЬ УПРАВЛЕНИЯ (В ЛС) ---
 @bot.message_handler(commands=['start', 'panel'])
 def send_panel(message):
-    if not (message.from_user.username or '').lower() == CREATOR_USERNAME: return
+    if (message.from_user.username or '').lower() != CREATOR_USERNAME: return
     
     status = "🟢 ВКЛ" if CONFIG['auto_reply_enabled'] else "🔴 ВЫКЛ"
+    limit = CONFIG.get('context_limit', 100)
     text = (f"👑 <b>Панель управления</b>\n\n"
             f"Автоответчик: {status}\n"
             f"Модель: <code>{CONFIG['active_model']}</code>\n"
-            f"Контекст: {CONFIG['context_limit']} соо\n\n"
-            f"Для теста напиши в этот чат: <code>гпт привет</code>")
+            f"Лимит контекста: {limit} соо\n\n"
+            f"Напиши <code>команды</code> для списка всех функций.")
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['text'])
 def handle_admin_text(message):
     text = message.text.lower().strip()
+    chat_id = message.chat.id
     
+    if text in ['команды', '/help']:
+        limit = CONFIG.get('context_limit', 100)
+        ctx_now = len(CHAT_MEMORY.get(chat_id, []))
+        status = "ВКЛ" if CONFIG['auto_reply_enabled'] else "ВЫКЛ"
+        help_text = (
+            f"📜 <b>Список команд:</b>\n\n"
+            f"<code>модели</code> — список доступных моделей\n"
+            f"<code>автоответчик вкл/выкл</code> — автоответ для чужих (сейчас {status})\n"
+            f"<code>контекст [число]</code> — изменить лимит (сейчас {limit})\n"
+            f"<code>запретить @юзер</code> — бан в автоответчике\n"
+            f"<code>разрешить @юзер</code> — разбан\n"
+            f"<code>сброс</code> — очистить память (сейчас {ctx_now}/{limit})\n"
+            f"<code>гпт [текст]</code> — прямой вызов ИИ (работает и в ЛС, и в бизнес-чатах)"
+        )
+        bot.reply_to(message, help_text)
+        return
+
     if text == 'модели':
         models = fetch_gemini_models()
         kb = InlineKeyboardMarkup(row_width=1)
@@ -207,6 +228,12 @@ def handle_admin_text(message):
             bot.reply_to(message, f"✅ @{uname} разблокирован.")
         return
 
+    if text in ['сброс', 'гпт сброс']:
+        CHAT_MEMORY[chat_id] = []
+        limit = CONFIG.get('context_limit', 100)
+        bot.reply_to(message, f"🧹 Память очищена!\n\n🧠 Контекст: 0/{limit}")
+        return
+
     # --- ТЕСТОВЫЙ РЕЖИМ В ЛИЧКЕ БОТА ---
     if text.startswith('гпт '):
         prompt = message.text[4:].strip()
@@ -215,20 +242,22 @@ def handle_admin_text(message):
         anim = threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event))
         anim.start()
         
-        reply, err = ask_gemini(message.chat.id, prompt)
+        reply, err, ctx_len = ask_gemini(chat_id, prompt)
         
         stop_event.set()
         anim.join()
         
+        limit = CONFIG.get('context_limit', 100)
         if reply:
-            bot.edit_message_text(reply, message.chat.id, loading_msg.message_id)
+            final_text = f"{reply}\n\n🧠 Контекст: {ctx_len}/{limit}"
+            bot.edit_message_text(final_text, message.chat.id, loading_msg.message_id)
         else:
             bot.edit_message_text(f"⚠️ Ошибка API:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setmodel_'))
 def callback_set_model(call):
-    if not (call.from_user.username or '').lower() == CREATOR_USERNAME: return
+    if (call.from_user.username or '').lower() != CREATOR_USERNAME: return
     model = call.data.replace('setmodel_', '')
     CONFIG['active_model'] = model
     save_config()
@@ -239,31 +268,57 @@ def callback_set_model(call):
 def handle_business_message(message):
     global CREATOR_ID
     if not message.from_user: return
+    if message.from_user.id == bot.get_me().id: return # Игнорим себя
     
-    if (message.from_user.username or '').lower() == CREATOR_USERNAME:
-        CREATOR_ID = message.from_user.id
-        LAST_OWNER_ACTIVITY[message.chat.id] = time.time()
-        return
-        
-    if (message.from_user.username or '').lower() in CONFIG['blacklist']:
-        return
-        
+    chat_id = message.chat.id
     text = message.text or ""
-    is_gpt = text.lower().startswith('гпт ')
+    lower_text = text.lower()
     
-    if not CONFIG['auto_reply_enabled'] and not is_gpt:
-        return
+    is_owner = (message.from_user.username or '').lower() == CREATOR_USERNAME
+    is_gpt = lower_text.startswith('гпт ')
+    
+    # Проверяем, является ли сообщение реплаем на сообщение бота
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot.get_me().id
+    
+    # --- ЛОГИКА ФИЛЬТРАЦИИ ---
+    if is_owner:
+        CREATOR_ID = message.from_user.id
+        LAST_OWNER_ACTIVITY[chat_id] = time.time()
         
-    if CONFIG['auto_reply_enabled'] and not is_gpt:
-        if time.time() - LAST_OWNER_ACTIVITY.get(message.chat.id, 0) < 600:
+        # Владелец должен писать "гпт ..." или отвечать на сообщение бота, чтобы тот ответил
+        if not (is_gpt or is_reply):
+            return
+    else:
+        # Если пишет забаненный
+        if (message.from_user.username or '').lower() in CONFIG['blacklist']:
             return
             
-    if is_gpt: text = text[4:].strip()
-    
+        # Если это не прямой вызов и не реплай, проверяем автоответчик и таймер
+        if not (is_gpt or is_reply):
+            if not CONFIG['auto_reply_enabled']:
+                return
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) < 600: # 10 минут
+                return
+
+    if is_gpt:
+        text = text[4:].strip() # Убираем префикс
+
+    # --- СБРОС КОНТЕКСТА ---
+    if text.lower() in ['сброс', '/reset']:
+        CHAT_MEMORY[chat_id] = []
+        limit = CONFIG.get('context_limit', 100)
+        bot.send_message(
+            chat_id, 
+            f"🧹 Память очищена!\n\n🧠 Контекст: 0/{limit}", 
+            business_connection_id=message.business_connection_id
+        )
+        return
+
+    # --- ГЕНЕРАЦИЯ КАРТИНКИ ---
     if text.lower().startswith('нарисуй '):
-        loading_msg = bot.send_message(message.chat.id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
+        loading_msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         stop_event = threading.Event()
-        anim = threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, message.business_connection_id))
+        anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id))
         anim.start()
         
         img, err = generate_image(text[8:])
@@ -272,16 +327,17 @@ def handle_business_message(message):
         
         if img:
             try:
-                bot.delete_message(message.chat.id, loading_msg.message_id, business_connection_id=message.business_connection_id)
-                bot.send_photo(message.chat.id, img, business_connection_id=message.business_connection_id)
+                bot.delete_message(chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+                bot.send_photo(chat_id, img, business_connection_id=message.business_connection_id)
             except Exception: pass
         else:
-            bot.edit_message_text(f"⚠️ Ошибка: {err}", message.chat.id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
+            bot.edit_message_text(f"⚠️ Ошибка: {err}", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
         return
         
-    loading_msg = bot.send_message(message.chat.id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
+    # --- ТЕКСТ ИЛИ ФОТО ---
+    loading_msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
     stop_event = threading.Event()
-    anim = threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, message.business_connection_id))
+    anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id))
     anim.start()
     
     img_bytes, mime = None, None
@@ -292,23 +348,24 @@ def handle_business_message(message):
             mime = 'image/jpeg'
         except Exception: pass
         
-    reply, err = ask_gemini(message.chat.id, text, img_bytes, mime)
+    reply, err, ctx_len = ask_gemini(chat_id, text, img_bytes, mime)
     
     stop_event.set()
     anim.join()
     
+    limit = CONFIG.get('context_limit', 100)
     if reply:
+        final_text = f"{reply}\n\n🧠 Контекст: {ctx_len}/{limit}"
         try:
-            bot.edit_message_text(reply, message.chat.id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+            bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
         except Exception:
-            bot.edit_message_text(reply, message.chat.id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
+            bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
     else:
-        bot.edit_message_text(f"⚠️ Ошибка API:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+        bot.edit_message_text(f"⚠️ Ошибка API:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
 
 # --- ЗАПУСК ---
 print("--> Очистка старых сессий...")
 try:
-    # Лечит ошибку 409 при деплое на Render
     bot.delete_webhook(drop_pending_updates=True) 
 except Exception:
     pass
