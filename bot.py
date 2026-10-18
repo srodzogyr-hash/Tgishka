@@ -19,7 +19,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ ---
+# --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ (ДО 10 ШТ.) ---
 TOKEN = os.environ.get('TG_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')  # Ключ Groq
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
@@ -28,14 +28,19 @@ def load_gemini_keys():
     """Собирает все ключи Gemini из переменных окружения."""
     keys = []
     env_names = [
-        'GROQ_KEY',       # Старый ключ №1
+        'GROQ_KEY',       # Ключ №1 (старое название)
         'GEMINI_KEYS',    # Запись через запятую
         'GEMINI_KEY',
         'GEMINI_KEY_1',
         'GEMINI_KEY_2',   # Ключ №2
         'GEMINI_KEY_3',   # Ключ №3
-        'GEMINI_KEY_4',
-        'GEMINI_KEY_5'
+        'GEMINI_KEY_4',   # Ключ №4
+        'GEMINI_KEY_5',   # Ключ №5
+        'GEMINI_KEY_6',
+        'GEMINI_KEY_7',
+        'GEMINI_KEY_8',
+        'GEMINI_KEY_9',
+        'GEMINI_KEY_10'
     ]
     for name in env_names:
         val = os.environ.get(name, '')
@@ -48,6 +53,7 @@ def load_gemini_keys():
 GEMINI_KEYS = load_gemini_keys()
 CURRENT_KEY_INDEX = 0
 EXHAUSTED_QUOTAS = {}  # {(model, key_idx): timestamp_until_free}
+KEY_STATS = {i: {'ok': 0, '429': 0, 'err': 0} for i in range(len(GEMINI_KEYS))}
 
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
@@ -60,6 +66,8 @@ MODEL_HIERARCHY = [
 ]
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
+DEFAULT_SYSTEM_PROMPT = "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."
+
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 GROQ_API_BASE = 'https://api.groq.com/openai/v1'
 
@@ -72,17 +80,19 @@ CONFIG = {
     'voice_auto_users': {},
     'creator_id': None,
     'context_limit': DEFAULT_CONTEXT_LIMIT,
+    'afk_minutes': 10,
+    'cooldown_seconds': 5,
+    'system_prompt': DEFAULT_SYSTEM_PROMPT,
     'image_model': DEFAULT_IMAGE_MODEL,
     'blacklist': {}
 }
 
 LAST_OWNER_ACTIVITY = {}
-LAST_REQUEST_TIME = {}  # Кулдаун на 5 секунд
+LAST_REQUEST_TIME = {}
 CHAT_MEMORY = {}
 BOT_BUSINESS_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
 
-# Кэш для режима «Шпиона»: хранит последние сообщения {(chat_id, message_id): dict}
 MESSAGE_CACHE = {}
 MAX_CACHE_SIZE = 500
 
@@ -146,8 +156,18 @@ def save_chat_memory_async(chat_id, history):
             print(f"⚠️ Ошибка сохранения памяти чата {chat_id}: {e}")
     threading.Thread(target=_worker, daemon=True).start()
 
+def clear_all_memory_firebase():
+    CHAT_MEMORY.clear()
+    if not FIREBASE_URL:
+        return
+    def _worker():
+        try:
+            session.delete(f'{FIREBASE_URL}/chat_memory.json', timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
+
 def register_creator_id(user):
-    """Автоматически запоминает ID владельца для пересылки удаленных сообщений."""
     global CREATOR_ID
     if user and (user.username or '').lower() == CREATOR_USERNAME:
         if CREATOR_ID != user.id:
@@ -158,27 +178,33 @@ def register_creator_id(user):
 init_firebase()
 
 def check_cooldown(chat_id):
+    cd = CONFIG.get('cooldown_seconds', 5)
+    if cd <= 0:
+        return True
     now = time.time()
-    if now - LAST_REQUEST_TIME.get(chat_id, 0) < 5:
+    if now - LAST_REQUEST_TIME.get(chat_id, 0) < cd:
         return False
     LAST_REQUEST_TIME[chat_id] = now
     return True
 
-def safe_edit_message(text, chat_id, message_id, business_id=None):
-    """Безопасное редактирование сообщения с защитой от ошибок HTML-разметки и лимита длины."""
+def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=None):
     if len(text) > 4050:
         text = text[:4050] + "..."
     try:
-        bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id)
+        bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, reply_markup=reply_markup)
     except Exception:
         try:
-            bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, parse_mode=None)
+            bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, parse_mode=None, reply_markup=reply_markup)
         except Exception:
             pass
 
+def mask_key(key_str):
+    if len(key_str) <= 10:
+        return "***"
+    return f"{key_str[:6]}...{key_str[-4:]}"
+
 # --- КЭШИРОВАНИЕ И РЕЖИМ «ШПИОНА» ---
 def cache_incoming_message(message, is_owner):
-    """Сохраняет сообщение и его медиа в кэш на случай удаления или редактирования."""
     if len(MESSAGE_CACHE) >= MAX_CACHE_SIZE:
         oldest_key = next(iter(MESSAGE_CACHE))
         MESSAGE_CACHE.pop(oldest_key, None)
@@ -218,7 +244,6 @@ def cache_incoming_message(message, is_owner):
     }
     MESSAGE_CACHE[(message.chat.id, message.message_id)] = entry
 
-    # Для фото, ГС и кружочков в фоне подгружаем байты на случай, если Telegram удалит сам файл
     if file_id and c_type in ['photo', 'voice', 'video_note'] and not is_owner:
         def _download_backup():
             try:
@@ -247,7 +272,7 @@ def handle_edited_business_message(message):
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Собеседник"
     uname = f"@{user.username}" if user.username else f"id:{user.id}"
     sender_label = old_data['sender_label'] if old_data else f"{html.escape(full_name)} ({uname})"
-    old_text = old_data['text'] if old_data else "(сообщение было отправлено до запуска бота)"
+    old_text = old_data['text'] if old_data else "(сообщение до запуска бота)"
 
     if old_text == new_text:
         return
@@ -260,8 +285,8 @@ def handle_edited_business_message(message):
     )
     try:
         bot.send_message(CREATOR_ID, alert)
-    except Exception as e:
-        print(f"Ошибка отправки уведомления Шпиона: {e}")
+    except Exception:
+        pass
 
     if old_data:
         old_data['text'] = new_text
@@ -321,7 +346,6 @@ if hasattr(bot, 'deleted_business_messages_handler'):
                         elif c_type == 'video':
                             bot.send_video(CREATOR_ID, media_source, caption="🕵️‍♂️ Удаленное видео")
                     except Exception:
-                        # Если file_id перестал работать после удаления, шлем сохраненные байты
                         if file_bytes:
                             if c_type == 'photo':
                                 bot.send_photo(CREATOR_ID, file_bytes, caption="🕵️‍♂️ Удаленное фото")
@@ -329,8 +353,8 @@ if hasattr(bot, 'deleted_business_messages_handler'):
                                 bot.send_voice(CREATOR_ID, file_bytes, caption="🕵️‍♂️ Удаленное ГС")
                             elif c_type == 'video_note':
                                 bot.send_video_note(CREATOR_ID, file_bytes)
-            except Exception as e:
-                print(f"Ошибка пересылки удаленного сообщения: {e}")
+            except Exception:
+                pass
 
 # --- РАБОТА С ФАЙЛАМИ, ДОКУМЕНТАМИ, ФОТО И АУДИО ---
 def get_photo_bytes(message):
@@ -341,7 +365,6 @@ def get_photo_bytes(message):
         return None, None
 
 def get_voice_or_videonote_bytes(message):
-    """Скачивает голосовое сообщение, кружочек или аудиофайл."""
     try:
         if message.content_type == 'voice' and message.voice:
             f_info = bot.get_file(message.voice.file_id)
@@ -352,12 +375,11 @@ def get_voice_or_videonote_bytes(message):
         elif message.content_type == 'audio' and message.audio:
             f_info = bot.get_file(message.audio.file_id)
             return bot.download_file(f_info.file_path), message.audio.mime_type or 'audio/mpeg'
-    except Exception as e:
-        print(f"Ошибка скачивания аудио/кружка: {e}")
+    except Exception:
+        pass
     return None, None
 
 def extract_docx_text(file_bytes):
-    """Извлекает чистый текст из Word (.docx) без сторонних библиотек."""
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             xml_content = zf.read('word/document.xml')
@@ -373,10 +395,6 @@ def extract_docx_text(file_bytes):
         return f"[Ошибка чтения DOCX: {e}]"
 
 def extract_document_content(message):
-    """
-    Разбирает документ из сообщения.
-    Возвращает: (media_tuple_or_None, extracted_text_or_None, error_or_None)
-    """
     doc = message.document
     if not doc:
         return None, None, "Документ не найден."
@@ -392,20 +410,16 @@ def extract_document_content(message):
     fname = (doc.file_name or 'document').lower()
     mime = doc.mime_type or ''
 
-    # 1. Если это PDF — передаем напрямую в Gemini через inline_data
     if fname.endswith('.pdf') or mime == 'application/pdf':
         return (file_bytes, 'application/pdf'), None, None
 
-    # 2. Если это Word (.docx) — вытаскиваем текст
     if fname.endswith('.docx'):
         text_content = extract_docx_text(file_bytes)
         return None, f"\n\n📄 [Содержимое файла {doc.file_name}]:\n{text_content[:60000]}", None
 
-    # 3. Если это картинка, отправленная файлом
     if mime.startswith('image/'):
         return (file_bytes, mime), None, None
 
-    # 4. Текстовые файлы, код, таблицы, конспекты
     try:
         text_content = file_bytes.decode('utf-8')
     except UnicodeDecodeError:
@@ -417,7 +431,6 @@ def extract_document_content(message):
     return None, f"\n\n📄 [Содержимое файла {doc.file_name}]:\n{text_content[:60000]}", None
 
 def transcribe_with_groq_whisper(audio_bytes, mime_type):
-    """Запасная расшифровка через Groq Whisper, если выбрана модель Groq."""
     if not GROQ_API_KEY:
         return None
     ext = 'mp4' if 'mp4' in mime_type else 'ogg'
@@ -439,7 +452,7 @@ def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True):
     else:
         return ask_gemini(chat_id, prompt, media_list, save_to_memory)
 
-# --- GEMINI API С РОТАЦИЕЙ КЛЮЧЕЙ И МОДЕЛЕЙ ---
+# --- GEMINI API С РОТАЦИЕЙ И СТАТИСТИКОЙ КЛЮЧЕЙ ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
@@ -454,8 +467,8 @@ def fetch_all_models():
                 for m in r.json().get('models', []):
                     if 'generateContent' in m.get('supportedGenerationMethods', []):
                         all_models.append(m['name'].replace('models/', ''))
-        except Exception as e:
-            print(f"Ошибка получения моделей Gemini: {e}")
+        except Exception:
+            pass
 
     if GROQ_API_KEY:
         url = f"{GROQ_API_BASE}/models"
@@ -465,8 +478,8 @@ def fetch_all_models():
                 for m in r.json().get('data', []):
                     if m.get('active') is not False:
                         all_models.append(f"groq/{m['id']}")
-        except Exception as e:
-            print(f"Ошибка получения моделей Groq: {e}")
+        except Exception:
+            pass
 
     if not all_models:
         return MODEL_HIERARCHY
@@ -498,9 +511,10 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
             })
 
     contents.append({"role": "user", "parts": parts})
+    sys_instruction = CONFIG.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
     payload = {
         "contents": contents,
-        "system_instruction": {"parts": [{"text": "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."}]}
+        "system_instruction": {"parts": [{"text": sys_instruction}]}
     }
 
     if ACTIVE_MODEL in MODEL_HIERARCHY:
@@ -518,6 +532,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
         for k_offset in range(len(GEMINI_KEYS)):
             key_idx = (CURRENT_KEY_INDEX + k_offset) % len(GEMINI_KEYS)
             api_key = GEMINI_KEYS[key_idx]
+            stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0})
 
             if EXHAUSTED_QUOTAS.get((model, key_idx), 0) > now:
                 continue
@@ -526,7 +541,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                 r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=75)
 
                 if r.status_code == 429:
-                    print(f"⚠️ Лимит {model} на ключе #{key_idx + 1} исчерпан. Переключаю ключ...")
+                    stats['429'] += 1
                     EXHAUSTED_QUOTAS[(model, key_idx)] = time.time() + 900
                     last_error = f"Лимит (429) на {model}"
                     continue
@@ -536,6 +551,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                     break
 
                 if r.status_code != 200:
+                    stats['err'] += 1
                     last_error = f"HTTP {r.status_code}: Gemini API Error"
                     continue
 
@@ -544,6 +560,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                     return None, "Модель заблокировала ответ (Safety Filter).", f"{model} [key #{key_idx + 1}]", 0
 
                 reply_text = data['candidates'][0]['content']['parts'][0]['text']
+                stats['ok'] += 1
                 CURRENT_KEY_INDEX = (key_idx + 1) % len(GEMINI_KEYS)
 
                 if save_to_memory:
@@ -559,6 +576,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                 return reply_text, None, model_label, len(history)
 
             except Exception as e:
+                stats['err'] += 1
                 last_error = f"Сетевая ошибка: {str(e)}"
                 continue
 
@@ -569,7 +587,6 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
 def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
     if media_list:
         first_bytes, first_mime = media_list[0]
-        # Если в режиме Groq скинули ГС или кружок — расшифровываем через Whisper!
         if first_mime.startswith('audio/') or first_mime.startswith('video/'):
             transcribed = transcribe_with_groq_whisper(first_bytes, first_mime)
             if transcribed:
@@ -617,11 +634,11 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
     except Exception as e:
         return None, str(e), ACTIVE_MODEL, 0
 
-# --- ОБРАБОТКА ГОЛОСОВЫХ И КРУЖОЧКОВ ---
+# --- ЧИСТАЯ РАСШИФРОВКА ГОЛОСОВЫХ И КРУЖОЧКОВ ---
 def handle_voice_transcription(chat_id, target_msg, custom_instruction="", business_id=None):
-    """Скачивает ГС/кружок, отправляет в нейросеть и выводит расшифровку/ответ."""
+    """Расшифровывает ГС/кружок строго в чистый текст (без описаний и воды), если нет доп. поручений."""
     is_video_note = (target_msg.content_type == 'video_note')
-    prefix_label = "Смотрю кружок..." if is_video_note else "Слушаю ГС..."
+    prefix_label = "Слушаю кружок..." if is_video_note else "Слушаю ГС..."
 
     loading_msg = bot.send_message(chat_id, f"🕐 {prefix_label}", business_connection_id=business_id)
     if business_id:
@@ -638,24 +655,26 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
 
     if custom_instruction:
         prompt = (
-            f"Сначала напиши краткую расшифровку этого сообщения (с пометкой 🎙 Расшифровка:), "
-            f"а затем выполни запрос пользователя: {custom_instruction}"
+            f"Прослушай это сообщение и выполни запрос пользователя: «{custom_instruction}».\n"
+            f"Не описывай видеоряд или фон, работай только со смыслом сказанного."
         )
     else:
         prompt = (
-            "Расшифруй это аудио/видеосообщение в текст максимально точно. "
-            "Оформи ответ так:\n"
-            "🎙 <b>Расшифровка:</b>\n[дословный текст]\n\n"
-            "Если сообщение длинное (больше 3 предложений), добавь ниже блок:\n"
-            "📌 <b>Суть:</b> [краткая выжимка в 1-2 предложениях]."
+            "Расшифруй речь из этого файла в текст дословно и максимально точно. "
+            "Выведи ТОЛЬКО чистый текст сказанного: без вступлений, без описания видео или звуков на фоне, "
+            "без пересказа сути и без каких-либо комментариев от себя. Если в записи вообще нет речи, напиши: [Без слов]."
         )
 
-    # Для расшифровки всегда используем Gemini (он напрямую слышит голос и видит кружочки)
     reply, err, model_used, ctx_len = ask_gemini(chat_id, prompt, [(media_bytes, mime_type)], save_to_memory=bool(custom_instruction))
     stop_event.set()
 
     if reply:
-        safe_edit_message(f"{reply}\n\nmodel: {model_used}", chat_id, loading_msg.message_id, business_id)
+        clean_reply = reply.strip()
+        if custom_instruction:
+            out_text = f"🎙 {clean_reply}\n\nmodel: {model_used}"
+        else:
+            out_text = f"🎙 {clean_reply}"
+        safe_edit_message(out_text, chat_id, loading_msg.message_id, business_id)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_id)
 
@@ -688,7 +707,7 @@ def generate_image(prompt):
                 if 'candidates' in data and data['candidates']:
                     for part in data['candidates'][0]['content']['parts']:
                         if 'inline_data' in part:
-                            return base64.b64decode(part['inline_data']['data']), None
+                            return base64.b64encode(part['inline_data']['data']), None
             last_err = "Модель не вернула изображение."
         except Exception as e:
             last_err = str(e)
@@ -713,39 +732,132 @@ def animate_loading(chat_id, message_id, stop_event, business_id=None, text_pref
             pass
         idx += 1
 
+# --- ФОРМИРОВАНИЕ ПАНЕЛИ УПРАВЛЕНИЯ И СТАТУСА КЛЮЧЕЙ ---
+def build_panel_view():
+    auto_on = CONFIG.get('auto_reply_enabled', True)
+    spy_on = CONFIG.get('spy_enabled', True)
+    voice_all_on = CONFIG.get('voice_auto_all', False)
+
+    auto_status = f"🟢 ВКЛ ({CONFIG.get('afk_minutes', 10)} мин)" if auto_on else "🔴 ВЫКЛ"
+    spy_status = "🟢 ВКЛ" if spy_on else "🔴 ВЫКЛ"
+    voice_all_status = "🟢 ВКЛ (все чаты)" if voice_all_on else "⚪ По команде «рс»"
+
+    voice_users = list(CONFIG.get('voice_auto_users', {}).keys())
+    voice_users_str = ", ".join([f"@{u}" for u in voice_users]) if voice_users else "нет"
+    bl_users = list(CONFIG.get('blacklist', {}).keys())
+    bl_str = f"{len(bl_users)} чел." if bl_users else "пусто"
+
+    active_cooldowns = sum(1 for v in EXHAUSTED_QUOTAS.values() if v > time.time())
+    sys_prompt = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
+    is_custom_prompt = (sys_prompt != DEFAULT_SYSTEM_PROMPT)
+
+    text = (
+        f"👑 <b>Панель управления аккаунтом</b>\n\n"
+        f"🤖 <b>Автоответчик:</b> {auto_status}\n"
+        f"🕵️‍♂️ <b>Режим Шпиона:</b> {spy_status}\n"
+        f"🎙 <b>Авто-ГС/кружки:</b> {voice_all_status}\n"
+        f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
+        f"🚫 <b>Черный список:</b> {bl_str}\n\n"
+        f"🧠 <b>Модель:</b> <code>{ACTIVE_MODEL}</code>\n"
+        f"🎭 <b>Характер ИИ:</b> {'Кастомный ✏️' if is_custom_prompt else 'Стандартный'}\n"
+        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (следующий: #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}, в кулдауне пар: {active_cooldowns})\n"
+        f"⏱ <b>Анти-спам КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (активных чатов: {len(CHAT_MEMORY)})"
+    )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data=" panel_toggle_auto"),
+        InlineKeyboardButton(f"🕵️‍♂️ Шпион: {'ВКЛ 🟢' if spy_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_spy")
+    )
+    kb.add(
+        InlineKeyboardButton(f"🎙 Авто-ГС (все): {'ВКЛ 🟢' if voice_all_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_voice"),
+        InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status")
+    )
+    kb.add(
+        InlineKeyboardButton("🧠 Сменить модель", callback_data="panel_models"),
+        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all")
+    )
+    kb.add(InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh"))
+    return text, kb
+
+def build_keys_status_view(ping_results=None):
+    now = time.time()
+    lines = [
+        f"🔑 <b>Мониторинг пула ключей Gemini ({len(GEMINI_KEYS)} шт.)</b>",
+        f"📍 <b>Приоритетная модель:</b> <code>{ACTIVE_MODEL}</code>",
+        f"➡️ <b>Очередь на запрос:</b> Ключ #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}\n"
+    ]
+
+    if not GEMINI_KEYS:
+        lines.append("⚠️ Ключи не найдены! Добавь GEMINI_KEY_1..5 в Render.")
+    else:
+        for idx, k in enumerate(GEMINI_KEYS):
+            stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0})
+            cooldown_models = []
+            for m in MODEL_HIERARCHY:
+                until = EXHAUSTED_QUOTAS.get((m, idx), 0)
+                if until > now:
+                    mins_left = int((until - now) // 60) + 1
+                    cooldown_models.append(f"{m} ({mins_left}м)")
+
+            if cooldown_models:
+                state_str = f"⏳ КД на: {', '.join(cooldown_models)}"
+            else:
+                state_str = "🟢 Свободен на всех моделях"
+
+            ping_str = ""
+            if ping_results and idx in ping_results:
+                ping_str = f"\n   📡 Тест: {ping_results[idx]}"
+
+            lines.append(
+                f"<b>Ключ #{idx + 1}</b> (<code>{mask_key(k)}</code>)\n"
+                f"   Статус: {state_str}\n"
+                f"   Запросов: ✅ {stats['ok']} | ⚠️ 429: {stats['429']} | ❌ Сбоев: {stats['err']}"
+                f"{ping_str}"
+            )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⚡ Пинг всех ключей", callback_data="keys_ping"),
+        InlineKeyboardButton("♻️ Сбросить кулдауны", callback_data="keys_reset_cd")
+    )
+    kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+    return "\n".join(lines), kb
+
+def ping_all_keys():
+    """Быстрая проверка работоспособности каждого ключа на текущей модели."""
+    results = {}
+    test_model = ACTIVE_MODEL if not ACTIVE_MODEL.startswith('groq/') else MODEL_HIERARCHY[0]
+    url = f"{GEMINI_API_BASE}/models/{test_model}:generateContent"
+    payload = {"contents": [{"role": "user", "parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 2}}
+
+    for idx, api_key in enumerate(GEMINI_KEYS):
+        try:
+            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=10)
+            if r.status_code == 200:
+                results[idx] = f"🟢 Работает ({test_model})"
+            elif r.status_code == 429:
+                results[idx] = f"🔴 Лимит 429 ({test_model})"
+            else:
+                results[idx] = f"⚠️ Код {r.status_code}"
+        except Exception as e:
+            results[idx] = f"❌ Ошибка сети"
+    return results
+
 # --- ПАНЕЛЬ УПРАВЛЕНИЯ (В ЛИЧКЕ С БОТОМ) ---
 @bot.message_handler(commands=['start', 'panel'])
 def send_panel(message):
     if (message.from_user.username or '').lower() != CREATOR_USERNAME:
         return
     register_creator_id(message.from_user)
+    text, kb = build_panel_view()
+    bot.send_message(message.chat.id, text, reply_markup=kb)
 
-    auto_status = "🟢 ВКЛ" if CONFIG.get('auto_reply_enabled') else "🔴 ВЫКЛ"
-    spy_status = "🟢 ВКЛ" if CONFIG.get('spy_enabled', True) else "🔴 ВЫКЛ"
-    voice_all_status = "🟢 ВКЛ (для всех)" if CONFIG.get('voice_auto_all') else "⚪ По команде «рс»"
-    voice_users = list(CONFIG.get('voice_auto_users', {}).keys())
-    voice_users_str = ", ".join([f"@{u}" for u in voice_users]) if voice_users else "нет"
-
-    text = (
-        f"👑 <b>Панель управления</b>\n\n"
-        f"🤖 Автоответчик: {auto_status}\n"
-        f"🕵️‍♂️ Режим Шпиона: {spy_status}\n"
-        f"🎙 Авто-ГС/кружки: {voice_all_status}\n"
-        f"👥 Авто-ГС для юзеров: <code>{voice_users_str}</code>\n"
-        f"🧠 Базовая модель: <code>{ACTIVE_MODEL}</code>\n"
-        f"🔑 Ключей Gemini в пуле: <b>{len(GEMINI_KEYS)} шт.</b>\n"
-        f"📚 Лимит памяти: {CONFIG.get('context_limit', 100)}\n\n"
-        f"Напиши <code>команды</code> для списка всех функций."
-    )
-    bot.send_message(message.chat.id, text)
-
-# Авто-расшифровка ГС и кружков, если владелец просто переслал их боту в личку
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['voice', 'video_note', 'audio'])
 def handle_admin_voice(message):
     register_creator_id(message.from_user)
     handle_voice_transcription(message.chat.id, message, business_id=None)
 
-# Чтение документов в личке с ботом
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['document'])
 def handle_admin_document(message):
     register_creator_id(message.from_user)
@@ -778,28 +890,62 @@ def handle_admin_document(message):
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['text'])
 def handle_admin_text(message):
     register_creator_id(message.from_user)
-    text = message.text.lower().strip()
+    raw_text = message.text.strip()
+    text = raw_text.lower()
     chat_id = message.chat.id
+
+    if text in ['панель', 'пульт']:
+        p_text, p_kb = build_panel_view()
+        bot.send_message(chat_id, p_text, reply_markup=p_kb)
+        return
+
+    if text in ['ключи', 'статус ключей', '/keys']:
+        k_text, k_kb = build_keys_status_view()
+        bot.send_message(chat_id, k_text, reply_markup=k_kb)
+        return
 
     if text in ['команды', '/help']:
         bot.reply_to(
             message,
-            "📜 <b>Команды управления:</b>\n\n"
-            "🔹 <b>Нейросеть и Модели:</b>\n"
-            "• <code>модели</code> — выбор модели текста\n"
-            "• <code>фото-модели</code> — выбор модели рисования\n"
-            "• <code>гпт [запрос]</code> — вопрос нейросети (или Reply на файл)\n"
+            "📜 <b>Все команды управления:</b>\n\n"
+            "🎛 <b>Пульт и Ключи:</b>\n"
+            "• <code>/panel</code> (или <code>панель</code>) — интерактивный пульт с кнопками\n"
+            "• <code>ключи</code> — статистика всех ключей, кулдауны и пинг-тест\n"
+            "• <code>список</code> — кто в ЧС и у кого включено авто-ГС\n\n"
+            "🧠 <b>Нейросеть и Настройки:</b>\n"
+            "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
+            "• <code>гпт [запрос]</code> — вопрос ИИ (или Reply на файл/фото)\n"
             "• <code>нарисуй [описание]</code> — генерация картинки\n"
-            "• <code>контекст 50</code> — размер памяти диалога\n"
-            "• <code>сброс</code> — очистить память\n\n"
-            "🔹 <b>Голосовые и Кружки (рс):</b>\n"
-            "• В любом чате ответь <code>рс</code> (или <code>рс [вопрос]</code>) на ГС/кружок\n"
-            "• <code>рс все вкл</code> / <code>рс все выкл</code> — авто-расшифровка для всех\n"
-            "• <code>рс @юзер</code> — вкл/выкл постоянную авто-расшифровку для юзера\n\n"
-            "🔹 <b>Шпион и Автоответчик:</b>\n"
-            "• <code>шпион вкл</code> / <code>шпион выкл</code> — перехват удаленных и измененных СМС\n"
-            "• <code>автоответчик вкл</code> / <code>выкл</code> — ответ после 10 мин тишины\n"
+            "• <code>характер [текст]</code> — задать свой промпт/статус для Gemini\n"
+            "• <code>характер сброс</code> — вернуть стандартный промпт\n"
+            "• <code>таймер 5</code> — через сколько минут молчания отвечает бот\n"
+            "• <code>кд 3</code> — задержка анти-спама в секундах (0 — без задержки)\n"
+            "• <code>контекст 100</code> — лимит памяти сообщений\n"
+            "• <code>сброс</code> / <code>сброс все</code> — очистить память чата или всех чатов\n\n"
+            "🎙 <b>Голосовые и Кружки (чистый текст):</b>\n"
+            "• Ответь <code>рс</code> на ГС/кружок — чистая расшифровка без воды\n"
+            "• Ответь <code>рс перескажи кратко</code> — расшифровка с заданием\n"
+            "• <code>рс @юзер</code> — вкл/выкл авто-расшифровку для конкретного человека\n"
+            "• <code>рс все вкл</code> / <code>выкл</code> — авто-расшифровка для всех\n\n"
+            "🕵️‍♂️ <b>Шпион и Доступ:</b>\n"
+            "• <code>шпион вкл</code> / <code>выкл</code> — перехват удаленных и измененных СМС\n"
+            "• <code>автоответчик вкл</code> / <code>выкл</code> — режим секретаря\n"
             "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота"
+        )
+        return
+
+    if text == 'список':
+        v_users = list(CONFIG.get('voice_auto_users', {}).keys())
+        b_users = list(CONFIG.get('blacklist', {}).keys())
+        v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
+        b_str = ", ".join([f"@{u}" for u in b_users]) if b_users else "пусто"
+        sys_p = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
+        bot.reply_to(
+            message,
+            f"📋 <b>Текущие списки и промпт:</b>\n\n"
+            f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
+            f"🚫 <b>Черный список:</b> {b_str}\n\n"
+            f"🎭 <b>Системный промпт Gemini:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>"
         )
         return
 
@@ -821,6 +967,38 @@ def handle_admin_text(message):
         bot.reply_to(message, "Модель рисования:", reply_markup=kb)
         return
 
+    if text.startswith('таймер '):
+        try:
+            mins = int(text.split()[1])
+            CONFIG['afk_minutes'] = max(1, mins)
+            save_config()
+            bot.reply_to(message, f"⏱ Таймер автоответчика установлен на: <b>{CONFIG['afk_minutes']} мин.</b>")
+        except Exception:
+            bot.reply_to(message, "⚠️ Укажи число минут, например: <code>таймер 5</code>")
+        return
+
+    if text.startswith('кд '):
+        try:
+            secs = int(text.split()[1])
+            CONFIG['cooldown_seconds'] = max(0, secs)
+            save_config()
+            bot.reply_to(message, f"⏱ Анти-спам задержка: <b>{CONFIG['cooldown_seconds']} сек.</b>")
+        except Exception:
+            bot.reply_to(message, "⚠️ Укажи секунды, например: <code>кд 3</code> (или <code>кд 0</code>)")
+        return
+
+    if text.startswith('характер ') or text.startswith('промпт '):
+        arg = raw_text.split(maxsplit=1)[1].strip() if len(raw_text.split()) > 1 else ""
+        if arg.lower() in ['сброс', 'стандарт', 'default']:
+            CONFIG['system_prompt'] = DEFAULT_SYSTEM_PROMPT
+            save_config()
+            bot.reply_to(message, "✅ Характер Gemini сброшен на стандартный.")
+        elif arg:
+            CONFIG['system_prompt'] = arg
+            save_config()
+            bot.reply_to(message, f"🎭 Новый характер/статус для Gemini сохранен:\n<blockquote>{html.escape(arg)}</blockquote>")
+        return
+
     if text.startswith('шпион'):
         if 'выкл' in text:
             CONFIG['spy_enabled'] = False
@@ -839,7 +1017,6 @@ def handle_admin_text(message):
         bot.reply_to(message, f"✅ Автоответчик: {'🟢 ВКЛ' if CONFIG['auto_reply_enabled'] else '🔴 ВЫКЛ'}")
         return
 
-    # Управление авто-расшифровкой ГС и кружков
     if text in ['рс все вкл', 'авто гс вкл']:
         CONFIG['voice_auto_all'] = True
         save_config()
@@ -866,11 +1043,10 @@ def handle_admin_text(message):
                 bot.reply_to(message, f"🎙 Постоянная авто-расшифровка ГС/кружков для @{uname}: <b>🟢 ВКЛ</b>")
         return
 
-    # Если в личке с ботом ответили «рс» на голосовое или кружок
     if (text == 'рс' or text.startswith('рс ')) and message.reply_to_message:
         rep = message.reply_to_message
         if rep.content_type in ['voice', 'video_note', 'audio']:
-            custom_q = message.text[3:].strip() if len(message.text) > 2 else ""
+            custom_q = raw_text[3:].strip() if len(raw_text) > 2 else ""
             handle_voice_transcription(chat_id, rep, custom_q, business_id=None)
             return
 
@@ -878,7 +1054,7 @@ def handle_admin_text(message):
         try:
             CONFIG['context_limit'] = int(text.split()[1])
             save_config()
-            bot.reply_to(message, f"✅ Лимит: {CONFIG['context_limit']}")
+            bot.reply_to(message, f"✅ Лимит памяти: {CONFIG['context_limit']}")
         except Exception:
             pass
         return
@@ -897,6 +1073,11 @@ def handle_admin_text(message):
         bot.reply_to(message, "✅ Разбанен.")
         return
 
+    if text in ['сброс все', 'очистить все']:
+        clear_all_memory_firebase()
+        bot.reply_to(message, "🧹 Память <b>всех чатов</b> полностью очищена!")
+        return
+
     if text in ['сброс', 'гпт сброс']:
         CHAT_MEMORY[chat_id] = []
         save_chat_memory_async(chat_id, [])
@@ -910,7 +1091,7 @@ def handle_admin_text(message):
         loading_msg = bot.reply_to(message, "🕐 Рисую...")
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую...")).start()
-        img, err = generate_image(message.text[8:].strip())
+        img, err = generate_image(raw_text[8:].strip())
         stop_event.set()
         if img:
             try:
@@ -927,10 +1108,9 @@ def handle_admin_text(message):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
             return
 
-        prompt_text = message.text[4:].strip()
+        prompt_text = raw_text[4:].strip()
         media_list = []
 
-        # Если ответили «гпт ...» на документ, фото или ГС в личке
         if message.reply_to_message:
             rep = message.reply_to_message
             if rep.content_type == 'document':
@@ -961,19 +1141,89 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('setmodel_') or call.data.startswith('setimg_'))
-def callback_set_model(call):
+# --- ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК АДМИНКИ ---
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
     global ACTIVE_MODEL
     if (call.from_user.username or '').lower() != CREATOR_USERNAME:
         return
-    if call.data.startswith('setmodel_'):
-        ACTIVE_MODEL = call.data.replace('setmodel_', '')
-        EXHAUSTED_QUOTAS.clear()
-        bot.edit_message_text(f"✅ Текст: <b>{ACTIVE_MODEL}</b>", call.message.chat.id, call.message.message_id)
-    else:
-        CONFIG['image_model'] = call.data.replace('setimg_', '')
+    register_creator_id(call.from_user)
+    data = call.data.strip()
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
+    if data == 'panel_toggle_auto':
+        CONFIG['auto_reply_enabled'] = not CONFIG.get('auto_reply_enabled', True)
         save_config()
-        bot.edit_message_text(f"✅ Рисование: <b>{CONFIG['image_model']}</b>", call.message.chat.id, call.message.message_id)
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Автоответчик: {'ВКЛ' if CONFIG['auto_reply_enabled'] else 'ВЫКЛ'}")
+
+    elif data == 'panel_toggle_spy':
+        CONFIG['spy_enabled'] = not CONFIG.get('spy_enabled', True)
+        save_config()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Шпион: {'ВКЛ' if CONFIG['spy_enabled'] else 'ВЫКЛ'}")
+
+    elif data == 'panel_toggle_voice':
+        CONFIG['voice_auto_all'] = not CONFIG.get('voice_auto_all', False)
+        save_config()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Авто-ГС (все): {'ВКЛ' if CONFIG['voice_auto_all'] else 'ВЫКЛ'}")
+
+    elif data == 'panel_refresh':
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, "Обновлено")
+
+    elif data == 'panel_keys_status':
+        text, kb = build_keys_status_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+
+    elif data == 'keys_reset_cd':
+        EXHAUSTED_QUOTAS.clear()
+        text, kb = build_keys_status_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, "Все кулдауны ключей сброшены!")
+
+    elif data == 'keys_ping':
+        bot.answer_callback_query(call.id, "Проверяю все ключи...")
+        safe_edit_message("⏳ <b>Пингую все ключи в пуле, подожди пару секунд...</b>", chat_id, msg_id)
+        ping_res = ping_all_keys()
+        text, kb = build_keys_status_view(ping_results=ping_res)
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+
+    elif data == 'panel_models':
+        models = fetch_all_models()
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in models:
+            mark = "✅ " if m == ACTIVE_MODEL else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
+        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+        safe_edit_message(f"🧠 <b>Выбери базовую модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+
+    elif data == 'panel_clear_all':
+        clear_all_memory_firebase()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, "🧹 Память всех диалогов очищена!")
+
+    elif data.startswith('setmodel_'):
+        ACTIVE_MODEL = data.replace('setmodel_', '')
+        EXHAUSTED_QUOTAS.clear()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Модель: {ACTIVE_MODEL}")
+
+    elif data.startswith('setimg_'):
+        CONFIG['image_model'] = data.replace('setimg_', '')
+        save_config()
+        bot.edit_message_text(f"✅ Рисование: <b>{CONFIG['image_model']}</b>", chat_id, msg_id)
+        bot.answer_callback_query(call.id, "Модель рисования изменена")
 
 # --- ОБРАБОТКА ФОТО-АЛЬБОМОВ ---
 def process_business_album(media_group_id):
@@ -1002,12 +1252,13 @@ def process_business_album(media_group_id):
     lower_text = text.lower().strip()
     is_gpt = lower_text.startswith('гпт ')
     is_reply_to_bot = base_msg.reply_to_message and base_msg.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
+    afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
     trigger = False
     if is_gpt or is_reply_to_bot:
         trigger = True
     elif not is_owner and CONFIG['auto_reply_enabled']:
-        if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
+        if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
             trigger = True
 
     if not trigger:
@@ -1058,7 +1309,6 @@ def handle_business_message(message):
     if is_owner:
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
 
-    # Сохраняем любое сообщение в кэш «Шпиона»
     cache_incoming_message(message, is_owner)
 
     if not is_owner and sender_uname in CONFIG.get('blacklist', {}):
@@ -1067,7 +1317,6 @@ def handle_business_message(message):
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
 
-    # Очистка памяти чата
     if lower_text in ['сброс', '/reset']:
         CHAT_MEMORY[chat_id] = []
         save_chat_memory_async(chat_id, [])
@@ -1075,7 +1324,7 @@ def handle_business_message(message):
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
         return
 
-    # 1. ПРОВЕРКА АВТО-РАСШИФРОВКИ ВХОДЯЩИХ ГС И КРУЖКОВ
+    # 1. АВТО-РАСШИФРОВКА ВХОДЯЩИХ ГС И КРУЖКОВ
     if message.content_type in ['voice', 'video_note', 'audio']:
         auto_all = CONFIG.get('voice_auto_all', False)
         auto_user = sender_uname in CONFIG.get('voice_auto_users', {})
@@ -1083,7 +1332,7 @@ def handle_business_message(message):
             handle_voice_transcription(chat_id, message, business_id=message.business_connection_id)
         return
 
-    # 2. РУЧНАЯ КОМАНДА «рс» (РАСШИФРОВКА ПО REPLY НА ГС ИЛИ КРУЖОК)
+    # 2. РУЧНАЯ КОМАНДА «рс» (ИЛИ «рс [задание]»)
     if (lower_text == 'рс' or lower_text.startswith('рс ')) and message.reply_to_message:
         rep = message.reply_to_message
         if rep.content_type in ['voice', 'video_note', 'audio']:
@@ -1102,6 +1351,7 @@ def handle_business_message(message):
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
     is_draw = lower_text.startswith('нарисуй ')
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
+    afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
     trigger = False
     if is_owner:
@@ -1111,7 +1361,7 @@ def handle_business_message(message):
         if is_gpt or is_draw or is_reply_to_bot:
             trigger = True
         elif message.content_type in ['text', 'document', 'photo'] and CONFIG['auto_reply_enabled']:
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
                 trigger = True
 
     if not trigger:
@@ -1125,7 +1375,6 @@ def handle_business_message(message):
     if is_gpt:
         text = text[4:].strip()
 
-    # Генерация изображений
     if is_draw:
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
@@ -1145,12 +1394,11 @@ def handle_business_message(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, message.business_connection_id)
         return
 
-    # Если ответили «гпт ...» на голосовое или кружок
     if message.reply_to_message and message.reply_to_message.content_type in ['voice', 'video_note', 'audio']:
         handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
         return
 
-    # 4. ОБРАБОТКА ТЕКСТА, ФОТО И ДОКУМЕНТОВ (PDF / DOCX / TXT / КОД)
+    # 4. ОБРАБОТКА ТЕКСТА, ФОТО И ДОКУМЕНТОВ
     media_list = []
     loading_label = "Думаю..."
 
@@ -1215,5 +1463,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini в пуле: {len(GEMINI_KEYS)} | Шпион + ГС + Файлы активны.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini в пуле: {len(GEMINI_KEYS)} | Админка 2.0 активна.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
