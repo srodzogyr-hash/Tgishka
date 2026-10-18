@@ -265,7 +265,6 @@ def process_business_album(media_group_id):
     is_owner = (base_msg.from_user.id == CREATOR_ID) or ((base_msg.from_user.username or '').lower() == CREATOR_USERNAME)
     if not is_owner and (base_msg.from_user.username or '').lower() in CONFIG.get('blacklist', {}): return
         
-    # Ищем подпись в любом сообщении альбома
     text = ""
     for m in messages:
         if m.caption: text = m.caption; break
@@ -273,12 +272,14 @@ def process_business_album(media_group_id):
         
     lower_text = text.lower().strip()
     is_gpt = lower_text.startswith('гпт ')
-    
+    is_reply_to_bot = base_msg.reply_to_message and base_msg.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
+
     trigger = False
-    if is_owner: trigger = True
-    else:
-        if is_gpt: trigger = True
-        elif CONFIG['auto_reply_enabled'] and (time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600): trigger = True
+    if is_gpt or is_reply_to_bot:
+        trigger = True
+    elif not is_owner and CONFIG['auto_reply_enabled']:
+        if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
+            trigger = True
             
     if not trigger: return
     if is_owner: LAST_OWNER_ACTIVITY[chat_id] = time.time()
@@ -337,12 +338,17 @@ def handle_business_message(message):
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
 
     trigger = False
+    
+    # УБРАНО УСЛОВИЕ or message.content_type == 'photo'
     if is_owner:
-        if is_gpt or is_draw or is_reply_to_bot or message.content_type == 'photo': trigger = True
+        if is_gpt or is_draw or is_reply_to_bot: 
+            trigger = True
     else:
-        if is_gpt or is_draw or is_reply_to_bot or message.content_type == 'photo': trigger = True
+        if is_gpt or is_draw or is_reply_to_bot: 
+            trigger = True
         elif message.content_type == 'text' and CONFIG['auto_reply_enabled']:
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600: trigger = True
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600: 
+                trigger = True
 
     if not trigger: return
     if is_gpt: text = text[4:].strip()
@@ -370,12 +376,10 @@ def handle_business_message(message):
     threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id)).start()
     
     images = []
-    # Если это фото
     if message.content_type == 'photo':
         img_bytes, mime = get_photo_bytes(message)
         if img_bytes: images.append((img_bytes, mime))
         if not text: text = "Опиши, что на этом фото."
-    # Если свайпнули на фото и написали текст
     elif message.reply_to_message and message.reply_to_message.photo:
         img_bytes, mime = get_photo_bytes(message.reply_to_message)
         if img_bytes: images.append((img_bytes, mime))
