@@ -2,7 +2,6 @@ import html
 import os
 import random
 import re
-import signal
 import threading
 import time
 
@@ -19,8 +18,8 @@ from telebot.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardB
 # --- НАСТРОЙКИ И КЛЮЧИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER) ---
 TOKEN = os.environ.get('TG_TOKEN')
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
-
 GROQ_KEY = os.environ.get('GROQ_KEY')
+
 DEFAULT_MODEL = 'llama-3.3-70b-versatile'
 GROQ_BASE = 'https://api.groq.com/openai/v1'
 
@@ -39,16 +38,13 @@ RANK_NAMES = {
 }
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
-FIREBASE_URL = FIREBASE_URL.rstrip('/')
+FIREBASE_URL = FIREBASE_URL.rstrip('/') if FIREBASE_URL else ''
 BOT_ID = None
 
 fb_session = requests.Session()
 ai_session = requests.Session()
 
-RAM_DB = {
-    'config': {'ai_model': DEFAULT_MODEL, 'creator_id': None},
-    'chats': {},
-}
+RAM_DB = {'config': {'ai_model': DEFAULT_MODEL, 'creator_id': None}, 'chats': {}}
 DB_LOCK = threading.Lock()
 DIRTY_PATHS = {}
 
@@ -77,12 +73,8 @@ def init_firebase_sync():
                   cval.setdefault('meta', {})
                   cval.setdefault('users', {})
                   RAM_DB['chats'][str(cid_s)] = cval
-          print('🔥 База Firebase загружена в память!')
           return
-      else:
-        print(f'⚠️ Firebase ответил кодом {r.status_code}')
-    except Exception as e:
-      print(f'⚠️ Попытка {attempt + 1}/3 подключения к Firebase: {e}')
+    except Exception:
       time.sleep(1)
 
 
@@ -121,7 +113,6 @@ def firebase_background_worker():
       flush_firebase_changes()
     except Exception:
       pass
-
 
 init_firebase_sync()
 threading.Thread(target=firebase_background_worker, daemon=True).start()
@@ -400,7 +391,7 @@ def get_global_chats_snapshot(current_chat=None):
 
     here_mark = ' 👈 [ТЕКУЩИЙ ЧАТ]' if current_chat and str(current_chat.id) == str(cid_str) else ''
     members_str = '; '.join(members_desc) if members_desc else 'пока нет записанных участников'
-    summary_lines.append(f'• Чат «{title}» (ID: {cid_str}){here_mark} — участников в Firebase: {len(members_desc)} [{members_str}]')
+    summary_lines.append(f'• Чат «{title}» (ID: {cid_str}){here_mark} — участников: {len(members_desc)} [{members_str}]')
 
   if not summary_lines:
     return 'В Firebase пока не зарегистрировано групповых чатов.'
@@ -479,8 +470,7 @@ def exec_mod_action(chat_id, caller, target_id, target_name_html, target_rank, a
   required_rank = {'delete': 1, 'mute': 1, 'unmute': 1, 'mute_all': 3, 'unmute_all': 3, 'warn': 2, 'unwarn': 2, 'kick': 2, 'ban': 3, 'unban': 3}.get(action, 1)
 
   if caller_rank < required_rank:
-    needed_name = RANK_NAMES[required_rank]
-    return False, f'❌ Твой ранг ({RANK_NAMES[caller_rank]}) слишком мал! Нужен минимум: <b>{needed_name}</b>.'
+    return False, f'❌ Твой ранг слишком мал! Нужен минимум: <b>{RANK_NAMES[required_rank]}</b>.'
 
   if action == 'mute_all':
     all_u = get_all_chat_users(chat_id)
@@ -502,7 +492,7 @@ def exec_mod_action(chat_id, caller, target_id, target_name_html, target_rank, a
     except Exception:
       pass
     who_str = f" (Заглушены: {', '.join(muted_names)})" if muted_names else ''
-    return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> Тотальный мут активирован на <b>{minutes} мин.</b>!{who_str}'
+    return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> Тотальный мут на <b>{minutes} мин.</b>!{who_str}'
 
   if action == 'unmute_all':
     all_u = get_all_chat_users(chat_id)
@@ -518,13 +508,13 @@ def exec_mod_action(chat_id, caller, target_id, target_name_html, target_rank, a
       bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True))
     except Exception:
       pass
-    return True, '✅ <b>[ВЫПОЛНЕНО]:</b> Все ограничения сняты, чат открыт!'
+    return True, '✅ <b>[ВЫПОЛНЕНО]:</b> Все ограничения сняты!'
 
   if target_id == get_bot_id():
     return False, '🛡 Себя я наказывать не буду!'
 
   if target_rank >= caller_rank and caller_rank < 4:
-    return False, f'🛡 Нельзя применить это к {target_name_html} — его ранг не ниже твоего ({RANK_NAMES[target_rank]})!'
+    return False, f'🛡 Нельзя применить это к {target_name_html} — его ранг не ниже твоего!'
 
   try:
     if action == 'delete':
@@ -535,7 +525,7 @@ def exec_mod_action(chat_id, caller, target_id, target_name_html, target_rank, a
     if action == 'mute':
       until = int(time.time()) + max(1, minutes) * 60
       bot.restrict_chat_member(chat_id, target_id, until_date=until, permissions=ChatPermissions(can_send_messages=False))
-      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 🔇 {target_name_html} отправлен в мут на <b>{minutes} мин.</b> (Причина: {html.escape(reason)})'
+      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 🔇 {target_name_html} в муте на <b>{minutes} мин.</b>'
 
     if action == 'unmute':
       bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True))
@@ -555,25 +545,22 @@ def exec_mod_action(chat_id, caller, target_id, target_name_html, target_rank, a
 
     if action == 'unwarn':
       update_user_fields(chat_id, target_id, {'warns': 0}, immediate=True)
-      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> Предупреждения с {target_name_html} сняты!'
+      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> Предупреждения сняты!'
 
     if action == 'kick':
       bot.ban_chat_member(chat_id, target_id)
       bot.unban_chat_member(chat_id, target_id)
-      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 👢 {target_name_html} кикнут из чата!'
+      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 👢 {target_name_html} кикнут!'
 
     if action == 'ban':
       bot.ban_chat_member(chat_id, target_id)
-      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 🔨 {target_name_html} забанен навсегда!'
+      return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 🔨 {target_name_html} забанен!'
 
     if action == 'unban':
       bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
       return True, f'✅ <b>[ВЫПОЛНЕНО]:</b> 🕊 {target_name_html} разбанен!'
   except Exception as e:
-    err_s = str(e)
-    if 'administrator' in err_s.lower() or 'owner' in err_s.lower() or "can't restrict" in err_s.lower():
-      return False, f'⚠️ Ошибка: Нельзя замутить/кикнуть {target_name_html}, так как он Администратор группы!'
-    return False, f'⚠️ Ошибка Telegram API: <code>{html.escape(err_s[:120])}</code>'
+    return False, f'⚠️ Ошибка Telegram: <code>{html.escape(str(e)[:100])}</code>'
 
   return False, 'Неизвестное действие'
 
@@ -588,7 +575,7 @@ def resolve_target_smart(chat_id, message, search_text):
       u_data = get_user_data(chat_id, r_user, message.chat)
       LAST_TARGET_ID[chat_id] = r_user.id
       t_rank = get_effective_rank(chat_id, r_user, u_data)
-      return r_user.id, display_name(chat_id, r_user, u_data), f"{clean_user_name(r_user)} (@{r_user.username or 'без_юза'})", t_rank
+      return r_user.id, display_name(chat_id, r_user, u_data), f"{clean_user_name(r_user)}", t_rank
 
   if message.entities:
     for ent in message.entities:
@@ -632,7 +619,7 @@ def resolve_target_smart(chat_id, message, search_text):
                 update_user_fields(chat_id, uid, uinfo, immediate=True)
               nm = html.escape(str(uinfo.get('nick') or uinfo.get('name') or 'Участник'))
               rk = 4 if uname in CREATOR_USERNAMES else int(uinfo.get('rank', 0))
-              return uid, f"<a href='tg://user?id={uid}'>{nm}</a>", f"{nm} (@{uname or 'без_юза'})", rk
+              return uid, f"<a href='tg://user?id={uid}'>{nm}</a>", f"{nm}", rk
 
   if any(p in text_lower.split() for p in ['его', 'ему', 'ее', 'ей', 'этого', 'бота', 'клоуна', 'типа']):
     last_id = LAST_TARGET_ID.get(chat_id)
@@ -641,7 +628,7 @@ def resolve_target_smart(chat_id, message, search_text):
       uname = str(uinfo.get('username') or '').lower()
       nm = html.escape(str(uinfo.get('nick') or uinfo.get('name') or 'Участник'))
       rk = 4 if uname in CREATOR_USERNAMES else int(uinfo.get('rank', 0))
-      return last_id, f"<a href='tg://user?id={last_id}'>{nm}</a>", f"{nm} (@{uname or 'без_юза'})", rk
+      return last_id, f"<a href='tg://user?id={last_id}'>{nm}</a>", f"{nm}", rk
 
   return None, None, 'Не выбран', 0
 
@@ -684,42 +671,32 @@ def ask_ai(chat_id, system_prompt, formatted_user_turn, raw_user_text):
 
   try:
     r = ai_session.post(f'{GROQ_BASE}/chat/completions', headers=headers, json=payload, timeout=40)
-  except requests.exceptions.Timeout:
-    return None, f'Превышено время ожидания (40 сек) от модели {selected_model}'
   except Exception as e:
     return None, f'Ошибка сети: {e}'
 
   if r.status_code != 200:
     try:
       err_data = r.json()
-      err_obj = err_data.get('error', {})
-      msg = err_obj.get('message') or str(err_data)
-      code = err_obj.get('code') or r.status_code
-      return None, f'[Код {code}] {selected_model}: {msg}'
+      msg = err_data.get('error', {}).get('message') or str(err_data)
+      return None, f'[Код {r.status_code}] {msg}'
     except Exception:
-      return None, f'[HTTP {r.status_code}] {selected_model}: {r.text[:200]}'
+      return None, f'[HTTP {r.status_code}] Ошибка'
 
   try:
     data = r.json()
   except Exception as e:
     return None, f'Ошибка чтения JSON: {e}'
 
-  if 'error' in data:
-    err_obj = data['error']
-    msg = err_obj.get('message', str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
-    return None, f'{selected_model}: {msg}'
-
   choices = data.get('choices') or []
   if not choices:
-    return None, f'{selected_model} вернула пустой ответ (choices=[])'
+    return None, f'Модель вернула пустой ответ'
 
   msg_obj = choices[0].get('message') or {}
   content = msg_obj.get('content') or ''
   content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
   if not content:
-    finish_reason = choices[0].get('finish_reason', 'unknown')
-    return None, f'{selected_model} не сгенерировала текст (finish_reason: {finish_reason})'
+    return None, f'Модель не сгенерировала текст'
 
   history.append({'role': 'user', 'content': f'Собеседник: {raw_user_text}'})
   history.append({'role': 'assistant', 'content': content})
@@ -739,10 +716,7 @@ def safe_edit_thinking(chat_id, message_id, text_html):
   try:
     bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=plain[:3900], parse_mode=None)
   except Exception:
-    try:
-      bot.send_message(chat_id, plain[:3900])
-    except Exception:
-      pass
+    pass
 
 
 def handle_all_ai(message, prompt_text):
@@ -769,7 +743,7 @@ def handle_all_ai(message, prompt_text):
     if any(w in prompt_lower for w in ['проверь чаты', 'какие чаты', 'список чатов', 'в каких ты чатах', 'мои чаты']):
       snap = get_global_chats_snapshot(message.chat)
       used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-      safe_edit_thinking(chat_id, thinking_msg.message_id, f'🌐 <b>Отчет по чатам в Firebase:</b>\n\n{html.escape(snap)}\n\n🧠 <i>Контекстное окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
+      safe_edit_thinking(chat_id, thinking_msg.message_id, f'🌐 <b>Отчет по чатам:</b>\n\n{html.escape(snap)}\n\n🧠 <i>Окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
       return
 
     target_id, target_name_html, target_plain_name, target_rank = resolve_target_smart(chat_id, message, prompt_text)
@@ -789,7 +763,7 @@ def handle_all_ai(message, prompt_text):
 
     if (intent or asking_rank_change) and caller_rank == 0:
       used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-      safe_edit_thinking(chat_id, thinking_msg.message_id, f'🤬 Ты даже не нищук, у тебя нет прав!\n\n🧠 <i>Контекстное окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
+      safe_edit_thinking(chat_id, thinking_msg.message_id, f'🤬 Ты даже не нищук, у тебя нет прав!\n\n🧠 <i>Окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
       return
 
     pre_executed_report = None
@@ -809,7 +783,7 @@ def handle_all_ai(message, prompt_text):
       else:
         PENDING_ACTION[chat_id] = {'action': intent, 'minutes': minutes, 'caller_id': caller.id, 'ts': time.time()}
         used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-        safe_edit_thinking(chat_id, thinking_msg.message_id, f'☝️ <b>Приказ ({intent.upper()}) принят в ожидание!</b>\nНо Telegram не отдает ботам ID других ботов просто по тексту, пока на их сообщение не ответят свайпом.\n\n👉 <b>Свайпни (ответь) прямо на ЛЮБОЕ сообщение нарушителя</b> в этом чате и напиши <code>мут</code> — я сразу сохраню его ID в Firebase навсегда и выдам мут!\n\n🧠 <i>Контекстное окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
+        safe_edit_thinking(chat_id, thinking_msg.message_id, f'☝️ <b>Приказ ({intent.upper()}) принят в ожидание!</b>\n👉 <b>Свайпни (ответь) прямо на ЛЮБОЕ сообщение нарушителя</b> в этом чате и напиши <code>мут</code> — я сразу сохраню его ID в Firebase навсегда и выдам мут!\n\n🧠 <i>Окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
         return
 
     global_chats_info = get_global_chats_snapshot(message.chat)
@@ -819,20 +793,22 @@ def handle_all_ai(message, prompt_text):
     current_place = f'Личный чат (ЛС) с Создателем {CREATOR_TITLE} ({CREATOR_DISPLAY_USER})' if message.chat.type == 'private' else f'Групповой чат «{message.chat.title}» (ID: {chat_id})'
 
     if caller_rank == 4:
-      speaker_identity_block = f'👑 С ТОБОЙ ГОВОРИТ ЛИЧНО ТВОЙ СОЗДАТЕЛЬ: {CREATOR_TITLE} ({CREATOR_DISPLAY_USER}, Уровень 4)!\nБеспрекословно уважай его, никогда не путай с другими участниками!'
+      speaker_identity_block = f'👑 С ТОБОЙ ГОВОРИТ ЛИЧНО ТВОЙ СОЗДАТЕЛЬ: {CREATOR_TITLE} ({CREATOR_DISPLAY_USER}, Уровень 4)!'
     else:
       speaker_identity_block = f"👤 С тобой говорит: {caller_clean_name} (@{caller.username or 'без_юза'}), ранг: {caller_rank_name} (Уровень {caller_rank})."
 
-    system_prompt = f'Ты — Алл, главный бот-администратор и искусственный интеллект этого Telegram-чата.\n{speaker_identity_block}\n\n📍 ТЕКУЩЕЕ МЕСТО: {current_place}\n🌐 СПИСОК ВСЕХ ГРУППОВЫХ ЧАТОВ В FIREBASE:\n{global_chats_info}\n\n💬 ПОСЛЕДНИЕ СООБЩЕНИЯ В ЭТОМ ЧАТЕ:\n{live_log_str}\n\n⚙️ СТАТУС ТЕКУЩЕГО ПРИКАЗА В TELEGRAM:\n{action_status_for_ai}\n(КРИТИЧЕСКОЕ ПРАВИЛО: НИКОГДА не пиши, что ты выдал мут/бан/кик, если в блоке СТАТУС ТЕКУЩЕГО ПРИКАЗА выше не написано ВЫПОЛНЕНО В TELEGRAM!)\n\nОтвечай по-русски, кратко (1-3 предложения), уверенно, без символов **.'
+    # ДОБАВЛЕНЫ РАНГИ В ПРОМПТ
+    system_prompt = f'Ты — Алл, главный бот-администратор и искусственный интеллект этого Telegram-чата.\n{speaker_identity_block}\n\nСПИСОК РАНГОВ В ЧАТЕ:\n0: 👤 Участник\n1: 🧹 Нищук\n2: ⚔️ Заглотус\n3: 💎 Баронесса\n4: 🥒 Слава Огурцов (Создатель)\n\n📍 ТЕКУЩЕЕ МЕСТО: {current_place}\n🌐 ЧАТЫ В FIREBASE:\n{global_chats_info}\n\n💬 ПОСЛЕДНИЕ СООБЩЕНИЯ:\n{live_log_str}\n\n⚙️ СТАТУС ПРИКАЗА В TELEGRAM:\n{action_status_for_ai}\n(КРИТИЧЕСКОЕ ПРАВИЛО: НИКОГДА не пиши, что ты выдал мут/бан/кик, если в блоке СТАТУС ПРИКАЗА выше не написано ВЫПОЛНЕНО В TELEGRAM!)\n\nОтвечай по-русски, кратко (1-3 предложения), уверенно, без символов **.'
+    
     formatted_user_turn = f"[Говорит: {caller_clean_name} (@{caller.username or 'без_юза'}) | Ранг: {caller_rank_name}]: {prompt_text or 'Ты тут?'}"
 
     ai_response, error_text = ask_ai(chat_id, system_prompt, formatted_user_turn, prompt_text or 'Ты тут?')
     used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-    ctx_footer = f'\n\n🧠 <i>Контекстное окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>'
+    ctx_footer = f'\n\n🧠 <i>Окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>'
 
     if error_text or not ai_response:
-      err_display = html.escape(str(error_text or 'Пустой ответ от модели'))
-      out_err = f'⚠️ <b>Ошибка:</b> <code>{err_display}</code>\n\nИзвините , агент временно не доступен'
+      err_display = html.escape(str(error_text or 'Пустой ответ'))
+      out_err = f'⚠️ <b>Ошибка:</b> <code>{err_display}</code>\n\nИзвините, агент временно недоступен'
       if pre_executed_report:
         out_err = f'{pre_executed_report}\n\n{out_err}'
       safe_edit_thinking(chat_id, thinking_msg.message_id, out_err + ctx_footer)
@@ -847,7 +823,7 @@ def handle_all_ai(message, prompt_text):
 
   except Exception as e:
     err_str = html.escape(str(e))
-    safe_edit_thinking(chat_id, thinking_msg.message_id, f'⚠️ <b>Ошибка:</b> <code>{err_str}</code>\n\nИзвините , агент временно не доступен')
+    safe_edit_thinking(chat_id, thinking_msg.message_id, f'⚠️ <b>Ошибка:</b> <code>{err_str}</code>')
 
 
 @bot.message_handler(content_types=['new_chat_members'])
@@ -855,7 +831,7 @@ def welcome_new_member(message):
   register_chat_in_firebase(message.chat)
   for user in message.new_chat_members:
     if user.id == get_bot_id():
-      bot.send_message(message.chat.id, f'⚡ <b>Алл на месте!</b>\nСоздатель: <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>.\nЧат «{html.escape(message.chat.title or "Группа")}» синхронизирован с Firebase!')
+      bot.send_message(message.chat.id, f'⚡ <b>Алл на месте!</b>\nСоздатель: <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>.')
     else:
       get_user_data(message.chat.id, user, message.chat)
       LAST_TARGET_ID[message.chat.id] = user.id
@@ -863,430 +839,414 @@ def welcome_new_member(message):
         save_creator_id(user.id)
         bot.send_message(message.chat.id, f'👑 В чат вошел создатель — <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>!')
       else:
-        bot.send_message(message.chat.id, f"👋 Добро пожаловать, <a href='tg://user?id={user.id}'>{clean_user_name(user)}</a>! Напиши <code>команды</code>, чтобы узнать правила.")
+        bot.send_message(message.chat.id, f"👋 Добро пожаловать, <a href='tg://user?id={user.id}'>{clean_user_name(user)}</a>! Напиши <code>команды</code>.")
 
 
 @bot.message_handler(content_types=['text', 'voice', 'photo', 'sticker', 'video', 'animation', 'document'])
 def handle_all_messages(message):
-  user = message.from_user
-  if not user:
-    return
+  try:
+    user = message.from_user
+    if not user:
+      return
 
-  if message.chat.type != 'private':
-    get_user_data(message.chat.id, user, message.chat)
-    if message.reply_to_message and message.reply_to_message.from_user:
-      r_u = message.reply_to_message.from_user
-      if r_u.id != get_bot_id():
-        get_user_data(message.chat.id, r_u, message.chat)
-        LAST_TARGET_ID[message.chat.id] = r_u.id
-        pending = PENDING_ACTION.get(message.chat.id)
-        if pending and (time.time() - pending['ts'] < 180) and pending['caller_id'] == user.id:
-          if message.content_type == 'text' and not message.text.lower().startswith(('размут', 'говори', 'профиль', 'кто ')):
-            PENDING_ACTION.pop(message.chat.id, None)
-            t_data = get_user_data(message.chat.id, r_u, message.chat)
-            t_link = display_name(message.chat.id, r_u, t_data)
-            t_rank = get_effective_rank(message.chat.id, r_u, t_data)
-            _, res_text = exec_mod_action(message.chat.id, user, r_u.id, t_link, t_rank, pending['action'], minutes=pending['minutes'], reason=f'По приказу {clean_user_name(user)}', reply_msg_id=message.message_id, target_msg_id=message.reply_to_message.message_id)
-            bot.reply_to(message, f'🎯 ID цели перехвачен и сохранен!\n{res_text}')
+    if message.chat.type != 'private':
+      get_user_data(message.chat.id, user, message.chat)
+      if message.reply_to_message and message.reply_to_message.from_user:
+        r_u = message.reply_to_message.from_user
+        if r_u.id != get_bot_id():
+          get_user_data(message.chat.id, r_u, message.chat)
+          LAST_TARGET_ID[message.chat.id] = r_u.id
+          pending = PENDING_ACTION.get(message.chat.id)
+          if pending and (time.time() - pending['ts'] < 180) and pending['caller_id'] == user.id:
+            if message.content_type == 'text' and not message.text.lower().startswith(('размут', 'говори', 'профиль', 'кто ')):
+              PENDING_ACTION.pop(message.chat.id, None)
+              t_data = get_user_data(message.chat.id, r_u, message.chat)
+              t_link = display_name(message.chat.id, r_u, t_data)
+              t_rank = get_effective_rank(message.chat.id, r_u, t_data)
+              _, res_text = exec_mod_action(message.chat.id, user, r_u.id, t_link, t_rank, pending['action'], minutes=pending['minutes'], reason=f'По приказу {clean_user_name(user)}', reply_msg_id=message.message_id, target_msg_id=message.reply_to_message.message_id)
+              bot.reply_to(message, f'🎯 ID цели перехвачен!\n{res_text}')
+              return
+
+    if message.content_type != 'text':
+      if message.chat.type != 'private':
+        if not is_creator_user(user):
+          LAST_TARGET_ID[message.chat.id] = user.id
+        record_live_chat_event(message.chat.id, clean_user_name(user), f'[{message.content_type}]')
+      return
+
+    text = message.text.strip()
+    text_lower = text.lower()
+
+    if is_creator_user(user):
+      save_creator_id(user.id)
+
+    is_boss = is_creator_user(user)
+
+    if text_lower in ['сброс', 'очистить контекст', 'очистить память', '/reset']:
+      CHAT_MEMORY[message.chat.id] = []
+      PENDING_ACTION.pop(message.chat.id, None)
+      bot.reply_to(message, f'🧹 <b>Контекстное окно очищено!</b>\n🧠 <i>Окно: 0/{MAX_CONTEXT_MESSAGES}</i>')
+      return
+
+    if text_lower in ['модели', '/models', 'список моделей']:
+      if not is_boss:
+        bot.reply_to(message, f'🤬 Управлять моделями может только создатель — <b>{CREATOR_TITLE}</b>!')
+        return
+      msg_text, kb = build_models_message_and_kb(page=0)
+      bot.reply_to(message, msg_text, reply_markup=kb)
+      return
+
+    if text_lower.startswith('модель '):
+      if not is_boss:
+        bot.reply_to(message, f'🤬 Менять модель может только создатель — <b>{CREATOR_TITLE}</b>!')
+        return
+      arg = text[7:].strip()
+      models = fetch_free_models()
+      if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(models):
+          chosen = models[idx]
+          set_active_model(chosen['id'])
+          bot.reply_to(message, f'✅ Модель переключена на:\n<b>{html.escape(chosen["name"])}</b>')
+        else:
+          bot.reply_to(message, f'⚠️ Номер должен быть от 1 до {len(models)}.')
+      else:
+        set_active_model(arg)
+        bot.reply_to(message, f'✅ Установлена модель:\n<code>{html.escape(arg)}</code>')
+      return
+
+    if message.chat.type == 'private':
+      creator_id = get_creator_id()
+      if is_boss:
+        save_creator_id(user.id)
+        if message.reply_to_message and message.reply_to_message.text:
+          m = re.search(r'\[ID:\s*(\d+)\]', message.reply_to_message.text)
+          if m:
+            target_uid = int(m.group(1))
+            try:
+              bot.send_message(target_uid, f'📩 <b>Ответ от {CREATOR_TITLE}:</b>\n\n{html.escape(text)}')
+              bot.reply_to(message, '✅ Доставлено!')
+            except Exception:
+              bot.reply_to(message, '⚠️ Не удалось доставить.')
             return
 
-  if message.content_type != 'text':
-    if message.chat.type != 'private':
-      if not is_creator_user(user):
-        LAST_TARGET_ID[message.chat.id] = user.id
-      record_live_chat_event(message.chat.id, clean_user_name(user), f'[{message.content_type}]')
-    return
-
-  text = message.text.strip()
-  text_lower = text.lower()
-
-  if is_creator_user(user):
-    save_creator_id(user.id)
-
-  is_boss = is_creator_user(user)
-
-  if text_lower in ['сброс', 'очистить контекст', 'очистить память', '/reset']:
-    CHAT_MEMORY[message.chat.id] = []
-    PENDING_ACTION.pop(message.chat.id, None)
-    bot.reply_to(message, f'🧹 <b>Контекстное окно диалога очищено!</b>\n🧠 <i>Контекстное окно: 0/{MAX_CONTEXT_MESSAGES}</i>')
-    return
-
-  if text_lower in ['модели', '/models', 'список моделей']:
-    if not is_boss:
-      bot.reply_to(message, f'🤬 Управлять моделями ИИ может только создатель — <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>!')
-      return
-    msg_text, kb = build_models_message_and_kb(page=0)
-    bot.reply_to(message, msg_text, reply_markup=kb)
-    return
-
-  if text_lower.startswith('модель '):
-    if not is_boss:
-      bot.reply_to(message, f'🤬 Менять модель может только создатель — <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>!')
-      return
-    arg = text[7:].strip()
-    models = fetch_free_models()
-    if arg.isdigit():
-      idx = int(arg) - 1
-      if 0 <= idx < len(models):
-        chosen = models[idx]
-        set_active_model(chosen['id'])
-        bot.reply_to(message, f'✅ Активная модель переключена на:\n<b>{html.escape(chosen["name"])}</b>\n(<code>{html.escape(chosen["id"])}</code>)')
-      else:
-        bot.reply_to(message, f'⚠️ Номер должен быть от 1 до {len(models)}. Напиши <code>модели</code> для списка.')
-    else:
-      set_active_model(arg)
-      bot.reply_to(message, f'✅ Установлена модель:\n<code>{html.escape(arg)}</code>')
-    return
-
-  if message.chat.type == 'private':
-    creator_id = get_creator_id()
-    if is_boss:
-      save_creator_id(user.id)
-      if message.reply_to_message and message.reply_to_message.text:
-        m = re.search(r'\[ID:\s*(\d+)\]', message.reply_to_message.text)
-        if m:
-          target_uid = int(m.group(1))
-          try:
-            bot.send_message(target_uid, f'📩 <b>Ответ от {CREATOR_TITLE}:</b>\n\n{html.escape(text)}')
-            bot.reply_to(message, '✅ Ответ доставлен пользователю!')
-          except Exception:
-            bot.reply_to(message, '⚠️ Не удалось доставить (пользователь заблокировал бота).')
+        if text_lower in ['/start', 'помощь', 'хелп', 'команды']:
+          used_ctx = len(CHAT_MEMORY.get(message.chat.id, []))
+          bot.reply_to(message, f'👑 Панель Создателя <b>{CREATOR_TITLE}</b>:\n\n• <code>проверь чаты</code> — беседы\n• <code>модели</code> — список моделей\n• <code>сброс</code> — очистить контекст\n• Любой текст — вопрос нейросети Алл')
           return
 
-      if text_lower in ['/start', 'помощь', 'хелп', 'команды']:
-        used_ctx = len(CHAT_MEMORY.get(message.chat.id, []))
-        bot.reply_to(message, f'👑 Панель Создателя <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>:\n\n• <code>проверь чаты</code> — список всех бесед\n• <code>модели</code> — список моделей\n• <code>сброс</code> — очистить контекст ({used_ctx}/{MAX_CONTEXT_MESSAGES})\n• Напиши любой вопрос — ответит нейросеть Алл')
+        clean_prompt = text[3:].lstrip(' ,:!-') if (text_lower == 'алл' or text_lower.startswith(('алл ', 'алл,', 'алл!'))) else text
+        handle_all_ai(message, clean_prompt)
         return
 
-      clean_prompt = text[3:].lstrip(' ,:!-') if (text_lower == 'алл' or text_lower.startswith(('алл ', 'алл,', 'алл!'))) else text
-      handle_all_ai(message, clean_prompt)
+      if creator_id:
+        try:
+          bot.send_message(creator_id, f'📨 <b>Сообщение в ЛС!</b>\n👤 От: <b>{clean_user_name(user)}</b> (@{user.username or "нет"})\n🆔 [ID: {user.id}]\n\n💬 {html.escape(text)}\n\n<i>↩️ Свайпни, чтобы ответить.</i>')
+        except Exception:
+          pass
+      bot.reply_to(message, '✉️ Сообщение передано создателю.')
       return
 
-    uname_str = f'@{user.username}' if user.username else 'без юзернейма'
-    if creator_id:
+    chat_id = message.chat.id
+    if not is_boss:
+      LAST_TARGET_ID[chat_id] = user.id
+
+    record_live_chat_event(chat_id, f"{clean_user_name(user)} (@{user.username or 'нет'})", text)
+
+    u_data = get_user_data(chat_id, user, message.chat)
+    new_msgs = int(u_data.get('messages', 0)) + 1
+    update_user_fields(chat_id, user.id, {'messages': new_msgs}, immediate=False)
+    caller_rank = get_effective_rank(chat_id, user, u_data)
+
+    if text_lower == 'алл' or text_lower.startswith(('алл ', 'алл,', 'алл!')):
+      prompt = text[3:].lstrip(' ,:!-')
+      handle_all_ai(message, prompt)
+      return
+
+    if text_lower in ['бот', 'пинг']:
+      used_ctx = len(CHAT_MEMORY.get(chat_id, []))
+      bot.reply_to(message, f'⚡ <b>Алл</b> на месте! Твой ранг: <b>{RANK_NAMES[caller_rank]}</b>.\n🧠 <i>Окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
+      return
+
+    if text_lower in ['команды', 'помощь', 'хелп', '/help', '/start']:
+      s0 = '✅ Доступно'
+      s1 = '✅ Доступно' if caller_rank >= 1 else '🔒 Недоступно'
+      s2 = '✅ Доступно' if caller_rank >= 2 else '🔒 Недоступно'
+      s3 = '✅ Доступно' if caller_rank >= 3 else '🔒 Недоступно'
+      s4 = '✅ Доступно' if caller_rank >= 4 else f'🔒 Только {CREATOR_TITLE}'
+      used_ctx = len(CHAT_MEMORY.get(chat_id, []))
+
+      cmd_text = f'📜 <b>Список команд</b>\nТвой статус: <b>{RANK_NAMES[caller_rank]}</b>\n🧠 Окно ИИ: <b>{used_ctx}/{MAX_CONTEXT_MESSAGES}</b>\n\n🤖 <b>ИИ Алл</b> [{s0}]:\n• <code>алл [вопрос]</code>\n• <code>сброс</code>\n\n👥 <b>Общие</b> [{s0}]:\n• <code>профиль</code>, <code>+ник [имя]</code>, <code>-ник</code>, <code>+</code> (реплай), <code>топ</code>, <code>админы</code>, <code>брак</code>, <code>развод</code>, <code>браки</code>, <code>рулетка</code>, <code>шар [вопрос]</code>\n\n🧹 <b>Ранг 1</b> [{s1}]:\n• <code>мут</code>, <code>размут</code>, <code>-смс</code>\n\n⚔️ <b>Ранг 2</b> [{s2}]:\n• <code>варн</code>, <code>разварн</code>, <code>кик</code>, <code>закреп</code>, <code>откреп</code>\n\n💎 <b>Ранг 3</b> [{s3}]:\n• <code>бан</code>, <code>разбан</code>, <code>мут всем</code>, <code>назначить нищук</code>\n\n🥒 <b>Создатель</b> [{s4}]:\n• <code>модели</code>, <code>назначить баронесса</code>'
+      bot.reply_to(message, cmd_text)
+      return
+
+    if text_lower.startswith(('мут всем', 'мут всём', 'замутить всех')):
+      words = text_lower.split()
+      mins = int(words[2]) if len(words) >= 3 and words[2].isdigit() else 60
+      _, res = exec_mod_action(chat_id, user, None, '', 0, 'mute_all', minutes=mins)
+      bot.reply_to(message, res)
+      return
+
+    if text_lower in ['размут всем', 'размут всём', 'размутить всех', 'открыть чат']:
+      _, res = exec_mod_action(chat_id, user, None, '', 0, 'unmute_all')
+      bot.reply_to(message, res)
+      return
+
+    if text_lower in ['тишина', 'закрыть чат']:
+      _, res = exec_mod_action(chat_id, user, None, '', 0, 'mute_all', minutes=60)
+      bot.reply_to(message, res)
+      return
+
+    if text_lower in ['кто я', 'профиль', 'кто ты', 'стата']:
+      target = message.reply_to_message.from_user if message.reply_to_message else user
+      tdata = get_user_data(chat_id, target, message.chat)
+      trank = get_effective_rank(chat_id, target, tdata)
+      tlink = display_name(chat_id, target, tdata)
+      partner_str = str(tdata.get('partner_name') or 'Свободен(а)')
+      nick_str = str(tdata.get('nick') or 'Не установлен')
+
+      bot.reply_to(message, f'🪪 <b>Карточка {tlink}</b>\n├ Статус: <b>{RANK_NAMES[trank]}</b>\n├ Ник: <b>{html.escape(nick_str)}</b>\n├ Актив: <b>{tdata.get("messages", 0)}</b>\n├ Авторитет: <b>+{tdata.get("reputation", 0)}</b>\n├ Брак: <b>{html.escape(partner_str)}</b>\n└ Варны: <b>{tdata.get("warns", 0)}/3</b>')
+      return
+
+    if text_lower.startswith('+ник '):
+      new_nick = text[5:].strip()[:30]
+      if new_nick:
+        update_user_fields(chat_id, user.id, {'nick': new_nick}, immediate=True)
+        bot.reply_to(message, f'🏷 Твой ник: <b>{html.escape(new_nick)}</b>')
+      return
+
+    if text_lower == '-ник':
+      update_user_fields(chat_id, user.id, {'nick': ''}, immediate=True)
+      bot.reply_to(message, '🗑 Ник сброшен.')
+      return
+
+    if text_lower in ['топ', 'актив', 'топ чата']:
+      all_u = get_all_chat_users(chat_id)
+      sorted_u = sorted(all_u.values(), key=lambda x: int(x.get('messages', 0)), reverse=True)[:10]
+      lines = ['🏆 <b>Топ активных:</b>\n']
+      for idx, item in enumerate(sorted_u, 1):
+        uname = str(item.get('username') or '').lower()
+        nm = CREATOR_TITLE if uname in CREATOR_USERNAMES else html.escape(str(item.get('nick') or item.get('name') or 'Участник'))
+        lines.append(f'{idx}. <b>{nm}</b> — 💬 {item.get("messages", 0)}')
+      bot.reply_to(message, '\n'.join(lines))
+      return
+
+    if text_lower in ['админы', 'кто админ', 'власть']:
+      all_u = get_all_chat_users(chat_id)
+      lines = [f'👑 <b>Создатель:</b> {CREATOR_TITLE}\n']
+      for r_lvl in [3, 2, 1]:
+        r_users = [html.escape(str(u.get('nick') or u.get('name') or 'Участник')) for u in all_u.values() if int(u.get('rank', 0)) == r_lvl and str(u.get('username') or '').lower() not in CREATOR_USERNAMES]
+        lines.append(f'<b>{RANK_NAMES[r_lvl]}:</b> ' + (', '.join(r_users) if r_users else '<i>пусто</i>'))
+      bot.reply_to(message, '\n'.join(lines))
+      return
+
+    if text_lower == 'браки':
+      all_u = get_all_chat_users(chat_id)
+      seen = set()
+      couples = []
+      for uid, u in all_u.items():
+        pid = str(u.get('partner', 0))
+        if pid != '0' and pid not in seen and uid not in seen:
+          seen.add(uid)
+          seen.add(pid)
+          couples.append(f"💍 <b>{html.escape(str(u.get('name', 'Участник')))}</b> ❤️ <b>{html.escape(str(u.get('partner_name', 'Партнер')))}</b>")
+      if not couples:
+        bot.reply_to(message, '💔 В этом чате пока нет союзов.')
+      else:
+        bot.reply_to(message, '💞 <b>Союзы:</b>\n\n' + '\n'.join(couples))
+      return
+
+    if text_lower == 'развод':
+      pid = int(u_data.get('partner', 0))
+      if not pid:
+        bot.reply_to(message, '🤷 Ты и так не состоишь в браке.')
+        return
+      update_user_fields(chat_id, user.id, {'partner': 0, 'partner_name': ''}, immediate=True)
+      update_user_fields(chat_id, pid, {'partner': 0, 'partner_name': ''}, immediate=True)
+      bot.reply_to(message, '💔 Брак расторгнут.')
+      return
+
+    if text_lower == 'рулетка':
+      if random.randint(1, 6) == 1:
+        bot.reply_to(message, f'💥 <b>БАХ!</b> {display_name(chat_id, user, u_data)} словил пулю!')
+      else:
+        bot.reply_to(message, f'😮‍💨 <i>Щелк!</i> Патрон холостой, {display_name(chat_id, user, u_data)} выживает!')
+      return
+
+    if text_lower.startswith('шар '):
+      answers = ['Бесспорно!', 'Даже не думай.', '100% так и будет!', 'Спроси позже.', 'Шансы отличные!', 'Полный бред.', 'Определенно да!']
+      bot.reply_to(message, f'🎱 <b>Ответ шара:</b> {random.choice(answers)}')
+      return
+
+    if text_lower.startswith('инфа '):
+      bot.reply_to(message, f'📊 Вероятность этого: <b>{random.randint(0, 100)}%</b>')
+      return
+
+    if not message.reply_to_message:
+      return
+
+    target = message.reply_to_message.from_user
+    first_word = text_lower.split()[0] if text_lower else ''
+    exact_reply_cmds = {'+', 'спасибо', 'сяб', 'реп', 'брак', 'дуэль', 'обнять', 'поцеловать', 'кусь', 'ударить', 'пнуть', 'назначить', 'разжаловать', 'снять', 'закреп', 'откреп', '-смс', 'удалить', 'мут', 'размут', 'говори', 'варн', 'пред', 'разварн', 'кик', 'бан', 'разбан'}
+
+    if target.id == get_bot_id() and first_word not in exact_reply_cmds and text_lower not in ['пожать руку', 'снять варны', 'снять админку']:
+      handle_all_ai(message, text)
+      return
+
+    target_data = get_user_data(chat_id, target, message.chat)
+    target_link = display_name(chat_id, target, target_data)
+    target_rank = get_effective_rank(chat_id, target, target_data)
+    caller_link = display_name(chat_id, user, u_data)
+
+    if text_lower in ['+', 'спасибо', 'сяб', 'реп']:
+      if target.id != user.id and not target.is_bot:
+        new_rep = int(target_data.get('reputation', 0)) + 1
+        update_user_fields(chat_id, target.id, {'reputation': new_rep}, immediate=True)
+        bot.reply_to(message, f'📈 Авторитет {target_link} вырос! (+{new_rep})')
+      return
+
+    if text_lower == 'брак':
+      if target.id == user.id or target.is_bot:
+        bot.reply_to(message, '🤨 С ботом нельзя!')
+        return
+      if u_data.get('partner') or target_data.get('partner'):
+        bot.reply_to(message, '💍 Кто-то уже в браке! Напишите <code>развод</code>.')
+        return
+      update_user_fields(chat_id, user.id, {'partner': target.id, 'partner_name': clean_user_name(target)}, immediate=True)
+      update_user_fields(chat_id, target.id, {'partner': user.id, 'partner_name': clean_user_name(user)}, immediate=True)
+      bot.reply_to(message, f'💍 Горько! {caller_link} и {target_link} теперь в браке!')
+      return
+
+    if text_lower == 'дуэль':
+      if target.id == user.id: return
+      winner = caller_link if random.choice([True, False]) else target_link
+      bot.reply_to(message, f'🔫 Дуэль! 🏆 Победил: <b>{winner}</b>!')
+      return
+
+    rp_map = {
+        'обнять': f'🤗 {caller_link} обнял(а) {target_link}!',
+        'поцеловать': f'💋 {caller_link} поцеловал(а) {target_link}!',
+        'кусь': f'🦷 {caller_link} сделал(а) кусь {target_link}!',
+        'ударить': f'👊 {caller_link} прописал(а) леща {target_link}!',
+        'пнуть': f'🦵 {caller_link} пнул(а) {target_link}!',
+        'пожать руку': f'🤝 {caller_link} пожал(а) руку {target_link}!',
+    }
+    if text_lower in rp_map:
+      bot.reply_to(message, rp_map[text_lower])
+      return
+
+    if text_lower.startswith('назначить '):
+      role_arg = text_lower.replace('назначить ', '').strip()
+      role_map = {'нищук': 1, 'нищука': 1, 'нищуком': 1, 'заглотус': 2, 'заглотуса': 2, 'заглотусом': 2, 'баронесса': 3, 'баронессу': 3, 'баронессой': 3}
+      if role_arg not in role_map:
+        bot.reply_to(message, 'ℹ️ Укажи ранг: <code>назначить нищук</code>, <code>назначить заглотус</code> или <code>назначить баронесса</code>.')
+        return
+
+      new_r = role_map[role_arg]
+      if caller_rank == 0:
+        bot.reply_to(message, '🤬 Ты даже не нищук!')
+        return
+      if caller_rank < 3:
+        bot.reply_to(message, '🤬 Назначать могут 💎 Баронесса и Создатель!')
+        return
+      if new_r == 3 and caller_rank < 4:
+        bot.reply_to(message, f'👑 Баронессу может дать только Создатель!')
+        return
+      if target_rank == 4:
+        bot.reply_to(message, f'👑 Нельзя менять статус Создателя!')
+        return
+
+      update_user_fields(chat_id, target.id, {'rank': new_r}, immediate=True)
+      bot.reply_to(message, f'🎖 {target_link} присвоен ранг: <b>{RANK_NAMES[new_r]}</b>!')
+      return
+
+    if text_lower in ['разжаловать', 'снять', 'снять админку']:
+      if caller_rank == 0:
+        bot.reply_to(message, '🤬 Ты даже не нищук!')
+        return
+      if caller_rank < 3 or caller_rank <= target_rank:
+        bot.reply_to(message, '❌ Недостаточно прав!')
+        return
+      update_user_fields(chat_id, target.id, {'rank': 0}, immediate=True)
+      bot.reply_to(message, f'📉 {target_link} разжалован.')
+      return
+
+    if text_lower == 'закреп':
+      if caller_rank < 2:
+        bot.reply_to(message, '❌ Закреп с ранга ⚔️ Заглотус!')
+        return
       try:
-        bot.send_message(creator_id, f'📨 <b>Новое сообщение в ЛС!</b>\n👤 От: <b>{clean_user_name(user)}</b> ({uname_str})\n🆔 [ID: {user.id}]\n\n💬 {html.escape(text)}\n\n<i>↩️ Свайпни на это сообщение, чтобы ответить ему.</i>')
+        bot.pin_chat_message(chat_id, message.reply_to_message.message_id)
+        bot.reply_to(message, '📌 Закреплено!')
       except Exception:
-        pass
-    bot.reply_to(message, '✉️ Сообщение передано создателю. Ожидай ответа!')
-    return
+        bot.reply_to(message, '⚠️ Дай право закреплять.')
+      return
 
-  chat_id = message.chat.id
-  if not is_boss:
-    LAST_TARGET_ID[chat_id] = user.id
+    if text_lower == 'откреп':
+      if caller_rank < 2:
+        bot.reply_to(message, '❌ Откреп с ранга ⚔️ Заглотус!')
+        return
+      try:
+        bot.unpin_chat_message(chat_id, message.reply_to_message.message_id)
+        bot.reply_to(message, '📍 Откреплено!')
+      except Exception:
+        bot.reply_to(message, '⚠️ Не удалось.')
+      return
 
-  record_live_chat_event(chat_id, f"{clean_user_name(user)} (@{user.username or 'нет'})", text)
-
-  u_data = get_user_data(chat_id, user, message.chat)
-  new_msgs = int(u_data.get('messages', 0)) + 1
-  update_user_fields(chat_id, user.id, {'messages': new_msgs}, immediate=False)
-  caller_rank = get_effective_rank(chat_id, user, u_data)
-
-  if text_lower == 'алл' or text_lower.startswith(('алл ', 'алл,', 'алл!')):
-    prompt = text[3:].lstrip(' ,:!-')
-    handle_all_ai(message, prompt)
-    return
-
-  if text_lower in ['бот', 'пинг']:
-    used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-    bot.reply_to(message, f'⚡ <b>Алл</b> на месте в чате «{html.escape(message.chat.title or "Группа")}»! Твой ранг: <b>{RANK_NAMES[caller_rank]}</b>.\n🧠 <i>Контекстное окно: {used_ctx}/{MAX_CONTEXT_MESSAGES}</i>')
-    return
-
-  if text_lower in ['команды', 'помощь', 'хелп', '/help', '/start']:
-    s0 = '✅ Доступно'
-    s1 = '✅ Доступно' if caller_rank >= 1 else '🔒 Недоступно (нужен: 🧹 Нищук)'
-    s2 = '✅ Доступно' if caller_rank >= 2 else '🔒 Недоступно (нужен: ⚔️ Заглотус)'
-    s3 = '✅ Доступно' if caller_rank >= 3 else '🔒 Недоступно (нужен: 💎 Баронесса)'
-    s4 = '✅ Доступно' if caller_rank >= 4 else f'🔒 Недоступно (только 🥒 {CREATOR_TITLE})'
-    used_ctx = len(CHAT_MEMORY.get(chat_id, []))
-
-    cmd_text = f'📜 <b>Список команд бота Алл</b>\nТвой статус: <b>{RANK_NAMES[caller_rank]}</b>\n🧠 Контекстное окно ИИ: <b>{used_ctx}/{MAX_CONTEXT_MESSAGES}</b>\n\n🤖 <b>Нейросеть Алл</b> [{s0}]:\n• <code>алл [вопрос/приказ]</code> или свайп на сообщение бота — живой ИИ чата\n• <code>сброс</code> / <code>алл сброс</code> — очистить контекстное окно\n\n👥 <b>Общие и развлечения</b> [{s0}]:\n• <code>профиль</code> / <code>кто я</code> / <code>кто ты</code> — карточка участника\n• <code>+ник [имя]</code> / <code>-ник</code> — установить или убрать ник\n• <code>+</code> / <code>спасибо</code> (реплай) — поднять уважение\n• <code>топ</code> / <code>актив</code> — рейтинг самых активных в чате\n• <code>админы</code> / <code>кто админ</code> — список властей чата\n• <code>брак</code> (реплай) / <code>развод</code> / <code>браки</code> — система отношений\n• <code>дуэль</code> (реплай) / <code>рулетка</code> / <code>шар [вопрос]</code> / <code>инфа [текст]</code>\n• РП-действия (реплай): <code>обнять</code>, <code>поцеловать</code>, <code>кусь</code>, <code>ударить</code>, <code>пнуть</code>, <code>пожать руку</code>\n\n🧹 <b>Ранг 1: Нищук</b> [{s1}]:\n• <code>мут [минуты] [причина]</code> (реплай) — закрыть рот\n• <code>размут</code> / <code>говори</code> (реплай) — снять мут\n• <code>-смс</code> / <code>удалить</code> (реплай) — снести сообщение\n\n⚔️ <b>Ранг 2: Заглотус</b> [{s2}]:\n• <code>варн [причина]</code> / <code>пред</code> (реплай) — выдать пред (3/3 = бан)\n• <code>разварн</code> / <code>снять варны</code> (реплай) — обнулить преды\n• <code>кик</code> (реплай) — выкинуть из чата\n• <code>закреп</code> / <code>откреп</code> (реплай) — управление закрепом\n\n💎 <b>Ранг 3: Баронесса</b> [{s3}]:\n• <code>бан [причина]</code> / <code>разбан</code> (реплай) — вечная блокировка\n• <code>мут всем [мин]</code> / <code>размут всем</code> / <code>тишина</code> / <code>открыть чат</code>\n• <code>назначить нищук</code> / <code>назначить заглотус</code> (реплай)\n• <code>разжаловать</code> / <code>снять</code> (реплай) — снять ранг\n\n🥒 <b>Создатель ({CREATOR_TITLE})</b> [{s4}]:\n• <code>модели</code> / <code>модель [номер]</code> — выбор модели ИИ Groq\n• <code>назначить баронесса</code> (реплай) — выдать высший ранг'
-    bot.reply_to(message, cmd_text)
-    return
-
-  if text_lower.startswith(('мут всем', 'мут всём', 'замутить всех')):
     words = text_lower.split()
-    mins = int(words[2]) if len(words) >= 3 and words[2].isdigit() else 60
-    _, res = exec_mod_action(chat_id, user, None, '', 0, 'mute_all', minutes=mins)
-    bot.reply_to(message, res)
-    return
+    cmd = words[0]
 
-  if text_lower in ['размут всем', 'размут всём', 'размутить всех', 'открыть чат']:
-    _, res = exec_mod_action(chat_id, user, None, '', 0, 'unmute_all')
-    bot.reply_to(message, res)
-    return
-
-  if text_lower in ['тишина', 'закрыть чат']:
-    _, res = exec_mod_action(chat_id, user, None, '', 0, 'mute_all', minutes=60)
-    bot.reply_to(message, res)
-    return
-
-  if text_lower in ['кто я', 'профиль', 'кто ты', 'стата']:
-    target = message.reply_to_message.from_user if message.reply_to_message else user
-    tdata = get_user_data(chat_id, target, message.chat)
-    trank = get_effective_rank(chat_id, target, tdata)
-    tlink = display_name(chat_id, target, tdata)
-    partner_str = str(tdata.get('partner_name') or 'Свободен(а)')
-    nick_str = str(tdata.get('nick') or 'Не установлен')
-
-    bot.reply_to(message, f'🪪 <b>Карточка {tlink}</b>\n├ Статус: <b>{RANK_NAMES[trank]}</b>\n├ Ник: <b>{html.escape(nick_str)}</b>\n├ Актив: <b>{tdata.get("messages", 0)} сообщ.</b>\n├ Авторитет: <b>+{tdata.get("reputation", 0)}</b>\n├ Брак: <b>{html.escape(partner_str)}</b>\n└ Предупреждения: <b>{tdata.get("warns", 0)}/3</b>')
-    return
-
-  if text_lower.startswith('+ник '):
-    new_nick = text[5:].strip()[:30]
-    if new_nick:
-      update_user_fields(chat_id, user.id, {'nick': new_nick}, immediate=True)
-      bot.reply_to(message, f'🏷 Твой новый ник в чате: <b>{html.escape(new_nick)}</b>')
-    return
-
-  if text_lower == '-ник':
-    update_user_fields(chat_id, user.id, {'nick': ''}, immediate=True)
-    bot.reply_to(message, '🗑 Ник сброшен.')
-    return
-
-  if text_lower in ['топ', 'актив', 'топ чата']:
-    all_u = get_all_chat_users(chat_id)
-    sorted_u = sorted(all_u.values(), key=lambda x: int(x.get('messages', 0)), reverse=True)[:10]
-    lines = ['🏆 <b>Топ самых активных в чате:</b>\n']
-    for idx, item in enumerate(sorted_u, 1):
-      uname = str(item.get('username') or '').lower()
-      nm = CREATOR_TITLE if uname in CREATOR_USERNAMES else html.escape(str(item.get('nick') or item.get('name') or 'Участник'))
-      ms = item.get('messages', 0)
-      rp = item.get('reputation', 0)
-      lines.append(f'{idx}. <b>{nm}</b> — 💬 {ms} (⭐️ +{rp})')
-    bot.reply_to(message, '\n'.join(lines))
-    return
-
-  if text_lower in ['админы', 'кто админ', 'власть']:
-    all_u = get_all_chat_users(chat_id)
-    lines = [f'👑 <b>Создатель:</b> {CREATOR_TITLE} ({CREATOR_DISPLAY_USER})\n']
-    for r_lvl in [3, 2, 1]:
-      r_users = [html.escape(str(u.get('nick') or u.get('name') or 'Участник')) for u in all_u.values() if int(u.get('rank', 0)) == r_lvl and str(u.get('username') or '').lower() not in CREATOR_USERNAMES]
-      lines.append(f'<b>{RANK_NAMES[r_lvl]}:</b> ' + (', '.join(r_users) if r_users else '<i>пусто</i>'))
-    bot.reply_to(message, '\n'.join(lines))
-    return
-
-  if text_lower == 'браки':
-    all_u = get_all_chat_users(chat_id)
-    seen = set()
-    couples = []
-    for uid, u in all_u.items():
-      pid = str(u.get('partner', 0))
-      if pid != '0' and pid not in seen and uid not in seen:
-        seen.add(uid)
-        seen.add(pid)
-        couples.append(f"💍 <b>{html.escape(str(u.get('name', 'Участник')))}</b> ❤️ <b>{html.escape(str(u.get('partner_name', 'Партнер')))}</b>")
-    if not couples:
-      bot.reply_to(message, '💔 В этом чате пока нет заключенных союзов.')
-    else:
-      bot.reply_to(message, '💞 <b>Союзы чата:</b>\n\n' + '\n'.join(couples))
-    return
-
-  if text_lower == 'развод':
-    pid = int(u_data.get('partner', 0))
-    if not pid:
-      bot.reply_to(message, '🤷 Ты и так не состоишь в браке.')
-      return
-    update_user_fields(chat_id, user.id, {'partner': 0, 'partner_name': ''}, immediate=True)
-    update_user_fields(chat_id, pid, {'partner': 0, 'partner_name': ''}, immediate=True)
-    bot.reply_to(message, '💔 Брак официально расторгнут. Теперь ты свободен(а)!')
-    return
-
-  if text_lower == 'рулетка':
-    if random.randint(1, 6) == 1:
-      bot.reply_to(message, f'💥 <b>БАХ!</b> {display_name(chat_id, user, u_data)} словил пулю в русской рулетке!')
-    else:
-      bot.reply_to(message, f'😮‍💨 <i>Щелк!</i> Патрон оказался холостым, {display_name(chat_id, user, u_data)} выживает!')
-    return
-
-  if text_lower.startswith('шар '):
-    answers = ['Бесспорно!', 'Даже не думай.', '100% так и будет!', 'Спроси позже.', 'Шансы отличные!', 'Полный бред.', 'Определенно да!']
-    bot.reply_to(message, f'🎱 <b>Ответ шара:</b> {random.choice(answers)}')
-    return
-
-  if text_lower.startswith('инфа '):
-    bot.reply_to(message, f'📊 Вероятность этого составляет: <b>{random.randint(0, 100)}%</b>')
-    return
-
-  if not message.reply_to_message:
-    return
-
-  target = message.reply_to_message.from_user
-  first_word = text_lower.split()[0] if text_lower else ''
-  exact_reply_cmds = {'+', 'спасибо', 'сяб', 'реп', 'брак', 'дуэль', 'обнять', 'поцеловать', 'кусь', 'ударить', 'пнуть', 'назначить', 'разжаловать', 'снять', 'закреп', 'откреп', '-смс', 'удалить', 'мут', 'размут', 'говори', 'варн', 'пред', 'разварн', 'кик', 'бан', 'разбан'}
-
-  if target.id == get_bot_id() and first_word not in exact_reply_cmds and text_lower not in ['пожать руку', 'снять варны', 'снять админку']:
-    handle_all_ai(message, text)
-    return
-
-  target_data = get_user_data(chat_id, target, message.chat)
-  target_link = display_name(chat_id, target, target_data)
-  target_rank = get_effective_rank(chat_id, target, target_data)
-  caller_link = display_name(chat_id, user, u_data)
-
-  if text_lower in ['+', 'спасибо', 'сяб', 'реп']:
-    if target.id != user.id and not target.is_bot:
-      new_rep = int(target_data.get('reputation', 0)) + 1
-      update_user_fields(chat_id, target.id, {'reputation': new_rep}, immediate=True)
-      bot.reply_to(message, f'📈 Авторитет {target_link} вырос! (Всего: <b>+{new_rep}</b>)')
-    return
-
-  if text_lower == 'брак':
-    if target.id == user.id or target.is_bot:
-      bot.reply_to(message, '🤨 С самим собой или с ботом расписаться нельзя!')
-      return
-    if u_data.get('partner') or target_data.get('partner'):
-      bot.reply_to(message, '💍 Кто-то из вас уже состоит в браке! Сначала напишите <code>развод</code>.')
-      return
-    update_user_fields(chat_id, user.id, {'partner': target.id, 'partner_name': clean_user_name(target)}, immediate=True)
-    update_user_fields(chat_id, target.id, {'partner': user.id, 'partner_name': clean_user_name(user)}, immediate=True)
-    bot.reply_to(message, f'💍 Горько! {caller_link} и {target_link} теперь официально в браке!')
-    return
-
-  if text_lower == 'дуэль':
-    if target.id == user.id:
-      return
-    winner = caller_link if random.choice([True, False]) else target_link
-    bot.reply_to(message, f'🔫 Дуэль между {caller_link} и {target_link}!\n🏆 Победителем выходит: <b>{winner}</b>!')
-    return
-
-  rp_map = {
-      'обнять': f'🤗 {caller_link} крепко обнял(а) {target_link}!',
-      'поцеловать': f'💋 {caller_link} страстно поцеловал(а) {target_link}!',
-      'кусь': f'🦷 {caller_link} сделал(а) внезапный кусь {target_link}!',
-      'ударить': f'👊 {caller_link} прописал(а) леща {target_link}!',
-      'пнуть': f'🦵 {caller_link} отвесил(а) смачного пинка {target_link}!',
-      'пожать руку': f'🤝 {caller_link} выразил(а) респект и пожал(а) руку {target_link}!',
-  }
-  if text_lower in rp_map:
-    bot.reply_to(message, rp_map[text_lower])
-    return
-
-  if text_lower.startswith('назначить '):
-    role_arg = text_lower.replace('назначить ', '').strip()
-    role_map = {'нищук': 1, 'нищука': 1, 'нищуком': 1, 'заглотус': 2, 'заглотуса': 2, 'заглотусом': 2, 'баронесса': 3, 'баронессу': 3, 'баронессой': 3}
-    if role_arg not in role_map:
-      bot.reply_to(message, 'ℹ️ Укажи ранг: <code>назначить нищук</code>, <code>назначить заглотус</code> или <code>назначить баронесса</code>.')
+    if cmd in ['-смс', 'удалить']:
+      ok, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'delete', reply_msg_id=message.message_id, target_msg_id=message.reply_to_message.message_id)
+      if not ok and res:
+        bot.reply_to(message, res)
       return
 
-    new_r = role_map[role_arg]
-    if caller_rank == 0:
-      bot.reply_to(message, '🤬 Ты даже не нищук, у тебя нет прав!')
-      return
-    if caller_rank < 3:
-      bot.reply_to(message, '🤬 Назначать ранги могут только 💎 Баронесса и 🥒 Слава Огурцов!')
-      return
-    if new_r == 3 and caller_rank < 4:
-      bot.reply_to(message, f'👑 Назначать ранг <b>💎 Баронесса</b> может только создатель — <b>{CREATOR_TITLE} ({CREATOR_DISPLAY_USER})</b>!')
-      return
-    if target_rank == 4:
-      bot.reply_to(message, f'👑 Нельзя менять статус создателя <b>{CREATOR_TITLE}</b>!')
+    if cmd == 'мут':
+      minutes = 60
+      reason = 'Без причины'
+      if len(words) >= 2 and words[1].isdigit():
+        minutes = max(1, int(words[1]))
+        if len(words) >= 3: reason = ' '.join(text.split()[2:])
+      elif len(words) >= 2: reason = ' '.join(text.split()[1:])
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'mute', minutes=minutes, reason=reason)
+      if res: bot.reply_to(message, res)
       return
 
-    update_user_fields(chat_id, target.id, {'rank': new_r}, immediate=True)
-    bot.reply_to(message, f'🎖 Пользователю {target_link} присвоен ранг: <b>{RANK_NAMES[new_r]}</b>!')
-    return
-
-  if text_lower in ['разжаловать', 'снять', 'снять админку']:
-    if caller_rank == 0:
-      bot.reply_to(message, '🤬 Ты даже не нищук, у тебя нет прав!')
+    if cmd in ['размут', 'говори']:
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unmute')
+      if res: bot.reply_to(message, res)
       return
-    if caller_rank < 3 or caller_rank <= target_rank:
-      bot.reply_to(message, '❌ У тебя недостаточно прав, чтобы разжаловать этого человека!')
+
+    if cmd in ['варн', 'пред']:
+      reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Нарушение'
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'warn', reason=reason)
+      if res: bot.reply_to(message, res)
       return
-    update_user_fields(chat_id, target.id, {'rank': 0}, immediate=True)
-    bot.reply_to(message, f'📉 {target_link} разжалован до обычного участника.')
-    return
 
-  if text_lower == 'закреп':
-    if caller_rank == 0:
-      bot.reply_to(message, '🤬 Ты даже не нищук, у тебя нет прав!')
+    if cmd == 'разварн' or text_lower == 'снять варны':
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unwarn')
+      if res: bot.reply_to(message, res)
       return
-    if caller_rank < 2:
-      bot.reply_to(message, '❌ Закреп доступен минимум с ранга ⚔️ Заглотус!')
+
+    if cmd == 'кик':
+      reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Исключен'
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'kick', reason=reason)
+      if res: bot.reply_to(message, res)
       return
-    try:
-      bot.pin_chat_message(chat_id, message.reply_to_message.message_id)
-      bot.reply_to(message, '📌 Сообщение закреплено!')
-    except Exception:
-      bot.reply_to(message, '⚠️ Дай мне право закреплять сообщения в настройках чата.')
-    return
 
-  if text_lower == 'откреп':
-    if caller_rank == 0:
-      bot.reply_to(message, '🤬 Ты даже не нищук, у тебя нет прав!')
+    if cmd == 'бан':
+      reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Забанен'
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'ban', reason=reason)
+      if res: bot.reply_to(message, res)
       return
-    if caller_rank < 2:
-      bot.reply_to(message, '❌ Откреп доступен минимум с ранга ⚔️ Заглотус!')
+
+    if cmd == 'разбан':
+      _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unban')
+      if res: bot.reply_to(message, res)
       return
-    try:
-      bot.unpin_chat_message(chat_id, message.reply_to_message.message_id)
-      bot.reply_to(message, '📍 Сообщение откреплено!')
-    except Exception:
-      bot.reply_to(message, '⚠️ Не удалось открепить сообщение.')
-    return
+  except Exception as e:
+    print(f"Ошибка в хендлере: {e}")
 
-  words = text_lower.split()
-  cmd = words[0]
-
-  if cmd in ['-смс', 'удалить']:
-    ok, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'delete', reply_msg_id=message.message_id, target_msg_id=message.reply_to_message.message_id)
-    if not ok and res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd == 'мут':
-    minutes = 60
-    reason = 'Без причины'
-    if len(words) >= 2 and words[1].isdigit():
-      minutes = max(1, int(words[1]))
-      if len(words) >= 3:
-        reason = ' '.join(text.split()[2:])
-    elif len(words) >= 2:
-      reason = ' '.join(text.split()[1:])
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'mute', minutes=minutes, reason=reason)
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd in ['размут', 'говори']:
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unmute')
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd in ['варн', 'пред']:
-    reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Нарушение порядка'
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'warn', reason=reason)
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd == 'разварн' or text_lower == 'снять варны':
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unwarn')
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd == 'кик':
-    reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Исключен администрацией'
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'kick', reason=reason)
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd == 'бан':
-    reason = ' '.join(text.split()[1:]) if len(words) >= 2 else 'Заблокирован администрацией'
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'ban', reason=reason)
-    if res:
-      bot.reply_to(message, res)
-    return
-
-  if cmd == 'разбан':
-    _, res = exec_mod_action(chat_id, user, target.id, target_link, target_rank, 'unban')
-    if res:
-      bot.reply_to(message, res)
-    return
-
-print('⚡ БОТ АЛЛ ЗАПУЩЕН (GROQ + ENV SECURITY)!')
+print('⚡ БОТ АЛЛ ЗАПУЩЕН!')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
