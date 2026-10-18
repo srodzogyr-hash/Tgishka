@@ -106,7 +106,7 @@ def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
     
     payload = {
         "contents": contents,
-        "system_instruction": {"parts": [{"text": "Ты — умный секретарь Славы. Отвечай кратко, по делу. Не говори, что ты ИИ, если не спросят напрямую."}]}
+        "system_instruction": {"parts": [{"text": "Ты — умный и полезный ИИ-ассистент. Отвечай на вопросы пользователя."}]}
     }
     
     try:
@@ -122,10 +122,9 @@ def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
         
         contents.append({"role": "model", "parts": [{"text": reply_text}]})
         
-        # Логика контекстного окна
         limit = CONFIG.get('context_limit', 100)
         if len(contents) > limit:
-            contents = contents[-limit:]  # Оставляем только последние N сообщений
+            contents = contents[-limit:] 
             
         CHAT_MEMORY[chat_id] = contents
         return reply_text, None, len(contents)
@@ -176,13 +175,13 @@ def handle_admin_text(message):
         status = "ВКЛ" if CONFIG['auto_reply_enabled'] else "ВЫКЛ"
         help_text = (
             f"📜 <b>Список команд:</b>\n\n"
-            f"<code>модели</code> — список доступных моделей\n"
-            f"<code>автоответчик вкл/выкл</code> — автоответ для чужих (сейчас {status})\n"
-            f"<code>контекст [число]</code> — изменить лимит (сейчас {limit})\n"
-            f"<code>запретить @юзер</code> — бан в автоответчике\n"
-            f"<code>разрешить @юзер</code> — разбан\n"
+            f"<code>модели</code> — список моделей\n"
+            f"<code>автоответчик вкл/выкл</code> — автоответ (сейчас {status})\n"
+            f"<code>контекст [число]</code> — лимит (сейчас {limit})\n"
+            f"<code>запретить @юзер</code> — заблокировать вызов ИИ\n"
+            f"<code>разрешить @юзер</code> — разблокировать\n"
             f"<code>сброс</code> — очистить память (сейчас {ctx_now}/{limit})\n"
-            f"<code>гпт [текст]</code> — прямой вызов ИИ (работает и в ЛС, и в бизнес-чатах)"
+            f"<code>гпт [текст]</code> — вызов ИИ"
         )
         bot.reply_to(message, help_text)
         return
@@ -212,12 +211,12 @@ def handle_admin_text(message):
         except:
             bot.reply_to(message, "⚠️ Напиши число: <code>контекст 50</code>")
         return
-        
+
     if text.startswith('запретить '):
         uname = text.split()[1].replace('@', '')
         CONFIG['blacklist'][uname] = True
         save_config()
-        bot.reply_to(message, f"🚫 @{uname} заблокирован.")
+        bot.reply_to(message, f"🚫 @{uname} больше не может вызывать ИИ.")
         return
         
     if text.startswith('разрешить '):
@@ -231,10 +230,9 @@ def handle_admin_text(message):
     if text in ['сброс', 'гпт сброс']:
         CHAT_MEMORY[chat_id] = []
         limit = CONFIG.get('context_limit', 100)
-        bot.reply_to(message, f"🧹 Память очищена!\n\n🧠 Контекст: 0/{limit}")
+        bot.reply_to(message, f"🧹 Память очищена.\ncontext: 0/{limit}")
         return
 
-    # --- ТЕСТОВЫЙ РЕЖИМ В ЛИЧКЕ БОТА ---
     if text.startswith('гпт '):
         prompt = message.text[4:].strip()
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
@@ -249,7 +247,7 @@ def handle_admin_text(message):
         
         limit = CONFIG.get('context_limit', 100)
         if reply:
-            final_text = f"{reply}\n\n🧠 Контекст: {ctx_len}/{limit}"
+            final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
             bot.edit_message_text(final_text, message.chat.id, loading_msg.message_id)
         else:
             bot.edit_message_text(f"⚠️ Ошибка API:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
@@ -263,12 +261,12 @@ def callback_set_model(call):
     save_config()
     bot.edit_message_text(f"✅ Активная модель: <b>{model}</b>", call.message.chat.id, call.message.message_id)
 
-# --- СЕКРЕТАРЬ (ДЛЯ РЕАЛЬНЫХ КЛИЕНТОВ) ---
+# --- БИЗНЕС-СООБЩЕНИЯ ---
 @bot.business_message_handler(content_types=['text', 'photo'])
 def handle_business_message(message):
     global CREATOR_ID
     if not message.from_user: return
-    if message.from_user.id == bot.get_me().id: return # Игнорим себя
+    if message.from_user.id == bot.get_me().id: return 
     
     chat_id = message.chat.id
     text = message.text or ""
@@ -276,45 +274,38 @@ def handle_business_message(message):
     
     is_owner = (message.from_user.username or '').lower() == CREATOR_USERNAME
     is_gpt = lower_text.startswith('гпт ')
+    is_reply = bool(message.reply_to_message)
     
-    # Проверяем, является ли сообщение реплаем на сообщение бота
-    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot.get_me().id
-    
-    # --- ЛОГИКА ФИЛЬТРАЦИИ ---
+    # --- ПРОВЕРКА ЧЕРНОГО СПИСКА ---
+    user_uname = (message.from_user.username or '').lower()
+    if not is_owner and user_uname in CONFIG.get('blacklist', {}):
+        return # Игнорируем забаненных
+
     if is_owner:
         CREATOR_ID = message.from_user.id
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
-        
-        # Владелец должен писать "гпт ..." или отвечать на сообщение бота, чтобы тот ответил
         if not (is_gpt or is_reply):
             return
     else:
-        # Если пишет забаненный
-        if (message.from_user.username or '').lower() in CONFIG['blacklist']:
-            return
-            
-        # Если это не прямой вызов и не реплай, проверяем автоответчик и таймер
         if not (is_gpt or is_reply):
             if not CONFIG['auto_reply_enabled']:
                 return
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) < 600: # 10 минут
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) < 600:
                 return
 
     if is_gpt:
-        text = text[4:].strip() # Убираем префикс
+        text = text[4:].strip() 
 
-    # --- СБРОС КОНТЕКСТА ---
     if text.lower() in ['сброс', '/reset']:
         CHAT_MEMORY[chat_id] = []
         limit = CONFIG.get('context_limit', 100)
         bot.send_message(
             chat_id, 
-            f"🧹 Память очищена!\n\n🧠 Контекст: 0/{limit}", 
+            f"Память очищена.\ncontext: 0/{limit}", 
             business_connection_id=message.business_connection_id
         )
         return
 
-    # --- ГЕНЕРАЦИЯ КАРТИНКИ ---
     if text.lower().startswith('нарисуй '):
         loading_msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         stop_event = threading.Event()
@@ -334,7 +325,6 @@ def handle_business_message(message):
             bot.edit_message_text(f"⚠️ Ошибка: {err}", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
         return
         
-    # --- ТЕКСТ ИЛИ ФОТО ---
     loading_msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
     stop_event = threading.Event()
     anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id))
@@ -355,7 +345,7 @@ def handle_business_message(message):
     
     limit = CONFIG.get('context_limit', 100)
     if reply:
-        final_text = f"{reply}\n\n🧠 Контекст: {ctx_len}/{limit}"
+        final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
         try:
             bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
         except Exception:
