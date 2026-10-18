@@ -5,6 +5,7 @@ import base64
 import time
 import requests
 import threading
+import json
 
 try:
   import telebot
@@ -22,23 +23,38 @@ FIREBASE_URL = os.environ.get('FIREBASE_URL')
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
 
-DEFAULT_MODEL = 'gemini-3.8-flash'
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 
+# Иерархия моделей для авто-переключения
+MODEL_HIERARCHY = [
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.1-flash-tts',
+    'gemini-3-flash'
+]
+
 CONFIG = {
     'auto_reply_enabled': True,
     'context_limit': DEFAULT_CONTEXT_LIMIT,
-    'active_model': DEFAULT_MODEL,
+    'active_model': MODEL_HIERARCHY[0],
     'image_model': DEFAULT_IMAGE_MODEL,
     'blacklist': {}
 }
+
+# Кэш заблокированных моделей: model_name -> timestamp разблокировки
+MODEL_COOLDOWN = {}
+
 LAST_OWNER_ACTIVITY = {}
 CHAT_MEMORY = {}
+BOT_BUSINESS_MESSAGES = set()
 
-# Хранилище ID сообщений, которые отправил бот в бизнес-чатах
-BOT_BUSINESS_MESSAGES = set() 
+# Буфер для альбомов (медиагрупп)
+MEDIA_GROUP_BUFFER = {} 
+MEDIA_GROUP_LOCK = threading.Lock()
+MEDIA_GROUP_TIMEOUT = 1.5
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 session = requests.Session()
@@ -94,18 +110,46 @@ def fetch_gemini_models():
             return models
     except Exception as e:
         print(f"Ошибка получения моделей: {e}")
-    return [DEFAULT_MODEL]
+    return [MODEL_HIERARCHY[0]]
 
-def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
-    model = CONFIG.get('active_model', DEFAULT_MODEL)
+def get_best_available_model():
+    """Выбирает самую мощную доступную модель с учетом кулдауна 429"""
+    now = time.time()
+    for m in MODEL_HIERARCHY:
+        if m not in MODEL_COOLDOWN or now > MODEL_COOLDOWN[m]:
+            return m
+    # Если все в кулдауне, возвращаем самую младшую (последнюю в списке)
+    return MODEL_HIERARCHY[-1]
+
+def ask_gemini(chat_id, prompt, image_bytes_list=None, mime_type='image/jpeg'):
+    model = CONFIG.get('active_model')
+    
+    # Проверяем, не истек ли кулдаун для текущей активной модели, если она не топовая
+    best_model = get_best_available_model()
+    
+    # Если текущая выбранная модель заблокирована по 429, берем лучшую доступную
+    if model in MODEL_COOLDOWN and time.time() < MODEL_COOLDOWN[model]:
+        model = best_model
+    # Если текущая модель не заблокирована, но есть модель выше по иерархии (с истекшим кулдауном), берем её
+    elif MODEL_HIERARCHY.index(best_model) < MODEL_HIERARCHY.index(model):
+        model = best_model
+
     url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
     
     contents = CHAT_MEMORY.get(chat_id, []).copy()
-    
     parts = []
-    if prompt: parts.append({"text": prompt})
-    if image_bytes:
-        parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode('utf-8')}})
+    
+    if prompt: 
+        parts.append({"text": prompt})
+        
+    if image_bytes_list:
+        for img in image_bytes_list:
+            parts.append({
+                "inline_data": {
+                    "mime_type": mime_type, 
+                    "data": base64.b64encode(img).decode('utf-8')
+                }
+            })
         
     contents.append({"role": "user", "parts": parts})
     
@@ -115,7 +159,17 @@ def ask_gemini(chat_id, prompt, image_bytes=None, mime_type=None):
     }
     
     try:
-        r = session.post(url, json=payload, timeout=45)
+        r = session.post(url, json=payload, timeout=60)
+        
+        # ОБРАБОТКА 429
+        if r.status_code == 429:
+            print(f"⚠️ 429 Quota Exceeded для {model}. Блокировка на 24 часа.")
+            MODEL_COOLDOWN[model] = time.time() + 86400 # 24 часа
+            CONFIG['active_model'] = get_best_available_model()
+            save_config()
+            # Рекурсивно пробуем снова с новой моделью
+            return ask_gemini(chat_id, prompt, image_bytes_list, mime_type)
+
         if r.status_code != 200:
             return None, f"HTTP {r.status_code}: {r.text[:300]}", 0
         
@@ -168,16 +222,66 @@ def generate_image(prompt):
     except Exception as e:
         return None, str(e)
 
-# --- ПАНЕЛЬ УПРАВЛЕНИЯ (В ЛС) ---
+# --- ЛОГИКА ОБРАБОТКИ АЛЬБОМОВ ---
+def process_media_group(group_id, business_id=None):
+    time.sleep(MEDIA_GROUP_TIMEOUT) # Ждем, пока все фото придут
+    
+    with MEDIA_GROUP_LOCK:
+        if group_id not in MEDIA_GROUP_BUFFER:
+            return
+        
+        msgs = MEDIA_GROUP_BUFFER.pop(group_id)
+        # Сортируем по message_id, чтобы сохранить порядок
+        msgs.sort(key=lambda x: x.message_id)
+        first_msg = msgs[0]
+        
+        chat_id = first_msg.chat.id
+        text = first_msg.caption or "Опиши, что на этих фото."
+        # Если в подписи есть гпт, убираем его
+        if text.lower().startswith('гпт '):
+            text = text[4:].strip()
+            
+        img_bytes_list = []
+        for m in msgs:
+            try:
+                file_info = bot.get_file(m.photo[-1].file_id)
+                img_bytes = bot.download_file(file_info.file_path)
+                img_bytes_list.append(img_bytes)
+            except Exception:
+                pass
+                
+        loading_msg = bot.send_message(chat_id, "🕐 Смотрю фото...", business_connection_id=business_id)
+        if business_id:
+            BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
+            
+        stop_event = threading.Event()
+        anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, "Смотрю фото..."))
+        anim.start()
+        
+        reply, err, ctx_len = ask_gemini(chat_id, text, img_bytes_list)
+        
+        stop_event.set()
+        anim.join()
+        
+        limit = CONFIG.get('context_limit', 100)
+        if reply:
+            final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
+            bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=business_id)
+        else:
+            bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=business_id)
+
+# --- ПАНЕЛЬ УПРАВЛЕНИЯ ---
 @bot.message_handler(commands=['start', 'panel'])
 def send_panel(message):
     if (message.from_user.username or '').lower() != CREATOR_USERNAME: return
     
     status = "🟢 ВКЛ" if CONFIG['auto_reply_enabled'] else "🔴 ВЫКЛ"
     limit = CONFIG.get('context_limit', 100)
+    current_model = CONFIG.get('active_model')
+    
     text = (f"👑 <b>Панель управления</b>\n\n"
             f"Автоответчик: {status}\n"
-            f"Текстовая модель: <code>{CONFIG['active_model']}</code>\n"
+            f"Текстовая модель: <code>{current_model}</code>\n"
             f"Модель рисования: <code>{CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)}</code>\n"
             f"Лимит контекста: {limit} соо\n\n"
             f"Напиши <code>команды</code> для списка всех функций.")
@@ -193,18 +297,30 @@ def handle_admin_text(message):
         limit = CONFIG.get('context_limit', 100)
         ctx_now = len(CHAT_MEMORY.get(chat_id, []))
         status = "ВКЛ" if CONFIG['auto_reply_enabled'] else "ВЫКЛ"
+        
+        # Формируем статус кулдаунов
+        cooldown_text = ""
+        now = time.time()
+        for m in MODEL_HIERARCHY:
+            if m in MODEL_COOLDOWN and now < MODEL_COOLDOWN[m]:
+                rem = int(MODEL_COOLDOWN[m] - now)
+                cooldown_text += f"  └ {m}: 🔒 еще {rem // 3600}ч {(rem % 3600) // 60}м\n"
+        
+        if not cooldown_text:
+            cooldown_text = "  Все модели доступны.\n"
+
         help_text = (
             f"📜 <b>Список команд:</b>\n\n"
             f"<code>модели</code> — список текстовых моделей\n"
             f"<code>фото-модели</code> — список моделей для рисования\n"
             f"<code>автоответчик вкл/выкл</code> — автоответ (сейчас {status})\n"
             f"<code>контекст [число]</code> — лимит (сейчас {limit})\n"
-            f"<code>запретить @юзер</code> — заблокировать вызов ИИ\n"
+            f"<code>запретить @юзер</code> — заблокировать\n"
             f"<code>разрешить @юзер</code> — разблокировать\n"
             f"<code>сброс</code> — очистить память (сейчас {ctx_now}/{limit})\n"
             f"<code>гпт [текст]</code> — вызов ИИ\n"
-            f"<code>нарисуй [текст]</code> — сгенерировать фото\n"
-            f"<i>Для анализа фото: отправь его с подписью</i> <code>гпт опиши</code>"
+            f"<code>нарисуй [текст]</code> — сгенерировать фото\n\n"
+            f"⏳ <b>Статус лимитов (429):</b>\n{cooldown_text}"
         )
         bot.reply_to(message, help_text)
         return
@@ -248,7 +364,7 @@ def handle_admin_text(message):
         uname = lower_text.split()[1].replace('@', '')
         CONFIG['blacklist'][uname] = True
         save_config()
-        bot.reply_to(message, f"🚫 @{uname} больше не может вызывать ИИ.")
+        bot.reply_to(message, f"🚫 @{uname} заблокирован.")
         return
         
     if lower_text.startswith('разрешить '):
@@ -286,7 +402,7 @@ def handle_admin_text(message):
             file_info = bot.get_file(message.photo[-1].file_id)
             img_bytes = bot.download_file(file_info.file_path)
             prompt = text.replace('гпт ', '').replace('алл ', '').strip() if is_gpt else (message.caption or "Опиши, что на этом фото.")
-            reply, err, ctx_len = ask_gemini(chat_id, prompt, img_bytes, 'image/jpeg')
+            reply, err, ctx_len = ask_gemini(chat_id, prompt, [img_bytes])
         except Exception as e:
             reply, err, ctx_len = None, str(e), 0
             
@@ -371,7 +487,6 @@ def handle_business_message(message):
     if not is_owner and user_uname in CONFIG.get('blacklist', {}):
         return
 
-    # 1. Обработка сброса контекста (работает всегда)
     if lower_text in ['сброс', '/reset']:
         CHAT_MEMORY[chat_id] = []
         limit = CONFIG.get('context_limit', 100)
@@ -379,30 +494,31 @@ def handle_business_message(message):
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
         return
 
-    # 2. Определение триггеров
     is_gpt = lower_text.startswith('гпт ')
     is_draw = lower_text.startswith('нарисуй ')
     
-    # Проверяем, является ли реплай ответом на сообщение, которое отправил бот
     is_reply_to_bot = False
+    replied_photo = None
+    
     if message.reply_to_message:
         if message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES:
             is_reply_to_bot = True
+        
+        # ПРОВЕРКА: Если свайпают фотографию
+        if message.reply_to_message.content_type == 'photo':
+            replied_photo = message.reply_to_message.photo[-1]
 
     trigger = False
     
     if is_owner:
         CREATOR_ID = message.from_user.id
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
-        # Владелец может вызвать бота только через гпт, нарисуй или реплай на бота
-        if is_gpt or is_draw or is_reply_to_bot:
+        if is_gpt or is_draw or is_reply_to_bot or replied_photo:
             trigger = True
     else:
-        # Собеседник
-        if is_gpt or is_draw or is_reply_to_bot:
+        if is_gpt or is_draw or is_reply_to_bot or replied_photo:
             trigger = True
         elif message.content_type == 'text' and CONFIG['auto_reply_enabled']:
-            # Автоответ работает только если владелец оффлайн > 10 минут
             if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
                 trigger = True
 
@@ -412,7 +528,6 @@ def handle_business_message(message):
     if is_gpt:
         text = text[4:].strip() 
 
-    # 3. Генерация картинки
     if is_draw:
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
@@ -436,7 +551,6 @@ def handle_business_message(message):
             bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, business_connection_id=message.business_connection_id)
         return
         
-    # 4. Текст или фото
     msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
     BOT_BUSINESS_MESSAGES.add(msg.message_id)
     
@@ -444,16 +558,25 @@ def handle_business_message(message):
     anim = threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id))
     anim.start()
     
-    img_bytes, mime = None, None
+    img_bytes_list = []
+    
+    # Если есть фото в самом сообщении
     if message.content_type == 'photo':
         try:
             file_info = bot.get_file(message.photo[-1].file_id)
-            img_bytes = bot.download_file(file_info.file_path)
-            mime = 'image/jpeg'
+            img_bytes_list.append(bot.download_file(file_info.file_path))
             if not text: text = "Опиши, что на этом фото."
         except Exception: pass
         
-    reply, err, ctx_len = ask_gemini(chat_id, text, img_bytes, mime)
+    # Если фото было в реплае
+    elif replied_photo:
+        try:
+            file_info = bot.get_file(replied_photo.file_id)
+            img_bytes_list.append(bot.download_file(file_info.file_path))
+            if not text: text = "Опиши, что на этом фото."
+        except Exception: pass
+        
+    reply, err, ctx_len = ask_gemini(chat_id, text, img_bytes_list)
     
     stop_event.set()
     anim.join()
