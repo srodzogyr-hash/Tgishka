@@ -24,6 +24,7 @@ FIREBASE_URL = os.environ.get('FIREBASE_URL')
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
 
+# Иерархия используется только для АВТОпереключения при лимитах
 MODEL_HIERARCHY = [
     'gemini-3.8-flash',
     'gemini-3.7-flash',
@@ -51,7 +52,8 @@ MEDIA_GROUP_BUFFER = {}
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 
-retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["POST"])
+# УБРАЛИ 429 из status_forcelist, чтобы перехватывать его самим и менять модель
+retry_strategy = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["POST"])
 session = requests.Session()
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
@@ -78,6 +80,27 @@ def save_config():
 init_firebase()
 
 # --- GEMINI API ---
+def get_headers():
+    # Безопасная передача ключа через заголовок (не светится в URL)
+    return {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_KEY
+    }
+
+def fetch_gemini_models():
+    url = f"{GEMINI_API_BASE}/models"
+    try:
+        r = session.get(url, headers=get_headers(), timeout=10)
+        if r.status_code == 200:
+            models = []
+            for m in r.json().get('models', []):
+                if 'generateContent' in m.get('supportedGenerationMethods', []):
+                    models.append(m['name'].replace('models/', ''))
+            return models
+    except Exception as e:
+        print(f"Ошибка получения моделей: {e}")
+    return MODEL_HIERARCHY
+
 def ask_gemini(chat_id, prompt, image_list=None):
     global ACTIVE_MODEL, MODEL_COOLDOWN_UNTIL
     
@@ -85,7 +108,6 @@ def ask_gemini(chat_id, prompt, image_list=None):
         ACTIVE_MODEL = MODEL_HIERARCHY[0]
         print(f"♻️ Квота восстановлена. Возврат к {ACTIVE_MODEL}")
 
-    current_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL) if ACTIVE_MODEL in MODEL_HIERARCHY else 0
     contents = CHAT_MEMORY.get(chat_id, []).copy()
     
     parts = []
@@ -100,47 +122,70 @@ def ask_gemini(chat_id, prompt, image_list=None):
         "system_instruction": {"parts": [{"text": "Ты — умный и полезный ИИ-ассистент. Отвечай на вопросы пользователя. Если на фото есть текст или объекты, опиши их. Если на фото задачи — реши их."}]}
     }
     
-    for i in range(current_idx, len(MODEL_HIERARCHY)):
-        model = MODEL_HIERARCHY[i]
-        url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
+    # Формируем очередь моделей для перебора
+    # Если текущая модель есть в иерархии, начинаем с нее. Если нет (выбрана вручную) - пробуем ее, потом иерархию.
+    models_to_try = [ACTIVE_MODEL]
+    if ACTIVE_MODEL in MODEL_HIERARCHY:
+        idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
+        models_to_try.extend(MODEL_HIERARCHY[idx+1:])
+    else:
+        models_to_try.extend(MODEL_HIERARCHY)
+
+    for model in models_to_try:
+        url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
         try:
-            r = session.post(url, json=payload, timeout=60)
+            r = session.post(url, headers=get_headers(), json=payload, timeout=60)
+            
             if r.status_code == 429:
                 print(f"⚠️ Лимит {model} исчерпан. Переключение...")
-                ACTIVE_MODEL = MODEL_HIERARCHY[min(i + 1, len(MODEL_HIERARCHY)-1)]
-                MODEL_COOLDOWN_UNTIL = time.time() + 86400
-                continue 
+                # Если модель была в иерархии, сдвигаем глобальный указатель
+                if model in MODEL_HIERARCHY:
+                    next_idx = min(MODEL_HIERARCHY.index(model) + 1, len(MODEL_HIERARCHY)-1)
+                    ACTIVE_MODEL = MODEL_HIERARCHY[next_idx]
+                    MODEL_COOLDOWN_UNTIL = time.time() + 86400
+                continue # Идем к следующей в списке
+                
             if r.status_code != 200:
-                return None, f"HTTP {r.status_code}: {r.text[:300]}", ACTIVE_MODEL, 0
+                # Если это не 200 и не 429, возвращаем ошибку (без ключа, так как он в заголовке)
+                err_json = r.json() if r.headers.get('content-type') == 'application/json' else {}
+                err_msg = err_json.get('error', {}).get('message', r.text[:200])
+                return None, f"HTTP {r.status_code}: {err_msg}", model, 0
             
             data = r.json()
             if 'candidates' not in data or not data['candidates']:
-                return None, "Модель заблокировала ответ (Safety Filter).", ACTIVE_MODEL, 0
+                return None, "Модель заблокировала ответ (Safety Filter).", model, 0
                 
             reply_text = data['candidates'][0]['content']['parts'][0]['text']
+            
+            # Успешно ответили - обновляем глобальную модель, если она из иерархии
+            if model in MODEL_HIERARCHY:
+                ACTIVE_MODEL = model
+                
             contents.append({"role": "model", "parts": [{"text": reply_text}]})
             limit = CONFIG.get('context_limit', 100)
             if len(contents) > limit: contents = contents[-limit:] 
                 
             CHAT_MEMORY[chat_id] = contents
             return reply_text, None, model, len(contents)
+            
         except Exception as e:
-            return None, str(e), model, 0
-    return None, "Все модели исчерпали лимиты.", ACTIVE_MODEL, 0
+            return None, f"Сетевая ошибка: {str(e)}", model, 0
+            
+    return None, "Все доступные модели исчерпали лимиты. Попробуйте позже.", ACTIVE_MODEL, 0
 
 def generate_image(prompt):
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
-    if 'imagen' in model:
-        url = f"{GEMINI_API_BASE}/models/{model}:predict?key={GEMINI_KEY}"
-        payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}}
-    else:
-        url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
-        payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
+    url = f"{GEMINI_API_BASE}/models/{model}:predict" if 'imagen' in model else f"{GEMINI_API_BASE}/models/{model}:generateContent"
+    
+    payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
+              {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
 
     try:
-        r = session.post(url, json=payload, timeout=60)
-        if r.status_code != 200: return None, f"HTTP {r.status_code}\n{r.text[:300]}"
+        r = session.post(url, headers=get_headers(), json=payload, timeout=60)
+        if r.status_code != 200: 
+            return None, f"HTTP {r.status_code}"
         data = r.json()
+        
         if 'imagen' in model:
             if 'predictions' in data and data['predictions']:
                 return base64.b64decode(data['predictions'][0]['bytesBase64Encoded']), None
@@ -192,11 +237,12 @@ def handle_admin_text(message):
         bot.reply_to(message, "📜 <b>Команды:</b>\n<code>модели</code>, <code>фото-модели</code>, <code>автоответчик вкл/выкл</code>, <code>контекст 50</code>, <code>запретить @юзер</code>, <code>сброс</code>, <code>гпт [текст]</code>, <code>нарисуй [текст]</code>")
         return
     if text == 'модели':
+        models = fetch_gemini_models()
         kb = InlineKeyboardMarkup(row_width=1)
-        for m in MODEL_HIERARCHY:
+        for m in models:
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, "Модель:", reply_markup=kb)
+        bot.reply_to(message, "Выбери модель (лимиты применяются отдельно):", reply_markup=kb)
         return
     if text in ['фото-модели', 'фото модели']:
         image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
@@ -249,7 +295,8 @@ def callback_set_model(call):
         ACTIVE_MODEL = call.data.replace('setmodel_', ''); MODEL_COOLDOWN_UNTIL = 0
         bot.edit_message_text(f"✅ Текст: <b>{ACTIVE_MODEL}</b>", call.message.chat.id, call.message.message_id)
     else:
-        CONFIG['image_model'] = call.data.replace('setimg_', ''); save_config()
+        CONFIG['image_model'] = call.data.replace('setimg_', '')
+        save_config()
         bot.edit_message_text(f"✅ Рисование: <b>{CONFIG['image_model']}</b>", call.message.chat.id, call.message.message_id)
 
 # --- ОБРАБОТКА АЛЬБОМОВ ---
@@ -325,7 +372,6 @@ def handle_business_message(message):
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
         return
 
-    # Буферизация альбомов
     if message.content_type == 'photo' and message.media_group_id:
         if message.media_group_id not in MEDIA_GROUP_BUFFER:
             MEDIA_GROUP_BUFFER[message.media_group_id] = []
@@ -338,17 +384,12 @@ def handle_business_message(message):
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
 
     trigger = False
-    
-    # УБРАНО УСЛОВИЕ or message.content_type == 'photo'
     if is_owner:
-        if is_gpt or is_draw or is_reply_to_bot: 
-            trigger = True
+        if is_gpt or is_draw or is_reply_to_bot: trigger = True
     else:
-        if is_gpt or is_draw or is_reply_to_bot: 
-            trigger = True
+        if is_gpt or is_draw or is_reply_to_bot: trigger = True
         elif message.content_type == 'text' and CONFIG['auto_reply_enabled']:
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600: 
-                trigger = True
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600: trigger = True
 
     if not trigger: return
     if is_gpt: text = text[4:].strip()
