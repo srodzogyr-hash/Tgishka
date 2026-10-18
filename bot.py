@@ -16,11 +16,11 @@ except ImportError:
 
 from telebot.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- НАСТРОЙКИ И КЛЮЧИ (УЖЕ РАЗДЕЛЕНЫ, ЧТОБЫ GITHUB НЕ РУГАЛСЯ) ---
-TOKEN = '8458915232' + ':AAHyS1jj_Oq6vy1_ILK73Rzxllfd0UiRVTA'
-FIREBASE_URL = 'https://tgbotik-d479c-default-rtdb.firebaseio.com/secret_845891'
+# --- НАСТРОЙКИ И КЛЮЧИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER) ---
+TOKEN = os.environ.get('TG_TOKEN')
+FIREBASE_URL = os.environ.get('FIREBASE_URL')
 
-GROQ_KEY = 'gsk_' + 'CbXsgoRKqMalzkeb8WOMWGdyb3FYhviVqk6Im6422RuaCAyfs7kX'
+GROQ_KEY = os.environ.get('GROQ_KEY')
 DEFAULT_MODEL = 'llama-3.3-70b-versatile'
 GROQ_BASE = 'https://api.groq.com/openai/v1'
 
@@ -1288,5 +1288,5 @@ def handle_all_messages(message):
       bot.reply_to(message, res)
     return
 
-print('⚡ БОТ АЛЛ ЗАПУЩЕН (GROQ)!')
+print('⚡ БОТ АЛЛ ЗАПУЩЕН (GROQ + ENV SECURITY)!')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
