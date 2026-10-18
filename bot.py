@@ -18,10 +18,10 @@ from telebot.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardB
 # --- НАСТРОЙКИ И КЛЮЧИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER) ---
 TOKEN = os.environ.get('TG_TOKEN')
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
-GROQ_KEY = os.environ.get('GROQ_KEY')
+GROQ_KEY = os.environ.get('GROQ_KEY') # Сюда вставь ключ HF
 
-DEFAULT_MODEL = 'llama-3.3-70b-versatile'
-GROQ_BASE = 'https://api.groq.com/openai/v1'
+DEFAULT_MODEL = 'meta-llama/Llama-3.3-70B-Instruct'
+GROQ_BASE = 'https://router.huggingface.co/v1'
 
 CREATOR_USERNAMES = ('wrtnoq', 'wtnoq')
 CREATOR_DISPLAY_USER = '@wrtnoq'
@@ -48,7 +48,6 @@ RAM_DB = {'config': {'ai_model': DEFAULT_MODEL, 'creator_id': None}, 'chats': {}
 DB_LOCK = threading.Lock()
 DIRTY_PATHS = {}
 
-# Теперь ключ словаря: (chat_id, user_id)
 CHAT_MEMORY = {}
 CHAT_LIVE_LOG = {}
 LAST_TARGET_ID = {}
@@ -100,7 +99,7 @@ def flush_firebase_changes():
         if isinstance(val, dict):
           r = fb_session.patch(url, json=val, timeout=6)
         else:
-          r = fb_session.put(url, json=val, timeout=6) # json=None удаляет узел
+          r = fb_session.put(url, json=val, timeout=6)
         if r.status_code == 200:
           break
       except Exception:
@@ -146,8 +145,8 @@ def fetch_free_models(force=False):
 
   free_list = []
   seen_ids = set()
-
   try:
+    # Для Hugging Face роутера
     headers = {'Authorization': f'Bearer {GROQ_KEY}'}
     r = ai_session.get(f'{GROQ_BASE}/models', headers=headers, timeout=10)
     if r.status_code == 200:
@@ -156,21 +155,15 @@ def fetch_free_models(force=False):
         mid = item.get('id', '')
         if not mid or mid in seen_ids:
           continue
-        if item.get('active') is False:
-          continue
-        lower = mid.lower()
-        if any(x in lower for x in ['whisper', 'tts', 'embed', 'guard', 'moderation', 'playai']):
-          continue
-        ctx_len = int(item.get('context_window') or 0)
         seen_ids.add(mid)
-        free_list.append({'id': mid, 'name': mid, 'ctx': ctx_len})
+        free_list.append({'id': mid, 'name': mid, 'ctx': 131072})
   except Exception as e:
-    print('Ошибка получения моделей Groq:', e)
+    print('Ошибка получения моделей:', e)
 
   free_list.sort(key=lambda m: (m['id'] != DEFAULT_MODEL, m['id']))
 
   if DEFAULT_MODEL not in seen_ids:
-    free_list.insert(0, {'id': DEFAULT_MODEL, 'name': 'Llama 3.3 70B Versatile', 'ctx': 131072})
+    free_list.insert(0, {'id': DEFAULT_MODEL, 'name': 'Llama 3.3 70B (HF)', 'ctx': 131072})
 
   CACHED_FREE_MODELS = free_list
   return CACHED_FREE_MODELS
@@ -188,7 +181,7 @@ def build_models_message_and_kb(page=0):
   page_items = models[start:end]
 
   lines = [
-      '🤖 <b>Выбор модели ИИ (Groq)</b>\n',
+      '🤖 <b>Выбор модели ИИ (Hugging Face)</b>\n',
       f'✅ <b>Активная модель:</b>\n<code>{html.escape(active)}</code>\n',
       f'📋 <b>Доступные модели (Стр. {page + 1}/{total_pages}):</b>',
   ]
@@ -695,7 +688,7 @@ def detect_informal_mod_intent(prompt_lower):
 
 def ask_ai(chat_id, user_id, system_prompt, formatted_user_turn, raw_user_text):
   selected_model = get_active_model()
-  mem_key = (chat_id, user_id) # Память для КАЖДОГО пользователя отдельно
+  mem_key = (chat_id, user_id)
   history = CHAT_MEMORY.get(mem_key, [])
 
   messages_payload = [{'role': 'system', 'content': system_prompt}]
@@ -738,7 +731,6 @@ def ask_ai(chat_id, user_id, system_prompt, formatted_user_turn, raw_user_text):
   history.append({'role': 'user', 'content': f'Собеседник: {raw_user_text}'})
   history.append({'role': 'assistant', 'content': content})
   
-  # Обрезаем до 20 сообщений (сохраняем последние)
   if len(history) > MAX_CONTEXT_MESSAGES:
     history = history[-MAX_CONTEXT_MESSAGES:]
     
@@ -845,23 +837,22 @@ def handle_all_ai(message, prompt_text):
     else:
       speaker_identity_block = f"👤 С тобой говорит: {caller_clean_name} (@{caller.username or 'без_юза'}), ранг: {caller_rank_name} (Уровень {caller_rank})."
 
-    # Максимально подробный промпт для обучения
     system_prompt = (
         f'Ты — Алл, главный бот-администратор и искусственный интеллект этого Telegram-чата.\n'
         f'{speaker_identity_block}\n\n'
         f'ТВОЯ ИЕРАРХИЯ (РАНГИ):\n'
-        f'0: 👤 Участник (ничего не может)\n'
-        f'1: 🧹 Нищук (может удалять сообщения, выдавать мут)\n'
-        f'2: ⚔️ Заглотус (может выдавать варны, кикать)\n'
-        f'3: 💎 Баронесса (может банить, делать тотальный мут/кик)\n'
+        f'0: 👤 Участник\n'
+        f'1: 🧹 Нищук (мут, удаление)\n'
+        f'2: ⚔️ Заглотус (варны, кик)\n'
+        f'3: 💎 Баронесса (бан, тотальный мут/кик)\n'
         f'4: 🥒 Слава Огурцов (Создатель, может всё)\n\n'
         f'📍 МЕСТО: {current_place}\n'
         f'🌐 ТЕКУЩИЙ СОСТАВ ЧАТА (по базе):\n{global_chats_info}\n\n'
         f'💬 ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:\n{live_log_str}\n\n'
         f'⚙️ СТАТУС ПРИКАЗА В TELEGRAM:\n{action_status_for_ai}\n'
-        f'(ВАЖНО: Если в статусе написано "нет приказа", ты НЕ МОЖЕШЬ выполнять бан/мут/кик прямо сейчас. Отвечай текстом, что для этого нужно написать команду.)\n'
+        f'(ВАЖНО: Если в статусе написано "нет приказа", ты НЕ МОЖЕШЬ выполнять бан/мут/кик прямо сейчас.)\n'
         f'(КРИТИЧЕСКОЕ ПРАВИЛО: НИКОГДА не ври, что забанил кого-то, если в статусе не написано "ВЫПОЛНЕНО В TELEGRAM".)\n\n'
-        f'Отвечай по-русски, кратко (1-3 предложения), уверенно, без символов **. Ты знаешь всё о текущем составе чата и правах участников.'
+        f'Отвечай по-русски, кратко (1-3 предложения), уверенно, без символов **.'
     )
     
     formatted_user_turn = f"[Говорит: {caller_clean_name} (@{caller.username or 'без_юза'}) | Ранг: {caller_rank_name}]: {prompt_text or 'Ты тут?'}"
@@ -911,7 +902,6 @@ def left_member(message):
   user = message.left_chat_member
   if not user or user.id == get_bot_id():
     return
-  # Удаляем пользователя из Firebase, чтобы бот про него забыл
   remove_user_from_db(message.chat.id, user.id)
 
 
