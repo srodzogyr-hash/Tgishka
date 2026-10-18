@@ -37,6 +37,9 @@ CONFIG = {
 LAST_OWNER_ACTIVITY = {}
 CHAT_MEMORY = {}
 
+# Хранилище ID сообщений, которые отправил бот в бизнес-чатах
+BOT_BUSINESS_MESSAGES = set() 
+
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 session = requests.Session()
 
@@ -266,7 +269,6 @@ def handle_admin_text(message):
     is_gpt = lower_text.startswith('гпт ') or lower_text.startswith('алл ')
     is_draw = lower_text.startswith('нарисуй ')
     
-    # Защита от реагирования на всё подряд в ЛС
     if message.content_type == 'photo' and not is_gpt and not is_reply_to_bot:
         bot.reply_to(message, "⚠️ Чтобы ИИ посмотрел фото, отправь его с подписью <code>гпт опиши</code> или свайпни на сообщение бота.")
         return
@@ -274,7 +276,6 @@ def handle_admin_text(message):
     if message.content_type == 'text' and not (is_gpt or is_draw or is_reply_to_bot):
         return
 
-    # --- ОБРАБОТКА ФОТО В ЛС ---
     if message.content_type == 'photo':
         loading_msg = bot.reply_to(message, "🕐 Смотрю фото...")
         stop_event = threading.Event()
@@ -299,7 +300,6 @@ def handle_admin_text(message):
             bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
-    # --- ГЕНЕРАЦИЯ КАРТИНКИ В ЛС ---
     if is_draw:
         prompt = text[8:]
         loading_msg = bot.reply_to(message, "🕐 Рисую...")
@@ -321,7 +321,6 @@ def handle_admin_text(message):
             bot.edit_message_text(f"⚠️ Ошибка генерации:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
-    # --- ТЕКСТОВЫЙ ЗАПРОС В ЛС ---
     if is_gpt or is_reply_to_bot:
         prompt = text[4:].strip() if is_gpt else text
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
@@ -361,58 +360,65 @@ def callback_set_model(call):
 def handle_business_message(message):
     global CREATOR_ID
     if not message.from_user: return
-    if message.from_user.id == bot.get_me().id: return 
     
     chat_id = message.chat.id
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
     
     is_owner = (message.from_user.username or '').lower() == CREATOR_USERNAME
-    is_gpt = lower_text.startswith('гпт ')
-    is_draw = lower_text.startswith('нарисуй ')
-    
-    # ИСПРАВЛЕНИЕ: Проверяем, что реплай именно на сообщение БОТА
-    is_reply_to_bot = False
-    if message.reply_to_message and message.reply_to_message.from_user:
-        is_reply_to_bot = (message.reply_to_message.from_user.id == bot.get_me().id)
     
     user_uname = (message.from_user.username or '').lower()
     if not is_owner and user_uname in CONFIG.get('blacklist', {}):
         return
 
-    trigger = False
-    if is_gpt or is_draw or is_reply_to_bot:
-        trigger = True
-    elif is_owner:
-        pass # Владелец должен использовать триггеры
-    else:
-        # Автоответ для собеседников (только для текста!)
-        if message.content_type == 'text' and CONFIG['auto_reply_enabled']:
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
-                trigger = True
-                
-    # Если ни одно условие не сработало — просто игнорируем
-    if not trigger:
+    # 1. Обработка сброса контекста (работает всегда)
+    if lower_text in ['сброс', '/reset']:
+        CHAT_MEMORY[chat_id] = []
+        limit = CONFIG.get('context_limit', 100)
+        msg = bot.send_message(chat_id, f"Память очищена.\ncontext: 0/{limit}", business_connection_id=message.business_connection_id)
+        BOT_BUSINESS_MESSAGES.add(msg.message_id)
         return
 
+    # 2. Определение триггеров
+    is_gpt = lower_text.startswith('гпт ')
+    is_draw = lower_text.startswith('нарисуй ')
+    
+    # Проверяем, является ли реплай ответом на сообщение, которое отправил бот
+    is_reply_to_bot = False
+    if message.reply_to_message:
+        if message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES:
+            is_reply_to_bot = True
+
+    trigger = False
+    
     if is_owner:
         CREATOR_ID = message.from_user.id
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
+        # Владелец может вызвать бота только через гпт, нарисуй или реплай на бота
+        if is_gpt or is_draw or is_reply_to_bot:
+            trigger = True
+    else:
+        # Собеседник
+        if is_gpt or is_draw or is_reply_to_bot:
+            trigger = True
+        elif message.content_type == 'text' and CONFIG['auto_reply_enabled']:
+            # Автоответ работает только если владелец оффлайн > 10 минут
+            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= 600:
+                trigger = True
+
+    if not trigger:
+        return
 
     if is_gpt:
         text = text[4:].strip() 
 
-    if text.lower() in ['сброс', '/reset']:
-        CHAT_MEMORY[chat_id] = []
-        limit = CONFIG.get('context_limit', 100)
-        bot.send_message(chat_id, f"Память очищена.\ncontext: 0/{limit}", business_connection_id=message.business_connection_id)
-        return
-
-    # --- ГЕНЕРАЦИЯ В БИЗНЕС-ЧАТЕ ---
+    # 3. Генерация картинки
     if is_draw:
-        loading_msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
+        msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
+        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        
         stop_event = threading.Event()
-        anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id, "Рисую..."))
+        anim = threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую..."))
         anim.start()
         
         img, err = generate_image(text[8:])
@@ -421,17 +427,21 @@ def handle_business_message(message):
         
         if img:
             try:
-                bot.delete_message(chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
-                bot.send_photo(chat_id, img, business_connection_id=message.business_connection_id)
+                bot.delete_message(chat_id, msg.message_id, business_connection_id=message.business_connection_id)
+                BOT_BUSINESS_MESSAGES.discard(msg.message_id)
+                photo_msg = bot.send_photo(chat_id, img, business_connection_id=message.business_connection_id)
+                BOT_BUSINESS_MESSAGES.add(photo_msg.message_id)
             except Exception: pass
         else:
-            bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+            bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, business_connection_id=message.business_connection_id)
         return
         
-    # --- ТЕКСТ ИЛИ ПРОСМОТР ФОТО В БИЗНЕС-ЧАТЕ ---
-    loading_msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
+    # 4. Текст или фото
+    msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=message.business_connection_id)
+    BOT_BUSINESS_MESSAGES.add(msg.message_id)
+    
     stop_event = threading.Event()
-    anim = threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, message.business_connection_id))
+    anim = threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id))
     anim.start()
     
     img_bytes, mime = None, None
@@ -452,11 +462,11 @@ def handle_business_message(message):
     if reply:
         final_text = f"{reply}\n\ncontext: {ctx_len}/{limit}"
         try:
-            bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+            bot.edit_message_text(final_text, chat_id, msg.message_id, business_connection_id=message.business_connection_id)
         except Exception:
-            bot.edit_message_text(final_text, chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
+            bot.edit_message_text(final_text, chat_id, msg.message_id, business_connection_id=message.business_connection_id, parse_mode=None)
     else:
-        bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_connection_id=message.business_connection_id)
+        bot.edit_message_text(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, business_connection_id=message.business_connection_id)
 
 # --- ЗАПУСК ---
 print("--> Очистка старых сессий...")
