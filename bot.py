@@ -18,14 +18,13 @@ from urllib3.util.retry import Retry
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.environ.get('TG_TOKEN')
-GEMINI_KEY = os.environ.get('GROQ_KEY') # Сюда мы ранее положили ключ Gemini
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # НОВАЯ переменная для Groq
+GEMINI_KEY = os.environ.get('GROQ_KEY') # Ключ Gemini
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Ключ Groq
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
 
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
 
-# Иерархия Gemini (для автопереключения при лимитах)
 MODEL_HIERARCHY = [
     'gemini-3.8-flash',
     'gemini-3.7-flash',
@@ -33,9 +32,6 @@ MODEL_HIERARCHY = [
     'gemini-3.1-flash-tts',
     'gemini-3-flash'
 ]
-# Модель Groq
-GROQ_MODEL = 'llama-3.3-70b-versatile'
-
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
@@ -51,7 +47,7 @@ CONFIG = {
     'blacklist': {}
 }
 LAST_OWNER_ACTIVITY = {}
-CHAT_MEMORY = {} # Теперь храним в универсальном формате {"role": "...", "content": "..."}
+CHAT_MEMORY = {}
 BOT_BUSINESS_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
 
@@ -94,21 +90,36 @@ def ask_ai(chat_id, prompt, image_list=None):
 def get_gemini_headers():
     return {'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY}
 
-def fetch_gemini_models():
+def fetch_all_models():
+    all_models = []
+    
+    # 1. Загрузка моделей Gemini
     url = f"{GEMINI_API_BASE}/models"
     try:
         r = session.get(url, headers=get_gemini_headers(), timeout=10)
         if r.status_code == 200:
-            models = []
             for m in r.json().get('models', []):
                 if 'generateContent' in m.get('supportedGenerationMethods', []):
-                    models.append(m['name'].replace('models/', ''))
-            # Добавляем Groq в начало списка
-            models.insert(0, f"groq/{GROQ_MODEL}")
-            return models
+                    all_models.append(m['name'].replace('models/', ''))
     except Exception as e:
-        print(f"Ошибка получения моделей: {e}")
-    return MODEL_HIERARCHY
+        print(f"Ошибка получения моделей Gemini: {e}")
+
+    # 2. Загрузка моделей Groq
+    if GROQ_API_KEY:
+        url = f"{GROQ_API_BASE}/models"
+        try:
+            r = session.get(url, headers={'Authorization': f'Bearer {GROQ_API_KEY}'}, timeout=10)
+            if r.status_code == 200:
+                for m in r.json().get('data', []):
+                    if m.get('active') is not False:
+                        all_models.append(f"groq/{m['id']}")
+        except Exception as e:
+            print(f"Ошибка получения моделей Groq: {e}")
+
+    if not all_models:
+        return MODEL_HIERARCHY
+
+    return sorted(list(set(all_models)))
 
 def ask_gemini(chat_id, prompt, image_list=None):
     global ACTIVE_MODEL, MODEL_COOLDOWN_UNTIL
@@ -119,7 +130,6 @@ def ask_gemini(chat_id, prompt, image_list=None):
 
     history = CHAT_MEMORY.get(chat_id, []).copy()
     
-    # Конвертация универсальной памяти в формат Gemini
     contents = []
     for msg in history:
         role = 'user' if msg['role'] == 'user' else 'model'
@@ -169,7 +179,6 @@ def ask_gemini(chat_id, prompt, image_list=None):
             if model in MODEL_HIERARCHY:
                 ACTIVE_MODEL = model
                 
-            # Сохраняем в память
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": reply_text})
             limit = CONFIG.get('context_limit', 100)
@@ -190,7 +199,6 @@ def ask_groq(chat_id, prompt, image_list=None):
         
     history = CHAT_MEMORY.get(chat_id, []).copy()
     
-    # ЖЕСТКИЙ СИСТЕМНЫЙ ПРОМПТ ДЛЯ GROQ
     system_prompt = (
         "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
         "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
@@ -203,12 +211,15 @@ def ask_groq(chat_id, prompt, image_list=None):
         
     messages_payload.append({"role": "user", "content": prompt})
     
+    # Получаем чистое имя модели без префикса 'groq/'
+    model_id = ACTIVE_MODEL.replace('groq/', '')
+    
     headers = {
         'Authorization': f'Bearer {GROQ_API_KEY}',
         'Content-Type': 'application/json'
     }
     payload = {
-        'model': GROQ_MODEL,
+        'model': model_id,
         'messages': messages_payload,
         'temperature': 0.9
     }
@@ -293,12 +304,12 @@ def handle_admin_text(message):
         bot.reply_to(message, "📜 <b>Команды:</b>\n<code>модели</code>, <code>фото-модели</code>, <code>автоответчик вкл/выкл</code>, <code>контекст 50</code>, <code>запретить @юзер</code>, <code>сброс</code>, <code>гпт [текст]</code>, <code>нарисуй [текст]</code>")
         return
     if text == 'модели':
-        models = fetch_gemini_models()
+        models = fetch_all_models()
         kb = InlineKeyboardMarkup(row_width=1)
         for m in models:
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, "Выбери модель (Groq - грубый):", reply_markup=kb)
+        bot.reply_to(message, f"Все доступные модели (всего {len(models)}):", reply_markup=kb)
         return
     if text in ['фото-модели', 'фото модели']:
         image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
@@ -495,5 +506,5 @@ def handle_business_message(message):
 try: bot.delete_webhook(drop_pending_updates=True) 
 except Exception: pass
 
-print('⚡ БОТ (GEMINI + GROQ) ЗАПУЩЕН!')
+print('⚡ БОТ (GEMINI + GROQ ALL MODELS) ЗАПУЩЕН!')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
