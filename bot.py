@@ -5,7 +5,9 @@ import re
 import base64
 import time
 import zipfile
+import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 import requests
 import threading
 
@@ -64,11 +66,6 @@ MODEL_HIERARCHY = [
     'gemini-3.6-flash',
     'gemini-3-flash'
 ]
-# Модели с бесплатным лимитом Search Grounding (1500 запросов/день на ключ)
-SEARCH_MODELS = [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash'
-]
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
 DEFAULT_SYSTEM_PROMPT = "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."
@@ -110,6 +107,81 @@ session = requests.Session()
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
+
+# --- ТЕКУЩАЯ ДАТА И БЕСПЛАТНЫЙ ПОИСК В ИНТЕРНЕТЕ ---
+def get_current_datetime_str():
+    """Возвращает точную текущую дату и время (МСК и Иркутск)."""
+    now_utc = datetime.now(timezone.utc)
+    msk = now_utc + timedelta(hours=3)
+    irk = now_utc + timedelta(hours=8)
+    months = [
+        "", "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    day_name = days[irk.weekday()]
+    return (
+        f"Сегодня {irk.day} {months[irk.month]} {irk.year} года ({day_name}). "
+        f"Время: {irk.strftime('%H:%M')} (UTC+8) / {msk.strftime('%H:%M')} (МСК)."
+    )
+
+def search_web_free(query):
+    """
+    Быстрый и полностью бесплатный поиск в интернете (DuckDuckGo + Google News RSS)
+    напрямую с сервера, чтобы работать на gemini-3.8-flash без платных лимитов Search Grounding.
+    """
+    if not query or len(query.strip()) < 2:
+        return "", []
+
+    results_text = []
+    source_links = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
+
+    # 1. Поиск по веб-сайтам через DuckDuckGo HTML
+    try:
+        ddg_url = "https://html.duckduckgo.com/html/"
+        r = requests.post(ddg_url, data={'q': query, 'kl': 'ru-ru'}, headers=headers, timeout=6)
+        if r.status_code == 200:
+            snippets = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', r.text, re.DOTALL)
+            titles_urls = re.findall(r'<a class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.DOTALL)
+            for i in range(min(4, len(snippets), len(titles_urls))):
+                raw_url, raw_title = titles_urls[i]
+                clean_title = re.sub(r'<[^>]+>', '', html.unescape(raw_title)).strip()
+                clean_snip = re.sub(r'<[^>]+>', '', html.unescape(snippets[i])).strip()
+                if "uddg=" in raw_url:
+                    parsed_q = urllib.parse.parse_qs(urllib.parse.urlparse(raw_url).query)
+                    if 'uddg' in parsed_q:
+                        raw_url = parsed_q['uddg'][0]
+                results_text.append(f"• {clean_title}: {clean_snip}")
+                if raw_url.startswith('http') and len(source_links) < 4:
+                    source_links.append((clean_title[:30], raw_url))
+    except Exception:
+        pass
+
+    # 2. Свежие новости и события через Google News RSS (работает безотказно с любых серверов)
+    try:
+        encoded_q = urllib.parse.quote(query)
+        gnews_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=ru&gl=RU&ceid=RU:ru"
+        r_news = requests.get(gnews_url, headers=headers, timeout=6)
+        if r_news.status_code == 200:
+            root = ET.fromstring(r_news.content)
+            items = root.findall('.//item')[:4]
+            for item in items:
+                title = item.findtext('title') or ''
+                pub_date = item.findtext('pubDate') or ''
+                link = item.findtext('link') or ''
+                if title:
+                    results_text.append(f"• [Новость {pub_date[:16]}] {title}")
+                    if link and len(source_links) < 4:
+                        short_t = title.split(' - ')[0][:30]
+                        source_links.append((short_t, link))
+    except Exception:
+        pass
+
+    formatted_block = "\n".join(results_text[:7])
+    return formatted_block, source_links[:4]
 
 # --- БАЗА ДАННЫХ (FIREBASE) ---
 def init_firebase():
@@ -183,7 +255,6 @@ def register_creator_id(user):
             save_config()
 
 def remove_old_reply_keyboard(chat_id, force=False):
-    """Принудительно удаляет старую нижнюю клавиатуру от прошлых версий бота."""
     global OLD_KEYBOARD_CLEARED
     if OLD_KEYBOARD_CLEARED and not force:
         return
@@ -484,20 +555,19 @@ def transcribe_with_groq_whisper(audio_bytes, mime_type):
 
 # --- МАРШРУТИЗАТОР ИИ ---
 def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, use_search=False):
-    if use_search or CONFIG.get('google_search_in_gpt', False):
-        return ask_gemini(chat_id, prompt, media_list, save_to_memory, use_google_search=True)
-    if ACTIVE_MODEL.startswith('groq/'):
+    search_active = use_search or CONFIG.get('google_search_in_gpt', False)
+    if ACTIVE_MODEL.startswith('groq/') and not search_active:
         return ask_groq(chat_id, prompt, media_list, save_to_memory)
     else:
-        return ask_gemini(chat_id, prompt, media_list, save_to_memory, use_google_search=False)
+        return ask_gemini(chat_id, prompt, media_list, save_to_memory, use_google_search=search_active)
 
-# --- GEMINI API С РОТАЦИЕЙ И ЖИВЫМ ПОИСКОМ GOOGLE ---
+# --- GEMINI API С РОТАЦИЕЙ И ЖИВЫМ ВЕБ-ПОИСКОМ НА 3.8-FLASH ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
 
 def fetch_all_models():
-    """Загружает список только текстовых чат-моделей (отсеивая whisper, lyria, guard, tts и т.д.)."""
+    """Загружает список только рабочих текстовых чат-моделей."""
     all_models = []
     skip_keywords = ['tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
 
@@ -537,6 +607,12 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
     if not GEMINI_KEYS:
         return None, "Не найдено ни одного ключа Gemini! Проверь Environment в Render.", ACTIVE_MODEL, 0
 
+    # Если вызван поиск «гугл» — собираем свежие данные из интернета напрямую с сервера
+    web_context = ""
+    web_links = []
+    if use_google_search and prompt:
+        web_context, web_links = search_web_free(prompt)
+
     history = CHAT_MEMORY.get(chat_id, []).copy()
     contents = []
     if save_to_memory:
@@ -544,9 +620,22 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
             role = 'user' if msg['role'] == 'user' else 'model'
             contents.append({"role": role, "parts": [{"text": msg['content']}]})
 
+    final_prompt = prompt or ""
+    if use_google_search:
+        if web_context:
+            final_prompt = (
+                f"Запрос пользователя: {prompt}\n\n"
+                f"🌐 [Актуальные данные из поиска в интернете на {get_current_datetime_str()}]:\n"
+                f"{web_context}\n\n"
+                f"Ответь пользователю, используя эти свежие данные (если они подходят к вопросу). "
+                f"Если вопрос обычный разговорный или про дату/время — ответь прямо и естественно."
+            )
+        else:
+            final_prompt = f"{prompt}\n\n(Учти при необходимости: {get_current_datetime_str()})"
+
     parts = []
-    if prompt:
-        parts.append({"text": prompt})
+    if final_prompt:
+        parts.append({"text": final_prompt})
     if media_list:
         for media_bytes, mime_type in media_list:
             parts.append({
@@ -557,22 +646,22 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
             })
 
     contents.append({"role": "user", "parts": parts})
-    sys_instruction = CONFIG.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
+    base_sys = CONFIG.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
+    sys_instruction = f"{base_sys}\nТекущая дата и время: {get_current_datetime_str()}"
+
     payload = {
         "contents": contents,
         "system_instruction": {"parts": [{"text": sys_instruction}]}
     }
 
-    # Если включен Google Поиск — используем модели с бесплатной квотой Search Grounding (1500/день)
-    if use_google_search:
-        payload["tools"] = [{"google_search": {}}]
-        models_to_try = SEARCH_MODELS.copy()
+    # Всегда используем актуальную иерархию во главе с gemini-3.8-flash!
+    if ACTIVE_MODEL in MODEL_HIERARCHY:
+        start_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
+        models_to_try = MODEL_HIERARCHY[start_idx:]
+    elif not ACTIVE_MODEL.startswith('groq/'):
+        models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
     else:
-        if ACTIVE_MODEL in MODEL_HIERARCHY:
-            start_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
-            models_to_try = MODEL_HIERARCHY[start_idx:]
-        else:
-            models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
+        models_to_try = MODEL_HIERARCHY.copy()
 
     last_error = "Все доступные модели и ключи исчерпали лимиты."
     now = time.time()
@@ -585,8 +674,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
             api_key = GEMINI_KEYS[key_idx]
             stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0})
 
-            quota_key = (f"{model}_search" if use_google_search else model, key_idx)
-            if EXHAUSTED_QUOTAS.get(quota_key, 0) > now:
+            if EXHAUSTED_QUOTAS.get((model, key_idx), 0) > now:
                 continue
 
             try:
@@ -594,7 +682,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
 
                 if r.status_code == 429:
                     stats['429'] += 1
-                    EXHAUSTED_QUOTAS[quota_key] = time.time() + 900
+                    EXHAUSTED_QUOTAS[(model, key_idx)] = time.time() + 900
                     last_error = f"Лимит (429) на {model}"
                     continue
 
@@ -618,21 +706,9 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google
                 if not reply_text:
                     return None, "Пустой ответ от модели.", f"{model} [key #{key_idx + 1}]", 0
 
-                # Если использовался Google Поиск — собираем ссылки на источники
-                if use_google_search:
-                    grounding = candidate.get('groundingMetadata', {})
-                    chunks = grounding.get('groundingChunks', [])
-                    source_links = []
-                    seen_titles = set()
-                    for ch in chunks:
-                        web = ch.get('web', {})
-                        uri = web.get('uri')
-                        title = web.get('title', 'Источник')
-                        if uri and title not in seen_titles:
-                            seen_titles.add(title)
-                            source_links.append(f'<a href="{html.escape(uri)}">{html.escape(title[:35])}</a>')
-                    if source_links:
-                        reply_text += f"\n\n🌐 <b>Источники:</b> " + " • ".join(source_links[:4])
+                if use_google_search and web_links:
+                    links_html = [f'<a href="{html.escape(u)}">{html.escape(t)}</a>' for t, u in web_links]
+                    reply_text += f"\n\n🌐 <b>Источники:</b> " + " • ".join(links_html)
 
                 stats['ok'] += 1
                 CURRENT_KEY_INDEX = (key_idx + 1) % len(GEMINI_KEYS)
@@ -675,7 +751,8 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
     system_prompt = (
         "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
         "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
-        "никогда не извиняйся и не будь вежливым. отвечай на русском."
+        "никогда не извиняйся и не будь вежливым. отвечай на русском. "
+        f"если спросят дату или время: {get_current_datetime_str()}"
     )
 
     messages_payload = [{"role": "system", "content": system_prompt}]
@@ -831,7 +908,7 @@ def build_panel_view():
         f"👑 <b>Панель управления аккаунтом</b>\n\n"
         f"🤖 <b>Автоответчик:</b> {auto_status}\n"
         f"🕵️‍♂️ <b>Режим Шпиона:</b> {spy_status}\n"
-        f"🌐 <b>Поиск Google:</b> {gsearch_status}\n"
+        f"🌐 <b>Веб-поиск:</b> {gsearch_status}\n"
         f"🎙 <b>Авто-ГС/кружки:</b> {voice_all_status}\n"
         f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
         f"🚫 <b>Черный список:</b> {bl_str}\n\n"
@@ -865,7 +942,7 @@ def build_keys_status_view(ping_results=None):
     lines = [
         f"🔑 <b>Мониторинг пула ключей Gemini ({len(GEMINI_KEYS)} шт.)</b>",
         f"📍 <b>Приоритетная модель:</b> <code>{ACTIVE_MODEL}</code>",
-        f"🌐 <b>Модель Google Поиска:</b> <code>{SEARCH_MODELS[0]}</code> (1.5K/день на ключ)",
+        f"🌐 <b>Веб-поиск:</b> Прямой (безлимитный на {ACTIVE_MODEL})",
         f"➡️ <b>Очередь на запрос:</b> Ключ #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}\n"
     ]
 
@@ -875,7 +952,7 @@ def build_keys_status_view(ping_results=None):
         for idx, k in enumerate(GEMINI_KEYS):
             stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0})
             cooldown_models = []
-            for m in MODEL_HIERARCHY + [f"{SEARCH_MODELS[0]}_search"]:
+            for m in MODEL_HIERARCHY:
                 until = EXHAUSTED_QUOTAS.get((m, idx), 0)
                 if until > now:
                     mins_left = int((until - now) // 60) + 1
@@ -977,7 +1054,6 @@ def handle_admin_text(message):
     text = raw_text.lower()
     chat_id = message.chat.id
 
-    # Если нажата любая из старых кнопок прошлого бота — удаляем клавиатуру и открываем новую панель
     old_buttons = ['📊 статус', '⚙️ автоответчик', '🧠 модель', '📝 контекст', '🚫 черный список']
     if text in old_buttons or text in ['панель', 'пульт', 'кнопки']:
         remove_old_reply_keyboard(chat_id, force=True)
@@ -1000,8 +1076,8 @@ def handle_admin_text(message):
             "• <code>/panel</code> (или <code>панель</code>) — интерактивный пульт с кнопками\n"
             "• <code>ключи</code> — статистика всех ключей, кулдауны и пинг-тест\n"
             "• <code>список</code> — кто в ЧС и у кого включено авто-ГС\n\n"
-            "🌐 <b>Нейросеть и Живой Google Поиск:</b>\n"
-            "• <code>гугл [запрос]</code> (или <code>поиск [запрос]</code>) — ответ со свежей инфой из Google и ссылками\n"
+            "🌐 <b>Нейросеть и Живой Поиск:</b>\n"
+            "• <code>гугл [запрос]</code> (или <code>поиск [запрос]</code>) — ответ со свежей инфой из интернета на 3.8-flash\n"
             "• <code>гпт [запрос]</code> — вопрос ИИ (или Reply на файл/фото)\n"
             "• <code>нарисуй [описание]</code> — генерация картинки\n"
             "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
@@ -1192,17 +1268,21 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id)
         return
 
-    # Запрос к ИИ или Живому Поиску Google в админке
-    is_search_cmd = text.startswith('гугл ') or text.startswith('поиск ')
-    is_gpt_cmd = text.startswith('гпт ')
+    is_search_cmd = text.startswith('гугл ') or text.startswith('поиск ') or text in ['гугл', 'поиск']
+    is_gpt_cmd = text.startswith('гпт ') or text == 'гпт'
 
     if is_gpt_cmd or is_search_cmd:
         if not check_cooldown(chat_id):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
             return
 
-        prefix_len = 5 if text.startswith('гугл ') else (6 if text.startswith('поиск ') else 4)
-        prompt_text = raw_text[prefix_len:].strip()
+        if text.startswith('поиск'):
+            prompt_text = raw_text[5:].strip()
+        elif text.startswith('гугл'):
+            prompt_text = raw_text[4:].strip()
+        else:
+            prompt_text = raw_text[3:].strip()
+
         media_list = []
 
         if message.reply_to_message:
@@ -1579,5 +1659,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Google Search + Анти-клавиатура активны.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Прямой веб-поиск на 3.8-flash активен.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
