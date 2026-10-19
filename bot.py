@@ -15,7 +15,7 @@ except ImportError:
     os.system('pip install -U pyTelegramBotAPI requests')
     import telebot
 
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -64,6 +64,11 @@ MODEL_HIERARCHY = [
     'gemini-3.6-flash',
     'gemini-3-flash'
 ]
+# Модели с бесплатным лимитом Search Grounding (1500 запросов/день на ключ)
+SEARCH_MODELS = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash'
+]
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
 DEFAULT_SYSTEM_PROMPT = "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."
@@ -72,12 +77,14 @@ GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 GROQ_API_BASE = 'https://api.groq.com/openai/v1'
 
 ACTIVE_MODEL = MODEL_HIERARCHY[0]
+OLD_KEYBOARD_CLEARED = False
 
 CONFIG = {
     'auto_reply_enabled': True,
     'spy_enabled': True,
     'voice_auto_all': False,
     'voice_auto_users': {},
+    'google_search_in_gpt': False,
     'creator_id': None,
     'context_limit': DEFAULT_CONTEXT_LIMIT,
     'afk_minutes': 10,
@@ -175,6 +182,21 @@ def register_creator_id(user):
             CONFIG['creator_id'] = CREATOR_ID
             save_config()
 
+def remove_old_reply_keyboard(chat_id, force=False):
+    """Принудительно удаляет старую нижнюю клавиатуру от прошлых версий бота."""
+    global OLD_KEYBOARD_CLEARED
+    if OLD_KEYBOARD_CLEARED and not force:
+        return
+    OLD_KEYBOARD_CLEARED = True
+    try:
+        bot.send_message(
+            chat_id,
+            "🧹 <i>Старые нерабочие кнопки снизу удалены.</i>",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        pass
+
 init_firebase()
 
 def check_cooldown(chat_id):
@@ -187,14 +209,29 @@ def check_cooldown(chat_id):
     LAST_REQUEST_TIME[chat_id] = now
     return True
 
-def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=None):
+def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=None, disable_web_page_preview=True):
     if len(text) > 4050:
         text = text[:4050] + "..."
     try:
-        bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, reply_markup=reply_markup)
+        bot.edit_message_text(
+            text,
+            chat_id,
+            message_id,
+            business_connection_id=business_id,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview
+        )
     except Exception:
         try:
-            bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, parse_mode=None, reply_markup=reply_markup)
+            bot.edit_message_text(
+                text,
+                chat_id,
+                message_id,
+                business_connection_id=business_id,
+                parse_mode=None,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview
+            )
         except Exception:
             pass
 
@@ -446,19 +483,24 @@ def transcribe_with_groq_whisper(audio_bytes, mime_type):
     return None
 
 # --- МАРШРУТИЗАТОР ИИ ---
-def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True):
+def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, use_search=False):
+    if use_search or CONFIG.get('google_search_in_gpt', False):
+        return ask_gemini(chat_id, prompt, media_list, save_to_memory, use_google_search=True)
     if ACTIVE_MODEL.startswith('groq/'):
         return ask_groq(chat_id, prompt, media_list, save_to_memory)
     else:
-        return ask_gemini(chat_id, prompt, media_list, save_to_memory)
+        return ask_gemini(chat_id, prompt, media_list, save_to_memory, use_google_search=False)
 
-# --- GEMINI API С РОТАЦИЕЙ И СТАТИСТИКОЙ КЛЮЧЕЙ ---
+# --- GEMINI API С РОТАЦИЕЙ И ЖИВЫМ ПОИСКОМ GOOGLE ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
 
 def fetch_all_models():
+    """Загружает список только текстовых чат-моделей (отсеивая whisper, lyria, guard, tts и т.д.)."""
     all_models = []
+    skip_keywords = ['tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
+
     if GEMINI_KEYS:
         url = f"{GEMINI_API_BASE}/models"
         try:
@@ -466,7 +508,9 @@ def fetch_all_models():
             if r.status_code == 200:
                 for m in r.json().get('models', []):
                     if 'generateContent' in m.get('supportedGenerationMethods', []):
-                        all_models.append(m['name'].replace('models/', ''))
+                        m_name = m['name'].replace('models/', '')
+                        if not any(kw in m_name.lower() for kw in skip_keywords):
+                            all_models.append(m_name)
         except Exception:
             pass
 
@@ -477,7 +521,9 @@ def fetch_all_models():
             if r.status_code == 200:
                 for m in r.json().get('data', []):
                     if m.get('active') is not False:
-                        all_models.append(f"groq/{m['id']}")
+                        m_id = m['id']
+                        if not any(kw in m_id.lower() for kw in skip_keywords):
+                            all_models.append(f"groq/{m_id}")
         except Exception:
             pass
 
@@ -485,7 +531,7 @@ def fetch_all_models():
         return MODEL_HIERARCHY
     return sorted(list(set(all_models)))
 
-def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
+def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, use_google_search=False):
     global CURRENT_KEY_INDEX
 
     if not GEMINI_KEYS:
@@ -517,11 +563,16 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
         "system_instruction": {"parts": [{"text": sys_instruction}]}
     }
 
-    if ACTIVE_MODEL in MODEL_HIERARCHY:
-        start_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
-        models_to_try = MODEL_HIERARCHY[start_idx:]
+    # Если включен Google Поиск — используем модели с бесплатной квотой Search Grounding (1500/день)
+    if use_google_search:
+        payload["tools"] = [{"google_search": {}}]
+        models_to_try = SEARCH_MODELS.copy()
     else:
-        models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
+        if ACTIVE_MODEL in MODEL_HIERARCHY:
+            start_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
+            models_to_try = MODEL_HIERARCHY[start_idx:]
+        else:
+            models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
 
     last_error = "Все доступные модели и ключи исчерпали лимиты."
     now = time.time()
@@ -534,7 +585,8 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
             api_key = GEMINI_KEYS[key_idx]
             stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0})
 
-            if EXHAUSTED_QUOTAS.get((model, key_idx), 0) > now:
+            quota_key = (f"{model}_search" if use_google_search else model, key_idx)
+            if EXHAUSTED_QUOTAS.get(quota_key, 0) > now:
                 continue
 
             try:
@@ -542,7 +594,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
 
                 if r.status_code == 429:
                     stats['429'] += 1
-                    EXHAUSTED_QUOTAS[(model, key_idx)] = time.time() + 900
+                    EXHAUSTED_QUOTAS[quota_key] = time.time() + 900
                     last_error = f"Лимит (429) на {model}"
                     continue
 
@@ -559,7 +611,29 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                 if 'candidates' not in data or not data['candidates']:
                     return None, "Модель заблокировала ответ (Safety Filter).", f"{model} [key #{key_idx + 1}]", 0
 
-                reply_text = data['candidates'][0]['content']['parts'][0]['text']
+                candidate = data['candidates'][0]
+                c_parts = candidate.get('content', {}).get('parts', [])
+                reply_text = "".join([p.get('text', '') for p in c_parts]).strip()
+
+                if not reply_text:
+                    return None, "Пустой ответ от модели.", f"{model} [key #{key_idx + 1}]", 0
+
+                # Если использовался Google Поиск — собираем ссылки на источники
+                if use_google_search:
+                    grounding = candidate.get('groundingMetadata', {})
+                    chunks = grounding.get('groundingChunks', [])
+                    source_links = []
+                    seen_titles = set()
+                    for ch in chunks:
+                        web = ch.get('web', {})
+                        uri = web.get('uri')
+                        title = web.get('title', 'Источник')
+                        if uri and title not in seen_titles:
+                            seen_titles.add(title)
+                            source_links.append(f'<a href="{html.escape(uri)}">{html.escape(title[:35])}</a>')
+                    if source_links:
+                        reply_text += f"\n\n🌐 <b>Источники:</b> " + " • ".join(source_links[:4])
+
                 stats['ok'] += 1
                 CURRENT_KEY_INDEX = (key_idx + 1) % len(GEMINI_KEYS)
 
@@ -572,7 +646,8 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                     CHAT_MEMORY[chat_id] = history
                     save_chat_memory_async(chat_id, history)
 
-                model_label = f"{model} [key #{key_idx + 1}]"
+                search_tag = " 🌐" if use_google_search else ""
+                model_label = f"{model}{search_tag} [key #{key_idx + 1}]"
                 return reply_text, None, model_label, len(history)
 
             except Exception as e:
@@ -636,7 +711,6 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
 
 # --- ЧИСТАЯ РАСШИФРОВКА ГОЛОСОВЫХ И КРУЖОЧКОВ ---
 def handle_voice_transcription(chat_id, target_msg, custom_instruction="", business_id=None):
-    """Расшифровывает ГС/кружок строго в чистый текст (без описаний и воды), если нет доп. поручений."""
     is_video_note = (target_msg.content_type == 'video_note')
     prefix_label = "Слушаю кружок..." if is_video_note else "Слушаю ГС..."
 
@@ -707,7 +781,7 @@ def generate_image(prompt):
                 if 'candidates' in data and data['candidates']:
                     for part in data['candidates'][0]['content']['parts']:
                         if 'inline_data' in part:
-                            return base64.b64encode(part['inline_data']['data']), None
+                            return base64.b64decode(part['inline_data']['data']), None
             last_err = "Модель не вернула изображение."
         except Exception as e:
             last_err = str(e)
@@ -737,10 +811,12 @@ def build_panel_view():
     auto_on = CONFIG.get('auto_reply_enabled', True)
     spy_on = CONFIG.get('spy_enabled', True)
     voice_all_on = CONFIG.get('voice_auto_all', False)
+    gsearch_on = CONFIG.get('google_search_in_gpt', False)
 
     auto_status = f"🟢 ВКЛ ({CONFIG.get('afk_minutes', 10)} мин)" if auto_on else "🔴 ВЫКЛ"
     spy_status = "🟢 ВКЛ" if spy_on else "🔴 ВЫКЛ"
     voice_all_status = "🟢 ВКЛ (все чаты)" if voice_all_on else "⚪ По команде «рс»"
+    gsearch_status = "🟢 ВКЛ (всегда)" if gsearch_on else "⚪ По команде «гугл»"
 
     voice_users = list(CONFIG.get('voice_auto_users', {}).keys())
     voice_users_str = ", ".join([f"@{u}" for u in voice_users]) if voice_users else "нет"
@@ -755,29 +831,33 @@ def build_panel_view():
         f"👑 <b>Панель управления аккаунтом</b>\n\n"
         f"🤖 <b>Автоответчик:</b> {auto_status}\n"
         f"🕵️‍♂️ <b>Режим Шпиона:</b> {spy_status}\n"
+        f"🌐 <b>Поиск Google:</b> {gsearch_status}\n"
         f"🎙 <b>Авто-ГС/кружки:</b> {voice_all_status}\n"
         f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
         f"🚫 <b>Черный список:</b> {bl_str}\n\n"
         f"🧠 <b>Модель:</b> <code>{ACTIVE_MODEL}</code>\n"
         f"🎭 <b>Характер ИИ:</b> {'Кастомный ✏️' if is_custom_prompt else 'Стандартный'}\n"
-        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (следующий: #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}, в кулдауне пар: {active_cooldowns})\n"
-        f"⏱ <b>Анти-спам КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (активных чатов: {len(CHAT_MEMORY)})"
+        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (следующий: #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}, в КД: {active_cooldowns})\n"
+        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (чатов: {len(CHAT_MEMORY)})"
     )
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data=" panel_toggle_auto"),
+        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_auto"),
         InlineKeyboardButton(f"🕵️‍♂️ Шпион: {'ВКЛ 🟢' if spy_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_spy")
     )
     kb.add(
-        InlineKeyboardButton(f"🎙 Авто-ГС (все): {'ВКЛ 🟢' if voice_all_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_voice"),
-        InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status")
+        InlineKeyboardButton(f"🎙 Авто-ГС: {'ВКЛ 🟢' if voice_all_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_voice"),
+        InlineKeyboardButton(f"🌐 Авто-Гугл: {'ВКЛ 🟢' if gsearch_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_gsearch")
     )
     kb.add(
-        InlineKeyboardButton("🧠 Сменить модель", callback_data="panel_models"),
-        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all")
+        InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status"),
+        InlineKeyboardButton("🧠 Сменить модель", callback_data="panel_models")
     )
-    kb.add(InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh"))
+    kb.add(
+        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all"),
+        InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh")
+    )
     return text, kb
 
 def build_keys_status_view(ping_results=None):
@@ -785,6 +865,7 @@ def build_keys_status_view(ping_results=None):
     lines = [
         f"🔑 <b>Мониторинг пула ключей Gemini ({len(GEMINI_KEYS)} шт.)</b>",
         f"📍 <b>Приоритетная модель:</b> <code>{ACTIVE_MODEL}</code>",
+        f"🌐 <b>Модель Google Поиска:</b> <code>{SEARCH_MODELS[0]}</code> (1.5K/день на ключ)",
         f"➡️ <b>Очередь на запрос:</b> Ключ #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}\n"
     ]
 
@@ -794,7 +875,7 @@ def build_keys_status_view(ping_results=None):
         for idx, k in enumerate(GEMINI_KEYS):
             stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0})
             cooldown_models = []
-            for m in MODEL_HIERARCHY:
+            for m in MODEL_HIERARCHY + [f"{SEARCH_MODELS[0]}_search"]:
                 until = EXHAUSTED_QUOTAS.get((m, idx), 0)
                 if until > now:
                     mins_left = int((until - now) // 60) + 1
@@ -825,7 +906,6 @@ def build_keys_status_view(ping_results=None):
     return "\n".join(lines), kb
 
 def ping_all_keys():
-    """Быстрая проверка работоспособности каждого ключа на текущей модели."""
     results = {}
     test_model = ACTIVE_MODEL if not ACTIVE_MODEL.startswith('groq/') else MODEL_HIERARCHY[0]
     url = f"{GEMINI_API_BASE}/models/{test_model}:generateContent"
@@ -840,8 +920,8 @@ def ping_all_keys():
                 results[idx] = f"🔴 Лимит 429 ({test_model})"
             else:
                 results[idx] = f"⚠️ Код {r.status_code}"
-        except Exception as e:
-            results[idx] = f"❌ Ошибка сети"
+        except Exception:
+            results[idx] = "❌ Ошибка сети"
     return results
 
 # --- ПАНЕЛЬ УПРАВЛЕНИЯ (В ЛИЧКЕ С БОТОМ) ---
@@ -850,17 +930,20 @@ def send_panel(message):
     if (message.from_user.username or '').lower() != CREATOR_USERNAME:
         return
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id, force=True)
     text, kb = build_panel_view()
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['voice', 'video_note', 'audio'])
 def handle_admin_voice(message):
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id)
     handle_voice_transcription(message.chat.id, message, business_id=None)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['document'])
 def handle_admin_document(message):
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id)
     caption = (message.caption or "").strip()
     if caption.lower().startswith('гпт '):
         caption = caption[4:].strip()
@@ -894,10 +977,15 @@ def handle_admin_text(message):
     text = raw_text.lower()
     chat_id = message.chat.id
 
-    if text in ['панель', 'пульт']:
+    # Если нажата любая из старых кнопок прошлого бота — удаляем клавиатуру и открываем новую панель
+    old_buttons = ['📊 статус', '⚙️ автоответчик', '🧠 модель', '📝 контекст', '🚫 черный список']
+    if text in old_buttons or text in ['панель', 'пульт', 'кнопки']:
+        remove_old_reply_keyboard(chat_id, force=True)
         p_text, p_kb = build_panel_view()
         bot.send_message(chat_id, p_text, reply_markup=p_kb)
         return
+
+    remove_old_reply_keyboard(chat_id)
 
     if text in ['ключи', 'статус ключей', '/keys']:
         k_text, k_kb = build_keys_status_view()
@@ -912,14 +1000,15 @@ def handle_admin_text(message):
             "• <code>/panel</code> (или <code>панель</code>) — интерактивный пульт с кнопками\n"
             "• <code>ключи</code> — статистика всех ключей, кулдауны и пинг-тест\n"
             "• <code>список</code> — кто в ЧС и у кого включено авто-ГС\n\n"
-            "🧠 <b>Нейросеть и Настройки:</b>\n"
-            "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
+            "🌐 <b>Нейросеть и Живой Google Поиск:</b>\n"
+            "• <code>гугл [запрос]</code> (или <code>поиск [запрос]</code>) — ответ со свежей инфой из Google и ссылками\n"
             "• <code>гпт [запрос]</code> — вопрос ИИ (или Reply на файл/фото)\n"
             "• <code>нарисуй [описание]</code> — генерация картинки\n"
+            "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
             "• <code>характер [текст]</code> — задать свой промпт/статус для Gemini\n"
             "• <code>характер сброс</code> — вернуть стандартный промпт\n"
             "• <code>таймер 5</code> — через сколько минут молчания отвечает бот\n"
-            "• <code>кд 3</code> — задержка анти-спама в секундах (0 — без задержки)\n"
+            "• <code>кд 3</code> — задержка анти-спама в секундах\n"
             "• <code>контекст 100</code> — лимит памяти сообщений\n"
             "• <code>сброс</code> / <code>сброс все</code> — очистить память чата или всех чатов\n\n"
             "🎙 <b>Голосовые и Кружки (чистый текст):</b>\n"
@@ -955,7 +1044,7 @@ def handle_admin_text(message):
         for m in models:
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, f"Все доступные модели (всего {len(models)}):", reply_markup=kb)
+        bot.reply_to(message, f"Доступные чат-модели (всего {len(models)}):", reply_markup=kb)
         return
 
     if text in ['фото-модели', 'фото модели']:
@@ -1103,12 +1192,17 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id)
         return
 
-    if text.startswith('гпт '):
+    # Запрос к ИИ или Живому Поиску Google в админке
+    is_search_cmd = text.startswith('гугл ') or text.startswith('поиск ')
+    is_gpt_cmd = text.startswith('гпт ')
+
+    if is_gpt_cmd or is_search_cmd:
         if not check_cooldown(chat_id):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
             return
 
-        prompt_text = raw_text[4:].strip()
+        prefix_len = 5 if text.startswith('гугл ') else (6 if text.startswith('поиск ') else 4)
+        prompt_text = raw_text[prefix_len:].strip()
         media_list = []
 
         if message.reply_to_message:
@@ -1129,11 +1223,14 @@ def handle_admin_text(message):
             elif rep.content_type in ['voice', 'video_note', 'audio']:
                 handle_voice_transcription(chat_id, rep, prompt_text, business_id=None)
                 return
+            elif rep.text and not prompt_text:
+                prompt_text = rep.text
 
-        loading_msg = bot.reply_to(message, "🕐 Думаю...")
+        label = "Гуглю..." if is_search_cmd else "Думаю..."
+        loading_msg = bot.reply_to(message, f"🕐 {label}")
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event)).start()
-        reply, err, model_used, ctx_len = ask_ai(chat_id, prompt_text, media_list)
+        threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, None, label)).start()
+        reply, err, model_used, ctx_len = ask_ai(chat_id, prompt_text, media_list, use_search=is_search_cmd)
         stop_event.set()
         if reply:
             safe_edit_message(f"{reply}\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}", message.chat.id, loading_msg.message_id)
@@ -1173,6 +1270,13 @@ def handle_callbacks(call):
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id, f"Авто-ГС (все): {'ВКЛ' if CONFIG['voice_auto_all'] else 'ВЫКЛ'}")
 
+    elif data == 'panel_toggle_gsearch':
+        CONFIG['google_search_in_gpt'] = not CONFIG.get('google_search_in_gpt', False)
+        save_config()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Авто-Гугл в ГПТ: {'ВКЛ' if CONFIG['google_search_in_gpt'] else 'ВЫКЛ'}")
+
     elif data == 'panel_refresh':
         text, kb = build_panel_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
@@ -1203,7 +1307,7 @@ def handle_callbacks(call):
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-        safe_edit_message(f"🧠 <b>Выбери базовую модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
+        safe_edit_message(f"🧠 <b>Выбери базовую чат-модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_clear_all':
@@ -1251,11 +1355,12 @@ def process_business_album(media_group_id):
 
     lower_text = text.lower().strip()
     is_gpt = lower_text.startswith('гпт ')
+    is_search = lower_text.startswith('гугл ') or lower_text.startswith('поиск ')
     is_reply_to_bot = base_msg.reply_to_message and base_msg.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
     trigger = False
-    if is_gpt or is_reply_to_bot:
+    if is_gpt or is_search or is_reply_to_bot:
         trigger = True
     elif not is_owner and CONFIG['auto_reply_enabled']:
         if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
@@ -1273,6 +1378,8 @@ def process_business_album(media_group_id):
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
     if is_gpt:
         text = text[4:].strip()
+    elif is_search:
+        text = text[5:].strip() if lower_text.startswith('гугл ') else text[6:].strip()
     if not text:
         text = "Опиши подробно, что на этих фотографиях."
 
@@ -1287,7 +1394,7 @@ def process_business_album(media_group_id):
         if img_bytes:
             images.append((img_bytes, mime))
 
-    reply, err, model_used, ctx_len = ask_ai(chat_id, text, images)
+    reply, err, model_used, ctx_len = ask_ai(chat_id, text, images, use_search=is_search)
     stop_event.set()
 
     if reply:
@@ -1349,16 +1456,17 @@ def handle_business_message(message):
         return
 
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
+    is_search = lower_text.startswith('гугл ') or lower_text == 'гугл' or lower_text.startswith('поиск ') or lower_text == 'поиск'
     is_draw = lower_text.startswith('нарисуй ')
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
     trigger = False
     if is_owner:
-        if is_gpt or is_draw or is_reply_to_bot:
+        if is_gpt or is_search or is_draw or is_reply_to_bot:
             trigger = True
     else:
-        if is_gpt or is_draw or is_reply_to_bot:
+        if is_gpt or is_search or is_draw or is_reply_to_bot:
             trigger = True
         elif message.content_type in ['text', 'document', 'photo'] and CONFIG['auto_reply_enabled']:
             if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
@@ -1374,6 +1482,11 @@ def handle_business_message(message):
 
     if is_gpt:
         text = text[4:].strip()
+    elif is_search:
+        if lower_text.startswith('поиск'):
+            text = text[5:].strip()
+        else:
+            text = text[4:].strip()
 
     if is_draw:
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
@@ -1398,9 +1511,9 @@ def handle_business_message(message):
         handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
         return
 
-    # 4. ОБРАБОТКА ТЕКСТА, ФОТО И ДОКУМЕНТОВ
+    # 4. ОБРАБОТКА ТЕКСТА, ПОИСКА GOOGLE, ФОТО И ДОКУМЕНТОВ
     media_list = []
-    loading_label = "Думаю..."
+    loading_label = "Гуглю..." if is_search else "Думаю..."
 
     if message.content_type == 'document':
         loading_label = "Читаю файл..."
@@ -1435,21 +1548,24 @@ def handle_business_message(message):
         if img_bytes:
             media_list.append((img_bytes, mime))
         if not text:
-            text = "Опиши, что на этом фото."
+            text = "Найди информацию об этом фото." if is_search else "Опиши, что на этом фото."
 
     elif message.reply_to_message and message.reply_to_message.photo:
         img_bytes, mime = get_photo_bytes(message.reply_to_message)
         if img_bytes:
             media_list.append((img_bytes, mime))
         if not text:
-            text = "Опиши, что на этом фото."
+            text = "Найди информацию об этом фото." if is_search else "Опиши, что на этом фото."
+
+    elif message.reply_to_message and message.reply_to_message.text and not text:
+        text = f"Проверь факты и найди актуальную информацию по этому сообщению: {message.reply_to_message.text}"
 
     msg = bot.send_message(chat_id, f"🕐 {loading_label}", business_connection_id=message.business_connection_id)
     BOT_BUSINESS_MESSAGES.add(msg.message_id)
     stop_event = threading.Event()
     threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, loading_label)).start()
 
-    reply, err, model_used, ctx_len = ask_ai(chat_id, text, media_list)
+    reply, err, model_used, ctx_len = ask_ai(chat_id, text, media_list, use_search=is_search)
     stop_event.set()
 
     if reply:
@@ -1463,5 +1579,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini в пуле: {len(GEMINI_KEYS)} | Админка 2.0 активна.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Google Search + Анти-клавиатура активны.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
