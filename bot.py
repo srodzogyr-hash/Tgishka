@@ -15,33 +15,19 @@ except ImportError:
     os.system('pip install -U pyTelegramBotAPI requests')
     import telebot
 
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ (ДО 10 ШТ.) ---
+# --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ (ДО 15 ШТ.) ---
 TOKEN = os.environ.get('TG_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')  # Ключ Groq
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
 
 def load_gemini_keys():
-    """Собирает все ключи Gemini из переменных окружения."""
+    """Собирает все ключи Gemini из переменных окружения (поддерживает до 15 ключей и запись через запятую)."""
     keys = []
-    env_names = [
-        'GROQ_KEY',       # Ключ №1 (старое название)
-        'GEMINI_KEYS',    # Запись через запятую
-        'GEMINI_KEY',
-        'GEMINI_KEY_1',
-        'GEMINI_KEY_2',   # Ключ №2
-        'GEMINI_KEY_3',   # Ключ №3
-        'GEMINI_KEY_4',   # Ключ №4
-        'GEMINI_KEY_5',   # Ключ №5
-        'GEMINI_KEY_6',
-        'GEMINI_KEY_7',
-        'GEMINI_KEY_8',
-        'GEMINI_KEY_9',
-        'GEMINI_KEY_10'
-    ]
+    env_names = ['GROQ_KEY', 'GEMINI_KEYS', 'GEMINI_KEY'] + [f'GEMINI_KEY_{i}' for i in range(1, 16)]
     for name in env_names:
         val = os.environ.get(name, '')
         if val:
@@ -52,7 +38,8 @@ def load_gemini_keys():
 
 GEMINI_KEYS = load_gemini_keys()
 CURRENT_KEY_INDEX = 0
-EXHAUSTED_QUOTAS = {}  # {(model, key_idx): timestamp_until_free}
+# Хранит время разблокировки: {"модель|хвост_ключа": timestamp_until_free}
+EXHAUSTED_QUOTAS = {}
 KEY_STATS = {i: {'ok': 0, '429': 0, 'err': 0} for i in range(len(GEMINI_KEYS))}
 
 CREATOR_USERNAME = 'wrtnoq'
@@ -72,12 +59,14 @@ GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 GROQ_API_BASE = 'https://api.groq.com/openai/v1'
 
 ACTIVE_MODEL = MODEL_HIERARCHY[0]
+OLD_KEYBOARD_CLEARED = False
 
 CONFIG = {
     'auto_reply_enabled': True,
     'spy_enabled': True,
     'voice_auto_all': False,
     'voice_auto_users': {},
+    'exhausted_quotas': {},
     'creator_id': None,
     'context_limit': DEFAULT_CONTEXT_LIMIT,
     'afk_minutes': 10,
@@ -98,15 +87,20 @@ MAX_CACHE_SIZE = 500
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 
-retry_strategy = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["POST"])
+# Уменьшен предел ретраев, чтобы бот не зависал при переключении ключей
+retry_strategy = Retry(total=1, backoff_factor=0.3, status_forcelist=[502, 503, 504], allowed_methods=["POST"])
 session = requests.Session()
-adapter = HTTPAdapter(max_retries=retry_strategy)
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
+def quota_id(model, api_key):
+    """Уникальный строковый ключ для сохранения кулдауна конкретной модели и API-ключа в Firebase."""
+    return f"{model}|{api_key[-6:]}"
+
 # --- БАЗА ДАННЫХ (FIREBASE) ---
 def init_firebase():
-    global CREATOR_ID
+    global CREATOR_ID, EXHAUSTED_QUOTAS
     if not FIREBASE_URL:
         return
     try:
@@ -119,7 +113,10 @@ def init_firebase():
                 CONFIG['voice_auto_users'] = {}
             if not isinstance(CONFIG.get('blacklist'), dict):
                 CONFIG['blacklist'] = {}
-            print("🔥 Настройки загружены из Firebase.")
+            if isinstance(CONFIG.get('exhausted_quotas'), dict):
+                now = time.time()
+                EXHAUSTED_QUOTAS = {k: float(v) for k, v in CONFIG['exhausted_quotas'].items() if float(v) > now}
+            print("🔥 Настройки и статусы лимитов загружены из Firebase.")
     except Exception as e:
         print(f"⚠️ Ошибка загрузки настроек Firebase: {e}")
 
@@ -139,6 +136,8 @@ def init_firebase():
 def save_config():
     if not FIREBASE_URL:
         return
+    now = time.time()
+    CONFIG['exhausted_quotas'] = {k: v for k, v in EXHAUSTED_QUOTAS.items() if v > now}
     def _worker():
         try:
             session.patch(f'{FIREBASE_URL}/config.json', json=CONFIG, timeout=5)
@@ -174,6 +173,21 @@ def register_creator_id(user):
             CREATOR_ID = user.id
             CONFIG['creator_id'] = CREATOR_ID
             save_config()
+
+def remove_old_reply_keyboard(chat_id, force=False):
+    """Удаляет старую нижнюю клавиатуру от прошлых версий бота."""
+    global OLD_KEYBOARD_CLEARED
+    if OLD_KEYBOARD_CLEARED and not force:
+        return
+    OLD_KEYBOARD_CLEARED = True
+    try:
+        bot.send_message(
+            chat_id,
+            "🧹 <i>Старые кнопки снизу убраны.</i>",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        pass
 
 init_firebase()
 
@@ -452,13 +466,15 @@ def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True):
     else:
         return ask_gemini(chat_id, prompt, media_list, save_to_memory)
 
-# --- GEMINI API С РОТАЦИЕЙ И СТАТИСТИКОЙ КЛЮЧЕЙ ---
+# --- GEMINI API С МГНОВЕННЫМ ПЕРЕКЛЮЧЕНИЕМ КЛЮЧЕЙ И МОДЕЛЕЙ ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
 
 def fetch_all_models():
     all_models = []
+    skip_keywords = ['tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
+
     if GEMINI_KEYS:
         url = f"{GEMINI_API_BASE}/models"
         try:
@@ -466,7 +482,9 @@ def fetch_all_models():
             if r.status_code == 200:
                 for m in r.json().get('models', []):
                     if 'generateContent' in m.get('supportedGenerationMethods', []):
-                        all_models.append(m['name'].replace('models/', ''))
+                        m_name = m['name'].replace('models/', '')
+                        if not any(kw in m_name.lower() for kw in skip_keywords):
+                            all_models.append(m_name)
         except Exception:
             pass
 
@@ -477,7 +495,9 @@ def fetch_all_models():
             if r.status_code == 200:
                 for m in r.json().get('data', []):
                     if m.get('active') is not False:
-                        all_models.append(f"groq/{m['id']}")
+                        m_id = m['id']
+                        if not any(kw in m_id.lower() for kw in skip_keywords):
+                            all_models.append(f"groq/{m_id}")
         except Exception:
             pass
 
@@ -534,15 +554,28 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
             api_key = GEMINI_KEYS[key_idx]
             stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0})
 
-            if EXHAUSTED_QUOTAS.get((model, key_idx), 0) > now:
+            q_key = quota_id(model, api_key)
+            # МГНОВЕННЫЙ ПРОПУСК (0.0001 сек): если ключ уже в кулдауне на этой модели, не тратим время на сеть!
+            if EXHAUSTED_QUOTAS.get(q_key, 0) > now:
                 continue
 
             try:
-                r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=75)
+                # Быстрый таймаут на коннект (5 сек), чтобы никогда не зависать на мертвых соединениях
+                r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 50))
 
                 if r.status_code == 429:
                     stats['429'] += 1
-                    EXHAUSTED_QUOTAS[(model, key_idx)] = time.time() + 900
+                    err_body = r.text.lower()
+                    # Различаем минутный лимит (RPM) и дневной лимит (RPD 20/20)
+                    if 'perminute' in err_body or 'per_minute' in err_body:
+                        # Минутный лимит — ставим паузу всего на 60 секунд
+                        EXHAUSTED_QUOTAS[q_key] = time.time() + 60
+                        print(f"⏱ Минутный лимит {model} на ключе #{key_idx + 1} (пауза 60 сек).")
+                    else:
+                        # Дневной лимит (20/20) — блокируем эту пару на 8 часов и сохраняем в Firebase!
+                        EXHAUSTED_QUOTAS[q_key] = time.time() + 28800
+                        save_config()
+                        print(f"🛑 Дневной лимит {model} на ключе #{key_idx + 1} исчерпан (пауза 8 часов).")
                     last_error = f"Лимит (429) на {model}"
                     continue
 
@@ -580,8 +613,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                 last_error = f"Сетевая ошибка: {str(e)}"
                 continue
 
-    EXHAUSTED_QUOTAS.clear()
-    return None, f"Все ключи ({len(GEMINI_KEYS)} шт.) и модели исчерпали лимит ({last_error}).", ACTIVE_MODEL, 0
+    return None, f"Все ключи ({len(GEMINI_KEYS)} шт.) и модели в очереди исчерпали лимит ({last_error}).", ACTIVE_MODEL, 0
 
 # --- GROQ API ---
 def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
@@ -614,7 +646,7 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
     payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.9}
 
     try:
-        r = session.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=60)
+        r = session.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(5, 45))
         if r.status_code != 200:
             return None, f"HTTP {r.status_code}: Groq API Error", ACTIVE_MODEL, 0
 
@@ -636,7 +668,6 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
 
 # --- ЧИСТАЯ РАСШИФРОВКА ГОЛОСОВЫХ И КРУЖОЧКОВ ---
 def handle_voice_transcription(chat_id, target_msg, custom_instruction="", business_id=None):
-    """Расшифровывает ГС/кружок строго в чистый текст (без описаний и воды), если нет доп. поручений."""
     is_video_note = (target_msg.content_type == 'video_note')
     prefix_label = "Слушаю кружок..." if is_video_note else "Слушаю ГС..."
 
@@ -691,7 +722,7 @@ def generate_image(prompt):
     last_err = "Неизвестная ошибка"
     for key_idx, api_key in enumerate(GEMINI_KEYS):
         try:
-            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=60)
+            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 50))
             if r.status_code == 429:
                 last_err = f"Лимит (429) на ключе #{key_idx + 1}"
                 continue
@@ -707,7 +738,7 @@ def generate_image(prompt):
                 if 'candidates' in data and data['candidates']:
                     for part in data['candidates'][0]['content']['parts']:
                         if 'inline_data' in part:
-                            return base64.b64encode(part['inline_data']['data']), None
+                            return base64.b64decode(part['inline_data']['data']), None
             last_err = "Модель не вернула изображение."
         except Exception as e:
             last_err = str(e)
@@ -733,6 +764,18 @@ def animate_loading(chat_id, message_id, stop_event, business_id=None, text_pref
         idx += 1
 
 # --- ФОРМИРОВАНИЕ ПАНЕЛИ УПРАВЛЕНИЯ И СТАТУСА КЛЮЧЕЙ ---
+def get_current_working_model():
+    """Показывает, какая модель реально ответит прямо сейчас с учетом выжатых ключей."""
+    if ACTIVE_MODEL.startswith('groq/'):
+        return ACTIVE_MODEL
+    now = time.time()
+    models = MODEL_HIERARCHY[MODEL_HIERARCHY.index(ACTIVE_MODEL):] if ACTIVE_MODEL in MODEL_HIERARCHY else [ACTIVE_MODEL] + MODEL_HIERARCHY
+    for m in models:
+        for k in GEMINI_KEYS:
+            if EXHAUSTED_QUOTAS.get(quota_id(m, k), 0) <= now:
+                return m
+    return "Все в кулдауне"
+
 def build_panel_view():
     auto_on = CONFIG.get('auto_reply_enabled', True)
     spy_on = CONFIG.get('spy_enabled', True)
@@ -750,6 +793,7 @@ def build_panel_view():
     active_cooldowns = sum(1 for v in EXHAUSTED_QUOTAS.values() if v > time.time())
     sys_prompt = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
     is_custom_prompt = (sys_prompt != DEFAULT_SYSTEM_PROMPT)
+    real_now_model = get_current_working_model()
 
     text = (
         f"👑 <b>Панель управления аккаунтом</b>\n\n"
@@ -758,19 +802,20 @@ def build_panel_view():
         f"🎙 <b>Авто-ГС/кружки:</b> {voice_all_status}\n"
         f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
         f"🚫 <b>Черный список:</b> {bl_str}\n\n"
-        f"🧠 <b>Модель:</b> <code>{ACTIVE_MODEL}</code>\n"
+        f"🧠 <b>Базовая модель:</b> <code>{ACTIVE_MODEL}</code>\n"
+        f"⚡ <b>Сейчас отвечает:</b> <code>{real_now_model}</code>\n"
         f"🎭 <b>Характер ИИ:</b> {'Кастомный ✏️' if is_custom_prompt else 'Стандартный'}\n"
-        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (следующий: #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}, в кулдауне пар: {active_cooldowns})\n"
-        f"⏱ <b>Анти-спам КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (активных чатов: {len(CHAT_MEMORY)})"
+        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в блоке пар: {active_cooldowns})\n"
+        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (чатов: {len(CHAT_MEMORY)})"
     )
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data=" panel_toggle_auto"),
+        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_auto"),
         InlineKeyboardButton(f"🕵️‍♂️ Шпион: {'ВКЛ 🟢' if spy_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_spy")
     )
     kb.add(
-        InlineKeyboardButton(f"🎙 Авто-ГС (все): {'ВКЛ 🟢' if voice_all_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_voice"),
+        InlineKeyboardButton(f"🎙 Авто-ГС: {'ВКЛ 🟢' if voice_all_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_voice"),
         InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status")
     )
     kb.add(
@@ -782,28 +827,29 @@ def build_panel_view():
 
 def build_keys_status_view(ping_results=None):
     now = time.time()
+    real_now_model = get_current_working_model()
     lines = [
         f"🔑 <b>Мониторинг пула ключей Gemini ({len(GEMINI_KEYS)} шт.)</b>",
-        f"📍 <b>Приоритетная модель:</b> <code>{ACTIVE_MODEL}</code>",
-        f"➡️ <b>Очередь на запрос:</b> Ключ #{CURRENT_KEY_INDEX + 1 if GEMINI_KEYS else 0}\n"
+        f"📍 <b>Приоритет:</b> <code>{ACTIVE_MODEL}</code> ➡️ <b>Активна сейчас:</b> <code>{real_now_model}</code>\n"
     ]
 
     if not GEMINI_KEYS:
-        lines.append("⚠️ Ключи не найдены! Добавь GEMINI_KEY_1..5 в Render.")
+        lines.append("⚠️ Ключи не найдены! Добавь GEMINI_KEY_1..8 в Render.")
     else:
         for idx, k in enumerate(GEMINI_KEYS):
             stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0})
             cooldown_models = []
             for m in MODEL_HIERARCHY:
-                until = EXHAUSTED_QUOTAS.get((m, idx), 0)
+                until = EXHAUSTED_QUOTAS.get(quota_id(m, k), 0)
                 if until > now:
-                    mins_left = int((until - now) // 60) + 1
-                    cooldown_models.append(f"{m} ({mins_left}м)")
+                    rem = int(until - now)
+                    time_lbl = f"{rem // 3600}ч {(rem % 3600) // 60}м" if rem >= 3600 else f"{rem // 60 + 1}м"
+                    cooldown_models.append(f"{m.replace('gemini-', '')} ({time_lbl})")
 
             if cooldown_models:
-                state_str = f"⏳ КД на: {', '.join(cooldown_models)}"
+                state_str = f"🛑 Выжат на: {', '.join(cooldown_models)}"
             else:
-                state_str = "🟢 Свободен на всех моделях"
+                state_str = "🟢 Свободен (3.8 и ниже)"
 
             ping_str = ""
             if ping_results and idx in ping_results:
@@ -811,7 +857,7 @@ def build_keys_status_view(ping_results=None):
 
             lines.append(
                 f"<b>Ключ #{idx + 1}</b> (<code>{mask_key(k)}</code>)\n"
-                f"   Статус: {state_str}\n"
+                f"   {state_str}\n"
                 f"   Запросов: ✅ {stats['ok']} | ⚠️ 429: {stats['429']} | ❌ Сбоев: {stats['err']}"
                 f"{ping_str}"
             )
@@ -825,23 +871,32 @@ def build_keys_status_view(ping_results=None):
     return "\n".join(lines), kb
 
 def ping_all_keys():
-    """Быстрая проверка работоспособности каждого ключа на текущей модели."""
+    """Пингует каждый ключ и автоматически помечает выжатые ключи в базу, чтобы они не тормозили бота."""
     results = {}
     test_model = ACTIVE_MODEL if not ACTIVE_MODEL.startswith('groq/') else MODEL_HIERARCHY[0]
     url = f"{GEMINI_API_BASE}/models/{test_model}:generateContent"
     payload = {"contents": [{"role": "user", "parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 2}}
 
+    changed = False
     for idx, api_key in enumerate(GEMINI_KEYS):
+        q_key = quota_id(test_model, api_key)
         try:
-            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=10)
+            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 10))
             if r.status_code == 200:
-                results[idx] = f"🟢 Работает ({test_model})"
+                results[idx] = f"🟢 Живой на {test_model}"
+                if q_key in EXHAUSTED_QUOTAS:
+                    del EXHAUSTED_QUOTAS[q_key]
+                    changed = True
             elif r.status_code == 429:
-                results[idx] = f"🔴 Лимит 429 ({test_model})"
+                results[idx] = f"🔴 Выжат (429) на {test_model}"
+                EXHAUSTED_QUOTAS[q_key] = time.time() + 28800
+                changed = True
             else:
                 results[idx] = f"⚠️ Код {r.status_code}"
-        except Exception as e:
-            results[idx] = f"❌ Ошибка сети"
+        except Exception:
+            results[idx] = "❌ Ошибка сети"
+    if changed:
+        save_config()
     return results
 
 # --- ПАНЕЛЬ УПРАВЛЕНИЯ (В ЛИЧКЕ С БОТОМ) ---
@@ -850,17 +905,20 @@ def send_panel(message):
     if (message.from_user.username or '').lower() != CREATOR_USERNAME:
         return
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id, force=True)
     text, kb = build_panel_view()
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['voice', 'video_note', 'audio'])
 def handle_admin_voice(message):
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id)
     handle_voice_transcription(message.chat.id, message, business_id=None)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['document'])
 def handle_admin_document(message):
     register_creator_id(message.from_user)
+    remove_old_reply_keyboard(message.chat.id)
     caption = (message.caption or "").strip()
     if caption.lower().startswith('гпт '):
         caption = caption[4:].strip()
@@ -894,10 +952,14 @@ def handle_admin_text(message):
     text = raw_text.lower()
     chat_id = message.chat.id
 
-    if text in ['панель', 'пульт']:
+    old_buttons = ['📊 статус', '⚙️ автоответчик', '🧠 модель', '📝 контекст', '🚫 черный список']
+    if text in old_buttons or text in ['панель', 'пульт', 'кнопки']:
+        remove_old_reply_keyboard(chat_id, force=True)
         p_text, p_kb = build_panel_view()
         bot.send_message(chat_id, p_text, reply_markup=p_kb)
         return
+
+    remove_old_reply_keyboard(chat_id)
 
     if text in ['ключи', 'статус ключей', '/keys']:
         k_text, k_kb = build_keys_status_view()
@@ -913,13 +975,13 @@ def handle_admin_text(message):
             "• <code>ключи</code> — статистика всех ключей, кулдауны и пинг-тест\n"
             "• <code>список</code> — кто в ЧС и у кого включено авто-ГС\n\n"
             "🧠 <b>Нейросеть и Настройки:</b>\n"
-            "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
             "• <code>гпт [запрос]</code> — вопрос ИИ (или Reply на файл/фото)\n"
             "• <code>нарисуй [описание]</code> — генерация картинки\n"
+            "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
             "• <code>характер [текст]</code> — задать свой промпт/статус для Gemini\n"
             "• <code>характер сброс</code> — вернуть стандартный промпт\n"
             "• <code>таймер 5</code> — через сколько минут молчания отвечает бот\n"
-            "• <code>кд 3</code> — задержка анти-спама в секундах (0 — без задержки)\n"
+            "• <code>кд 3</code> — задержка анти-спама в секундах\n"
             "• <code>контекст 100</code> — лимит памяти сообщений\n"
             "• <code>сброс</code> / <code>сброс все</code> — очистить память чата или всех чатов\n\n"
             "🎙 <b>Голосовые и Кружки (чистый текст):</b>\n"
@@ -955,7 +1017,7 @@ def handle_admin_text(message):
         for m in models:
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, f"Все доступные модели (всего {len(models)}):", reply_markup=kb)
+        bot.reply_to(message, f"Доступные чат-модели (всего {len(models)}):", reply_markup=kb)
         return
 
     if text in ['фото-модели', 'фото модели']:
@@ -1185,6 +1247,7 @@ def handle_callbacks(call):
 
     elif data == 'keys_reset_cd':
         EXHAUSTED_QUOTAS.clear()
+        save_config()
         text, kb = build_keys_status_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id, "Все кулдауны ключей сброшены!")
@@ -1203,7 +1266,7 @@ def handle_callbacks(call):
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-        safe_edit_message(f"🧠 <b>Выбери базовую модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
+        safe_edit_message(f"🧠 <b>Выбери базовую чат-модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_clear_all':
@@ -1214,7 +1277,6 @@ def handle_callbacks(call):
 
     elif data.startswith('setmodel_'):
         ACTIVE_MODEL = data.replace('setmodel_', '')
-        EXHAUSTED_QUOTAS.clear()
         text, kb = build_panel_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id, f"Модель: {ACTIVE_MODEL}")
@@ -1463,5 +1525,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini в пуле: {len(GEMINI_KEYS)} | Админка 2.0 активна.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Турбо-переключение активно.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
