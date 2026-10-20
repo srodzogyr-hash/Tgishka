@@ -16,8 +16,6 @@ except ImportError:
     import telebot
 
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ (ДО 15 ШТ.) ---
 TOKEN = os.environ.get('TG_TOKEN')
@@ -25,7 +23,7 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY')  # Ключ Groq
 FIREBASE_URL = os.environ.get('FIREBASE_URL')
 
 def load_gemini_keys():
-    """Собирает все ключи Gemini из переменных окружения (поддерживает до 15 ключей и запись через запятую)."""
+    """Собирает все ключи Gemini из переменных окружения (до 15 ключей)."""
     keys = []
     env_names = ['GROQ_KEY', 'GEMINI_KEYS', 'GEMINI_KEY'] + [f'GEMINI_KEY_{i}' for i in range(1, 16)]
     for name in env_names:
@@ -40,16 +38,17 @@ GEMINI_KEYS = load_gemini_keys()
 CURRENT_KEY_INDEX = 0
 # Хранит время разблокировки: {"модель|хвост_ключа": timestamp_until_free}
 EXHAUSTED_QUOTAS = {}
-KEY_STATS = {i: {'ok': 0, '429': 0, 'err': 0} for i in range(len(GEMINI_KEYS))}
+KEY_STATS = {i: {'ok': 0, '429': 0, 'err': 0, 'last_err': ''} for i in range(len(GEMINI_KEYS))}
 
 CREATOR_USERNAME = 'wrtnoq'
 CREATOR_ID = None
 
+# 3.7-flash убрана! Чистая очередь рабочих моделей:
 MODEL_HIERARCHY = [
     'gemini-3.8-flash',
-    'gemini-3.7-flash',
     'gemini-3.6-flash',
-    'gemini-3-flash'
+    'gemini-3-flash',
+    'gemini-2.5-flash'
 ]
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
@@ -87,15 +86,15 @@ MAX_CACHE_SIZE = 500
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 
-# Уменьшен предел ретраев, чтобы бот не зависал при переключении ключей
-retry_strategy = Retry(total=1, backoff_factor=0.3, status_forcelist=[502, 503, 504], allowed_methods=["POST"])
-session = requests.Session()
-adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+# Изолированные сессии для каждого потока (чтобы потоки никогда не вешали друг друга в очереди!)
+thread_local = threading.local()
+
+def get_http_session():
+    if not hasattr(thread_local, "session"):
+        thread_local.session = requests.Session()
+    return thread_local.session
 
 def quota_id(model, api_key):
-    """Уникальный строковый ключ для сохранения кулдауна конкретной модели и API-ключа в Firebase."""
     return f"{model}|{api_key[-6:]}"
 
 # --- БАЗА ДАННЫХ (FIREBASE) ---
@@ -103,8 +102,9 @@ def init_firebase():
     global CREATOR_ID, EXHAUSTED_QUOTAS
     if not FIREBASE_URL:
         return
+    s = get_http_session()
     try:
-        r = session.get(f'{FIREBASE_URL}/config.json', timeout=10)
+        r = s.get(f'{FIREBASE_URL}/config.json', timeout=8)
         if r.status_code == 200 and isinstance(r.json(), dict):
             CONFIG.update(r.json())
             if CONFIG.get('creator_id'):
@@ -115,13 +115,17 @@ def init_firebase():
                 CONFIG['blacklist'] = {}
             if isinstance(CONFIG.get('exhausted_quotas'), dict):
                 now = time.time()
-                EXHAUSTED_QUOTAS = {k: float(v) for k, v in CONFIG['exhausted_quotas'].items() if float(v) > now}
+                # Загружаем кулдауны, игнорируя удаленную 3.7-flash
+                EXHAUSTED_QUOTAS = {
+                    k: float(v) for k, v in CONFIG['exhausted_quotas'].items()
+                    if float(v) > now and '3.7-flash' not in k
+                }
             print("🔥 Настройки и статусы лимитов загружены из Firebase.")
     except Exception as e:
         print(f"⚠️ Ошибка загрузки настроек Firebase: {e}")
 
     try:
-        r_mem = session.get(f'{FIREBASE_URL}/chat_memory.json', timeout=10)
+        r_mem = s.get(f'{FIREBASE_URL}/chat_memory.json', timeout=8)
         if r_mem.status_code == 200 and isinstance(r_mem.json(), dict):
             for k, v in r_mem.json().items():
                 if isinstance(v, list):
@@ -140,9 +144,9 @@ def save_config():
     CONFIG['exhausted_quotas'] = {k: v for k, v in EXHAUSTED_QUOTAS.items() if v > now}
     def _worker():
         try:
-            session.patch(f'{FIREBASE_URL}/config.json', json=CONFIG, timeout=5)
-        except Exception as e:
-            print(f"⚠️ Ошибка сохранения в Firebase: {e}")
+            get_http_session().patch(f'{FIREBASE_URL}/config.json', json=CONFIG, timeout=5)
+        except Exception:
+            pass
     threading.Thread(target=_worker, daemon=True).start()
 
 def save_chat_memory_async(chat_id, history):
@@ -150,9 +154,9 @@ def save_chat_memory_async(chat_id, history):
         return
     def _worker():
         try:
-            session.put(f'{FIREBASE_URL}/chat_memory/{chat_id}.json', json=history, timeout=5)
-        except Exception as e:
-            print(f"⚠️ Ошибка сохранения памяти чата {chat_id}: {e}")
+            get_http_session().put(f'{FIREBASE_URL}/chat_memory/{chat_id}.json', json=history, timeout=5)
+        except Exception:
+            pass
     threading.Thread(target=_worker, daemon=True).start()
 
 def clear_all_memory_firebase():
@@ -161,7 +165,7 @@ def clear_all_memory_firebase():
         return
     def _worker():
         try:
-            session.delete(f'{FIREBASE_URL}/chat_memory.json', timeout=5)
+            get_http_session().delete(f'{FIREBASE_URL}/chat_memory.json', timeout=5)
         except Exception:
             pass
     threading.Thread(target=_worker, daemon=True).start()
@@ -175,7 +179,6 @@ def register_creator_id(user):
             save_config()
 
 def remove_old_reply_keyboard(chat_id, force=False):
-    """Удаляет старую нижнюю клавиатуру от прошлых версий бота."""
     global OLD_KEYBOARD_CLEARED
     if OLD_KEYBOARD_CLEARED and not force:
         return
@@ -201,6 +204,44 @@ def check_cooldown(chat_id):
     LAST_REQUEST_TIME[chat_id] = now
     return True
 
+# --- ФОРМАТИРОВАНИЕ И РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ НА ЧАСТИ ---
+def format_markdown_to_html(text):
+    """Превращает сырой Markdown от нейросети (####, **, `) в чистый HTML для Telegram."""
+    escaped = html.escape(text)
+    # Блоки кода ```...```
+    escaped = re.sub(r'```(?:\w+)?\n?(.*?)```', r'<pre>\1</pre>', escaped, flags=re.DOTALL)
+    # Одиночный код `...`
+    escaped = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', escaped)
+    # Заголовки #### Заголовок -> жирный текст
+    escaped = re.sub(r'(?m)^#{1,6}\s+(.+)$', r'<b>\1</b>', escaped)
+    # Жирный текст **...**
+    escaped = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', escaped)
+    return escaped
+
+def split_text_into_chunks(text, max_len=3700):
+    """Аккуратно режет длинный текст по абзацам или строкам, чтобы не обрывать на полуслове."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > max_len:
+        # Ищем последний перенос абзаца, строки или пробел в пределах лимита
+        split_pos = remaining.rfind('\n\n', 0, max_len)
+        if split_pos == -1 or split_pos < max_len // 2:
+            split_pos = remaining.rfind('\n', 0, max_len)
+        if split_pos == -1 or split_pos < max_len // 2:
+            split_pos = remaining.rfind(' ', 0, max_len)
+        if split_pos == -1:
+            split_pos = max_len
+
+        chunks.append(remaining[:split_pos].strip())
+        remaining = remaining[split_pos:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=None):
     if len(text) > 4050:
         text = text[:4050] + "..."
@@ -211,6 +252,51 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
             bot.edit_message_text(text, chat_id, message_id, business_connection_id=business_id, parse_mode=None, reply_markup=reply_markup)
         except Exception:
             pass
+
+def send_long_response(reply_text, footer_text, chat_id, loading_msg_id, business_id=None):
+    """
+    Если ответ длинный — редактирует первое сообщение и отправляет продолжение 2-м, 3-м и т.д. сообщением!
+    Ни один символ больше не обрезается.
+    """
+    raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
+    total = len(raw_chunks)
+
+    for idx, chunk in enumerate(raw_chunks):
+        formatted_chunk = format_markdown_to_html(chunk)
+        plain_chunk = chunk
+
+        # К последнему куску прикрепляем подпись context / model
+        if idx == total - 1 and footer_text:
+            formatted_chunk += f"\n\n{footer_text}"
+            plain_chunk += f"\n\n{footer_text}"
+        elif total > 1:
+            part_label = f"<i>(Часть {idx + 1}/{total})</i>\n\n"
+            formatted_chunk = part_label + formatted_chunk
+            plain_chunk = f"(Часть {idx + 1}/{total})\n\n" + plain_chunk
+
+        if idx == 0:
+            # Первый кусок заменяет собой сообщение «🕐 Думаю...»
+            try:
+                bot.edit_message_text(formatted_chunk, chat_id, loading_msg_id, business_connection_id=business_id)
+            except Exception:
+                try:
+                    bot.edit_message_text(plain_chunk, chat_id, loading_msg_id, business_connection_id=business_id, parse_mode=None)
+                except Exception:
+                    pass
+        else:
+            # Все следующие куски отправляются новыми сообщениями следом
+            time.sleep(0.3)
+            try:
+                sent = bot.send_message(chat_id, formatted_chunk, business_connection_id=business_id)
+                if business_id and sent:
+                    BOT_BUSINESS_MESSAGES.add(sent.message_id)
+            except Exception:
+                try:
+                    sent = bot.send_message(chat_id, plain_chunk, business_connection_id=business_id, parse_mode=None)
+                    if business_id and sent:
+                        BOT_BUSINESS_MESSAGES.add(sent.message_id)
+                except Exception:
+                    pass
 
 def mask_key(key_str):
     if len(key_str) <= 10:
@@ -452,7 +538,7 @@ def transcribe_with_groq_whisper(audio_bytes, mime_type):
     data = {'model': 'whisper-large-v3-turbo', 'language': 'ru'}
     headers = {'Authorization': f'Bearer {GROQ_API_KEY}'}
     try:
-        r = session.post(f'{GROQ_API_BASE}/audio/transcriptions', headers=headers, files=files, data=data, timeout=45)
+        r = get_http_session().post(f'{GROQ_API_BASE}/audio/transcriptions', headers=headers, files=files, data=data, timeout=25)
         if r.status_code == 200:
             return r.json().get('text', '').strip()
     except Exception:
@@ -466,19 +552,20 @@ def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True):
     else:
         return ask_gemini(chat_id, prompt, media_list, save_to_memory)
 
-# --- GEMINI API С МГНОВЕННЫМ ПЕРЕКЛЮЧЕНИЕМ КЛЮЧЕЙ И МОДЕЛЕЙ ---
+# --- GEMINI API С МГНОВЕННЫМ ОТСЕВОМ СБОЙНЫХ КЛЮЧЕЙ ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
 
 def fetch_all_models():
     all_models = []
-    skip_keywords = ['tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
+    skip_keywords = ['3.7', 'tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
+    s = get_http_session()
 
     if GEMINI_KEYS:
         url = f"{GEMINI_API_BASE}/models"
         try:
-            r = session.get(url, headers=get_gemini_headers(GEMINI_KEYS[0]), timeout=10)
+            r = s.get(url, headers=get_gemini_headers(GEMINI_KEYS[0]), timeout=8)
             if r.status_code == 200:
                 for m in r.json().get('models', []):
                     if 'generateContent' in m.get('supportedGenerationMethods', []):
@@ -491,7 +578,7 @@ def fetch_all_models():
     if GROQ_API_KEY:
         url = f"{GROQ_API_BASE}/models"
         try:
-            r = session.get(url, headers={'Authorization': f'Bearer {GROQ_API_KEY}'}, timeout=10)
+            r = s.get(url, headers={'Authorization': f'Bearer {GROQ_API_KEY}'}, timeout=8)
             if r.status_code == 200:
                 for m in r.json().get('data', []):
                     if m.get('active') is not False:
@@ -504,6 +591,13 @@ def fetch_all_models():
     if not all_models:
         return MODEL_HIERARCHY
     return sorted(list(set(all_models)))
+
+def block_key_Across_all_models(api_key, seconds, reason=""):
+    """Блокирует нерабочий/невалидный ключ сразу на всех моделях, чтобы он не тормозил очередь."""
+    until = time.time() + seconds
+    for m in MODEL_HIERARCHY:
+        EXHAUSTED_QUOTAS[quota_id(m, api_key)] = until
+    save_config()
 
 def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
     global CURRENT_KEY_INDEX
@@ -544,47 +638,59 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
         models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
 
     last_error = "Все доступные модели и ключи исчерпали лимиты."
-    now = time.time()
+    s = get_http_session()
 
     for model in models_to_try:
         url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
 
         for k_offset in range(len(GEMINI_KEYS)):
+            now = time.time()
             key_idx = (CURRENT_KEY_INDEX + k_offset) % len(GEMINI_KEYS)
             api_key = GEMINI_KEYS[key_idx]
-            stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0})
+            stats = KEY_STATS.setdefault(key_idx, {'ok': 0, '429': 0, 'err': 0, 'last_err': ''})
 
             q_key = quota_id(model, api_key)
-            # МГНОВЕННЫЙ ПРОПУСК (0.0001 сек): если ключ уже в кулдауне на этой модели, не тратим время на сеть!
             if EXHAUSTED_QUOTAS.get(q_key, 0) > now:
                 continue
 
             try:
-                # Быстрый таймаут на коннект (5 сек), чтобы никогда не зависать на мертвых соединениях
-                r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 50))
+                # Жесткий таймаут: 4 сек на коннект, 20 сек на ответ (никаких зависаний по 10 минут!)
+                r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 20))
 
                 if r.status_code == 429:
                     stats['429'] += 1
                     err_body = r.text.lower()
-                    # Различаем минутный лимит (RPM) и дневной лимит (RPD 20/20)
                     if 'perminute' in err_body or 'per_minute' in err_body:
-                        # Минутный лимит — ставим паузу всего на 60 секунд
                         EXHAUSTED_QUOTAS[q_key] = time.time() + 60
-                        print(f"⏱ Минутный лимит {model} на ключе #{key_idx + 1} (пауза 60 сек).")
+                        stats['last_err'] = f"RPM лимит ({model})"
                     else:
-                        # Дневной лимит (20/20) — блокируем эту пару на 8 часов и сохраняем в Firebase!
                         EXHAUSTED_QUOTAS[q_key] = time.time() + 28800
+                        stats['last_err'] = f"Дневной 429 ({model})"
                         save_config()
-                        print(f"🛑 Дневной лимит {model} на ключе #{key_idx + 1} исчерпан (пауза 8 часов).")
                     last_error = f"Лимит (429) на {model}"
                     continue
 
-                if r.status_code in [400, 404]:
-                    last_error = f"HTTP {r.status_code} ({model})"
+                # Если модель удалена/не существует (404) — блокируем модель для всех ключей на 12 часов и идем дальше
+                if r.status_code == 404:
+                    for k in GEMINI_KEYS:
+                        EXHAUSTED_QUOTAS[quota_id(model, k)] = time.time() + 43200
+                    save_config()
+                    last_error = f"Модель {model} не найдена (404)"
                     break
 
+                # Если сам ключ невалидный или заблокирован (400 / 403) — отключаем этот ключ на всех моделях на 6 часов!
+                if r.status_code in [400, 401, 403]:
+                    stats['err'] += 1
+                    stats['last_err'] = f"Код {r.status_code} (ключ отклонен)"
+                    block_key_Across_all_models(api_key, 21600)
+                    last_error = f"Ключ #{key_idx + 1} отклонен (HTTP {r.status_code})"
+                    continue
+
+                # Если ошибка сервера Google (500, 503) — ставим пару (модель+ключ) на паузу 5 минут и сразу берем следующий
                 if r.status_code != 200:
                     stats['err'] += 1
+                    stats['last_err'] = f"HTTP {r.status_code} ({model})"
+                    EXHAUSTED_QUOTAS[q_key] = time.time() + 300
                     last_error = f"HTTP {r.status_code}: Gemini API Error"
                     continue
 
@@ -594,6 +700,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
 
                 reply_text = data['candidates'][0]['content']['parts'][0]['text']
                 stats['ok'] += 1
+                stats['last_err'] = ''
                 CURRENT_KEY_INDEX = (key_idx + 1) % len(GEMINI_KEYS)
 
                 if save_to_memory:
@@ -609,11 +716,14 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True):
                 return reply_text, None, model_label, len(history)
 
             except Exception as e:
+                # При таймауте или обрыве связи ставим ключ на паузу 5 минут, чтобы следующие запросы не ждали!
                 stats['err'] += 1
-                last_error = f"Сетевая ошибка: {str(e)}"
+                stats['last_err'] = "Таймаут / Сеть"
+                EXHAUSTED_QUOTAS[q_key] = time.time() + 300
+                last_error = f"Таймаут ключа #{key_idx + 1}"
                 continue
 
-    return None, f"Все ключи ({len(GEMINI_KEYS)} шт.) и модели в очереди исчерпали лимит ({last_error}).", ACTIVE_MODEL, 0
+    return None, f"Все ключи ({len(GEMINI_KEYS)} шт.) и модели исчерпаны или недоступны ({last_error}).", ACTIVE_MODEL, 0
 
 # --- GROQ API ---
 def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
@@ -646,7 +756,7 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True):
     payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.9}
 
     try:
-        r = session.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(5, 45))
+        r = get_http_session().post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(4, 25))
         if r.status_code != 200:
             return None, f"HTTP {r.status_code}: Groq API Error", ACTIVE_MODEL, 0
 
@@ -676,7 +786,7 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
         BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
 
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, prefix_label)).start()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, prefix_label), daemon=True).start()
 
     media_bytes, mime_type = get_voice_or_videonote_bytes(target_msg)
     if not media_bytes:
@@ -700,12 +810,9 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
     stop_event.set()
 
     if reply:
-        clean_reply = reply.strip()
-        if custom_instruction:
-            out_text = f"🎙 {clean_reply}\n\nmodel: {model_used}"
-        else:
-            out_text = f"🎙 {clean_reply}"
-        safe_edit_message(out_text, chat_id, loading_msg.message_id, business_id)
+        clean_reply = f"🎙 {reply.strip()}"
+        footer = f"model: {model_used}" if custom_instruction else ""
+        send_long_response(clean_reply, footer, chat_id, loading_msg.message_id, business_id)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_id)
 
@@ -720,9 +827,10 @@ def generate_image(prompt):
               {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
 
     last_err = "Неизвестная ошибка"
+    s = get_http_session()
     for key_idx, api_key in enumerate(GEMINI_KEYS):
         try:
-            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 50))
+            r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 30))
             if r.status_code == 429:
                 last_err = f"Лимит (429) на ключе #{key_idx + 1}"
                 continue
@@ -765,7 +873,6 @@ def animate_loading(chat_id, message_id, stop_event, business_id=None, text_pref
 
 # --- ФОРМИРОВАНИЕ ПАНЕЛИ УПРАВЛЕНИЯ И СТАТУСА КЛЮЧЕЙ ---
 def get_current_working_model():
-    """Показывает, какая модель реально ответит прямо сейчас с учетом выжатых ключей."""
     if ACTIVE_MODEL.startswith('groq/'):
         return ACTIVE_MODEL
     now = time.time()
@@ -837,7 +944,7 @@ def build_keys_status_view(ping_results=None):
         lines.append("⚠️ Ключи не найдены! Добавь GEMINI_KEY_1..8 в Render.")
     else:
         for idx, k in enumerate(GEMINI_KEYS):
-            stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0})
+            stats = KEY_STATS.get(idx, {'ok': 0, '429': 0, 'err': 0, 'last_err': ''})
             cooldown_models = []
             for m in MODEL_HIERARCHY:
                 until = EXHAUSTED_QUOTAS.get(quota_id(m, k), 0)
@@ -847,18 +954,17 @@ def build_keys_status_view(ping_results=None):
                     cooldown_models.append(f"{m.replace('gemini-', '')} ({time_lbl})")
 
             if cooldown_models:
-                state_str = f"🛑 Выжат на: {', '.join(cooldown_models)}"
+                state_str = f"🛑 Пауза на: {', '.join(cooldown_models)}"
             else:
                 state_str = "🟢 Свободен (3.8 и ниже)"
 
-            ping_str = ""
-            if ping_results and idx in ping_results:
-                ping_str = f"\n   📡 Тест: {ping_results[idx]}"
+            err_note = f" ({stats['last_err']})" if stats.get('last_err') else ""
+            ping_str = f"\n   📡 Тест: {ping_results[idx]}" if (ping_results and idx in ping_results) else ""
 
             lines.append(
                 f"<b>Ключ #{idx + 1}</b> (<code>{mask_key(k)}</code>)\n"
                 f"   {state_str}\n"
-                f"   Запросов: ✅ {stats['ok']} | ⚠️ 429: {stats['429']} | ❌ Сбоев: {stats['err']}"
+                f"   Запросов: ✅ {stats['ok']} | ⚠️ 429: {stats['429']} | ❌ Сбоев: {stats['err']}{err_note}"
                 f"{ping_str}"
             )
 
@@ -871,17 +977,19 @@ def build_keys_status_view(ping_results=None):
     return "\n".join(lines), kb
 
 def ping_all_keys():
-    """Пингует каждый ключ и автоматически помечает выжатые ключи в базу, чтобы они не тормозили бота."""
+    """Пингует каждый ключ и автоматически блокирует невалидные/выжатые ключи."""
     results = {}
     test_model = ACTIVE_MODEL if not ACTIVE_MODEL.startswith('groq/') else MODEL_HIERARCHY[0]
     url = f"{GEMINI_API_BASE}/models/{test_model}:generateContent"
     payload = {"contents": [{"role": "user", "parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 2}}
 
+    s = get_http_session()
     changed = False
     for idx, api_key in enumerate(GEMINI_KEYS):
         q_key = quota_id(test_model, api_key)
+        stats = KEY_STATS.setdefault(idx, {'ok': 0, '429': 0, 'err': 0, 'last_err': ''})
         try:
-            r = session.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(5, 10))
+            r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 8))
             if r.status_code == 200:
                 results[idx] = f"🟢 Живой на {test_model}"
                 if q_key in EXHAUSTED_QUOTAS:
@@ -891,10 +999,20 @@ def ping_all_keys():
                 results[idx] = f"🔴 Выжат (429) на {test_model}"
                 EXHAUSTED_QUOTAS[q_key] = time.time() + 28800
                 changed = True
+            elif r.status_code in [400, 401, 403]:
+                results[idx] = f"🚫 Невалидный ключ (Код {r.status_code})"
+                stats['last_err'] = f"Код {r.status_code}"
+                for m in MODEL_HIERARCHY:
+                    EXHAUSTED_QUOTAS[quota_id(m, api_key)] = time.time() + 21600
+                changed = True
             else:
                 results[idx] = f"⚠️ Код {r.status_code}"
+                EXHAUSTED_QUOTAS[q_key] = time.time() + 300
+                changed = True
         except Exception:
-            results[idx] = "❌ Ошибка сети"
+            results[idx] = "❌ Таймаут сети"
+            EXHAUSTED_QUOTAS[q_key] = time.time() + 300
+            changed = True
     if changed:
         save_config()
     return results
@@ -927,7 +1045,7 @@ def handle_admin_document(message):
 
     loading_msg = bot.reply_to(message, "🕐 Читаю файл...")
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, None, "Читаю файл...")).start()
+    threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, None, "Читаю файл..."), daemon=True).start()
 
     media_item, extracted_text, doc_err = extract_document_content(message)
     if doc_err:
@@ -941,7 +1059,8 @@ def handle_admin_document(message):
     stop_event.set()
 
     if reply:
-        safe_edit_message(f"{reply}\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}", message.chat.id, loading_msg.message_id)
+        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, message.chat.id, loading_msg.message_id)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
 
@@ -975,7 +1094,7 @@ def handle_admin_text(message):
             "• <code>ключи</code> — статистика всех ключей, кулдауны и пинг-тест\n"
             "• <code>список</code> — кто в ЧС и у кого включено авто-ГС\n\n"
             "🧠 <b>Нейросеть и Настройки:</b>\n"
-            "• <code>гпт [запрос]</code> — вопрос ИИ (или Reply на файл/фото)\n"
+            "• <code>гпт [запрос]</code> — вопрос ИИ (длинные ответы шлет в несколько СМС)\n"
             "• <code>нарисуй [описание]</code> — генерация картинки\n"
             "• <code>модели</code> / <code>фото-модели</code> — выбор моделей\n"
             "• <code>характер [текст]</code> — задать свой промпт/статус для Gemini\n"
@@ -1152,7 +1271,7 @@ def handle_admin_text(message):
             return
         loading_msg = bot.reply_to(message, "🕐 Рисую...")
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую...")).start()
+        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую..."), daemon=True).start()
         img, err = generate_image(raw_text[8:].strip())
         stop_event.set()
         if img:
@@ -1194,11 +1313,12 @@ def handle_admin_text(message):
 
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event)).start()
+        threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event), daemon=True).start()
         reply, err, model_used, ctx_len = ask_ai(chat_id, prompt_text, media_list)
         stop_event.set()
         if reply:
-            safe_edit_message(f"{reply}\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}", message.chat.id, loading_msg.message_id)
+            footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+            send_long_response(reply, footer, message.chat.id, loading_msg.message_id)
         else:
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
@@ -1341,7 +1461,7 @@ def process_business_album(media_group_id):
     msg = bot.send_message(chat_id, f"🕐 Смотрю {len(messages)} фото...", business_connection_id=base_msg.business_connection_id)
     BOT_BUSINESS_MESSAGES.add(msg.message_id)
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, base_msg.business_connection_id, f"Смотрю {len(messages)} фото...")).start()
+    threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, base_msg.business_connection_id, f"Смотрю {len(messages)} фото..."), daemon=True).start()
 
     images = []
     for m in messages:
@@ -1353,7 +1473,8 @@ def process_business_album(media_group_id):
     stop_event.set()
 
     if reply:
-        safe_edit_message(f"{reply}\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}", chat_id, msg.message_id, base_msg.business_connection_id)
+        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, msg.message_id, base_msg.business_connection_id)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, base_msg.business_connection_id)
 
@@ -1441,7 +1562,7 @@ def handle_business_message(message):
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую...")).start()
+        threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую..."), daemon=True).start()
         img, err = generate_image(text[8:])
         stop_event.set()
         if img:
@@ -1509,13 +1630,14 @@ def handle_business_message(message):
     msg = bot.send_message(chat_id, f"🕐 {loading_label}", business_connection_id=message.business_connection_id)
     BOT_BUSINESS_MESSAGES.add(msg.message_id)
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, loading_label)).start()
+    threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, loading_label), daemon=True).start()
 
     reply, err, model_used, ctx_len = ask_ai(chat_id, text, media_list)
     stop_event.set()
 
     if reply:
-        safe_edit_message(f"{reply}\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}", chat_id, msg.message_id, message.business_connection_id)
+        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, msg.message_id, message.business_connection_id)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, message.business_connection_id)
 
@@ -1525,5 +1647,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Турбо-переключение активно.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Мульти-сообщения и защита от сбоев активны.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
