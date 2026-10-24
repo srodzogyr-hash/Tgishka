@@ -63,7 +63,9 @@ OLD_KEYBOARD_CLEARED = False
 TRAINING_MODE_ACTIVE = False  # Режим диалогового обучения в админке
 
 CONFIG = {
-    'auto_reply_enabled': True,
+    'auto_reply_enabled': False,      # Общий автоответчик (для всех)
+    'auto_reply_users': {},           # Индивидуальный автоответчик по @username
+    'auto_reply_chats': {},           # Индивидуальный автоответчик по chat_id
     'spy_enabled': True,
     'stealth_mode': False,            # Режим «Человек» (без плашек ИИ и без редактирования)
     'human_reply_chance': 100,        # Шанс ответа автоответчика в % (10..100)
@@ -103,6 +105,16 @@ def get_http_session():
     if not hasattr(thread_local, "session"):
         thread_local.session = requests.Session()
     return thread_local.session
+
+def is_auto_reply_active_for(chat_id, sender_uname):
+    """Проверяет, включен ли автоответчик глобально ИЛИ персонально для этого юзера/чата."""
+    if CONFIG.get('auto_reply_enabled', False):
+        return True
+    if sender_uname and sender_uname.lower() in CONFIG.get('auto_reply_users', {}):
+        return True
+    if str(chat_id) in CONFIG.get('auto_reply_chats', {}):
+        return True
+    return False
 
 # --- АВТО-ПРОВЕРКА ДОСТУПНЫХ МОДЕЛЕЙ ПРИ СТАРТЕ ---
 def sync_available_models_on_startup():
@@ -144,7 +156,7 @@ def init_firebase():
             CONFIG.update(data)
             if CONFIG.get('creator_id'):
                 CREATOR_ID = int(CONFIG['creator_id'])
-            for dict_key in ('voice_auto_users', 'blacklist', 'known_chats'):
+            for dict_key in ('voice_auto_users', 'blacklist', 'known_chats', 'auto_reply_users', 'auto_reply_chats'):
                 if not isinstance(CONFIG.get(dict_key), dict):
                     CONFIG[dict_key] = {}
             print("🔥 Настройки и обученный профиль загружены из Firebase.")
@@ -424,7 +436,7 @@ def mask_key(key_str):
         return "***"
     return f"{key_str[:6]}...{key_str[-4:]}"
 
-# --- ПОЛНЫЙ ТЕКСТ ВСЕХ КОМАНД (СТАРЫХ И НОВЫХ) ---
+# --- ПОЛНЫЙ ТЕКСТ ВСЕХ КОМАНД ---
 def get_full_commands_text():
     return (
         "📜 <b>Полный список всех команд бота:</b>\n\n"
@@ -440,14 +452,15 @@ def get_full_commands_text():
         "• <code>характер [текст]</code> — задать кастомный промпт/роль для Gemini\n"
         "• <code>характер сброс</code> — вернуть стандартный характер\n"
         "• <code>ключи</code> — статус всех ключей, их паузы и пинг-тест\n"
-        "• <code>список</code> — посмотреть ЧС, список авто-ГС, промпт и будильники\n\n"
-        "🔹 <b>2. Автоответчик, Шпион и Доступ:</b>\n"
-        "• <code>автоответчик вкл</code> / <code>автоответчик выкл</code> — переключить автоответчик\n"
+        "• <code>список</code> — посмотреть все списки (у кого включен автоответчик, авто-ГС, ЧС)\n\n"
+        "🔹 <b>2. Автоответчик (для отдельных юзеров и общий):</b>\n"
+        "• <code>автоответчик @юзер</code> (или <code>ао @юзер</code>) — вкл/выкл автоответчик для конкретного человека\n"
+        "• <code>ао вкл</code> / <code>ао выкл</code> — (прямо в чате с человеком) скрытно вкл/выкл автоответчик для этого чата\n"
+        "• <code>автоответчик вкл</code> / <code>автоответчик выкл</code> — глобальный автоответчик для всех\n"
         "• <code>таймер 5</code> — через сколько минут молчания включается автоответчик\n"
         "• <code>кд 3</code> — задержка анти-спама между запросами в секундах (0 = без КД)\n"
         "• <code>шпион вкл</code> / <code>шпион выкл</code> — перехват удаленных и измененных СМС\n"
-        "• <code>запретить @юзер</code> — добавить человека в ЧС бота\n"
-        "• <code>разрешить @юзер</code> — убрать человека из ЧС\n\n"
+        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота\n\n"
         "🔹 <b>3. Голосовые и Кружки (рс + живой ответ):</b>\n"
         "• Ответь <code>рс</code> на ГС/кружок — чистая текстовая расшифровка без воды\n"
         "• Ответь <code>рс [вопрос/задача]</code> — например: <code>рс перескажи кратко</code>\n"
@@ -1309,7 +1322,7 @@ def get_current_working_model():
     return models[0] if models else ACTIVE_MODEL
 
 def build_panel_view():
-    auto_on = CONFIG.get('auto_reply_enabled', True)
+    auto_on = CONFIG.get('auto_reply_enabled', False)
     spy_on = CONFIG.get('spy_enabled', True)
     stealth_on = CONFIG.get('stealth_mode', False)
     voice_all_on = CONFIG.get('voice_auto_all', False)
@@ -1317,7 +1330,12 @@ def build_panel_view():
     chance = CONFIG.get('human_reply_chance', 100)
     learned = (CONFIG.get('learned_persona') or '').strip()
 
-    auto_status = f"🟢 ВКЛ ({CONFIG.get('afk_minutes', 10)} мин, шанс {chance}%)" if auto_on else "🔴 ВЫКЛ"
+    ar_users = list(CONFIG.get('auto_reply_users', {}).keys())
+    ar_chats = list(CONFIG.get('auto_reply_chats', {}).values())
+    ar_targets = [f"@{u}" for u in ar_users] + [str(c) for c in ar_chats if str(c) not in ar_users]
+    ar_users_str = ", ".join(ar_targets) if ar_targets else "нет"
+
+    auto_status = f"🟢 ВКЛ для всех ({CONFIG.get('afk_minutes', 10)} мин, {chance}%)" if auto_on else f"⚪ Точечно ({CONFIG.get('afk_minutes', 10)} мин, {chance}%)"
     spy_status = "🟢 ВКЛ" if spy_on else "🔴 ВЫКЛ"
     stealth_status = "🥷 ВКЛ (без палева ИИ)" if stealth_on else "⚪ ВЫКЛ (обычный вид)"
     tw_status = f"🍿 Каждые {tw_interval} сообщ." if tw_interval > 0 else "🔴 ВЫКЛ"
@@ -1333,7 +1351,8 @@ def build_panel_view():
 
     text = (
         f"👑 <b>Панель управления аккаунтом</b>\n\n"
-        f"🤖 <b>Автоответчик:</b> {auto_status}\n"
+        f"🤖 <b>Автоответчик (общий):</b> {auto_status}\n"
+        f"🎯 <b>Автоответчик (юзеры):</b> <code>{ar_users_str}</code>\n"
         f"🥷 <b>Режим Человека (Стелс):</b> {stealth_status}\n"
         f"🍿 <b>Третий собеседник (5 коп.):</b> {tw_status}\n"
         f"🎓 <b>Обученный стиль:</b> {'✅ Настроен' if learned else '⚪ Не задан'}\n"
@@ -1345,12 +1364,12 @@ def build_panel_view():
         f"🧠 <b>Базовая модель:</b> <code>{ACTIVE_MODEL}</code> (сейчас: <code>{real_now_model}</code>)\n"
         f"🎨 <b>Фото-модель:</b> <code>{CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)}</code>\n"
         f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в паузе: {active_cooldowns})\n"
-        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (чатов: {len(CHAT_MEMORY)})"
+        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ."
     )
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton(f"🤖 Автоответ: {'ВКЛ 🟢' if auto_on else 'ВЫКЛ 🔴'}", callback_data="panel_toggle_auto"),
+        InlineKeyboardButton(f"🤖 Автоответ (все): {'ВКЛ 🟢' if auto_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_auto"),
         InlineKeyboardButton(f"🥷 Стелс: {'ВКЛ 🥷' if stealth_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_stealth")
     )
     kb.add(
@@ -1508,7 +1527,6 @@ def handle_admin_text(message):
 
     remove_old_reply_keyboard(chat_id)
 
-    # 1. ВСЕ КОМАНДЫ АДМИНКИ СРАБАТЫВАЮТ ПЕРВЫМИ (даже если включен режим обучения!)
     if text in ['стоп', 'выйти', 'конец обучения', '/stop']:
         if TRAINING_MODE_ACTIVE:
             TRAINING_MODE_ACTIVE = False
@@ -1546,6 +1564,11 @@ def handle_admin_text(message):
         return
 
     if text == 'список':
+        ar_users = list(CONFIG.get('auto_reply_users', {}).keys())
+        ar_chats = list(CONFIG.get('auto_reply_chats', {}).values())
+        ar_list = [f"@{u}" for u in ar_users] + [str(c) for c in ar_chats if str(c) not in ar_users]
+        ar_str = ", ".join(ar_list) if ar_list else "пусто"
+
         v_users = list(CONFIG.get('voice_auto_users', {}).keys())
         b_users = list(CONFIG.get('blacklist', {}).keys())
         v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
@@ -1555,6 +1578,7 @@ def handle_admin_text(message):
         bot.reply_to(
             message,
             f"📋 <b>Текущие списки и обучение:</b>\n\n"
+            f"🎯 <b>Автоответчик (отдельные юзеры):</b> {ar_str}\n"
             f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
             f"🚫 <b>Черный список:</b> {b_str}\n"
             f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
@@ -1679,11 +1703,63 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🕵️‍♂️ Режим Шпиона: {'🟢 ВКЛ' if CONFIG['spy_enabled'] else '🔴 ВЫКЛ'}")
         return
 
-    if text.startswith('автоответчик'):
-        CONFIG['auto_reply_enabled'] = ('вкл' in text)
-        save_config()
-        bot.reply_to(message, f"✅ Автоответчик: {'🟢 ВКЛ' if CONFIG['auto_reply_enabled'] else '🔴 ВЫКЛ'}")
-        return
+    # УПРАВЛЕНИЕ АВТООТВЕТЧИКОМ: ДЛЯ ОТДЕЛЬНЫХ ЮЗЕРОВ (@username) И ДЛЯ ВСЕХ
+    if text.startswith('автоответчик') or text.startswith('ао '):
+        if '@' in text:
+            uname = text.split('@')[-1].split()[0].strip().lower()
+            if uname:
+                ar_users = CONFIG.setdefault('auto_reply_users', {})
+                if 'выкл' in text:
+                    ar_users.pop(uname, None)
+                    state_lbl = "🔴 ВЫКЛ"
+                elif 'вкл' in text:
+                    ar_users[uname] = True
+                    state_lbl = "🟢 ВКЛ"
+                else:
+                    if uname in ar_users:
+                        del ar_users[uname]
+                        state_lbl = "🔴 ВЫКЛ"
+                    else:
+                        ar_users[uname] = True
+                        state_lbl = "🟢 ВКЛ"
+                save_config()
+                bot.reply_to(message, f"🎯 Персональный автоответчик для <b>@{uname}</b>: <b>{state_lbl}</b>")
+                return
+
+        if text in ['автоответчик сброс', 'ао сброс', 'автоответчик очистить']:
+            CONFIG['auto_reply_users'] = {}
+            CONFIG['auto_reply_chats'] = {}
+            save_config()
+            bot.reply_to(message, "🧹 Список отдельных пользователей автоответчика очищен.")
+            return
+
+        if 'выкл' in text:
+            CONFIG['auto_reply_enabled'] = False
+            save_config()
+            ar_cnt = len(CONFIG.get('auto_reply_users', {})) + len(CONFIG.get('auto_reply_chats', {}))
+            extra_note = f" (но продолжает работать для {ar_cnt} выбранных чатов/юзеров)" if ar_cnt else ""
+            bot.reply_to(message, f"✅ Общий автоответчик для всех: <b>🔴 ВЫКЛ</b>{extra_note}")
+            return
+        elif 'вкл' in text:
+            CONFIG['auto_reply_enabled'] = True
+            save_config()
+            bot.reply_to(message, "✅ Общий автоответчик для всех чатов: <b>🟢 ВКЛ</b>")
+            return
+
+        # Если написали просто "автоответчик @ник" без знака @ (например: "ао ivan_123")
+        parts = text.split()
+        if len(parts) == 2 and parts[1] not in ['вкл', 'выкл', 'все', 'сброс']:
+            uname = parts[1].replace('@', '').strip().lower()
+            ar_users = CONFIG.setdefault('auto_reply_users', {})
+            if uname in ar_users:
+                del ar_users[uname]
+                state_lbl = "🔴 ВЫКЛ"
+            else:
+                ar_users[uname] = True
+                state_lbl = "🟢 ВКЛ"
+            save_config()
+            bot.reply_to(message, f"🎯 Персональный автоответчик для <b>@{uname}</b>: <b>{state_lbl}</b>")
+            return
 
     if text in ['рс все вкл', 'авто гс вкл']:
         CONFIG['voice_auto_all'] = True
@@ -1813,7 +1889,6 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
-    # 2. ЕСЛИ ЭТО НЕ КОМАНДА, И ВКЛЮЧЕН РЕЖИМ ОБУЧЕНИЯ — ОБУЧАЕМ БОТА
     if TRAINING_MODE_ACTIVE:
         loading_msg = bot.reply_to(message, "🎓 Обновляю навыки...")
         result_html = process_training_dialogue(chat_id, raw_text)
@@ -1832,11 +1907,11 @@ def handle_callbacks(call):
     msg_id = call.message.message_id
 
     if data == 'panel_toggle_auto':
-        CONFIG['auto_reply_enabled'] = not CONFIG.get('auto_reply_enabled', True)
+        CONFIG['auto_reply_enabled'] = not CONFIG.get('auto_reply_enabled', False)
         save_config()
         text, kb = build_panel_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, f"Автоответчик: {'ВКЛ' if CONFIG['auto_reply_enabled'] else 'ВЫКЛ'}")
+        bot.answer_callback_query(call.id, f"Автоответчик (для всех): {'ВКЛ' if CONFIG['auto_reply_enabled'] else 'ВЫКЛ'}")
 
     elif data == 'panel_toggle_stealth':
         CONFIG['stealth_mode'] = not CONFIG.get('stealth_mode', False)
@@ -1927,6 +2002,11 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_show_lists':
+        ar_users = list(CONFIG.get('auto_reply_users', {}).keys())
+        ar_chats = list(CONFIG.get('auto_reply_chats', {}).values())
+        ar_list = [f"@{u}" for u in ar_users] + [str(c) for c in ar_chats if str(c) not in ar_users]
+        ar_str = ", ".join(ar_list) if ar_list else "пусто"
+
         v_users = list(CONFIG.get('voice_auto_users', {}).keys())
         b_users = list(CONFIG.get('blacklist', {}).keys())
         v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
@@ -1937,6 +2017,7 @@ def handle_callbacks(call):
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
         safe_edit_message(
             f"📋 <b>Текущие списки и обучение:</b>\n\n"
+            f"🎯 <b>Автоответчик (юзеры):</b> {ar_str}\n"
             f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
             f"🚫 <b>Черный список:</b> {b_str}\n"
             f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
@@ -1984,9 +2065,10 @@ def process_business_album(media_group_id):
 
     base_msg = messages[0]
     chat_id = base_msg.chat.id
+    sender_uname = (base_msg.from_user.username or '').lower()
 
-    is_owner = (base_msg.from_user.id == CREATOR_ID) or ((base_msg.from_user.username or '').lower() == CREATOR_USERNAME)
-    if not is_owner and (base_msg.from_user.username or '').lower() in CONFIG.get('blacklist', {}):
+    is_owner = (base_msg.from_user.id == CREATOR_ID) or (sender_uname == CREATOR_USERNAME)
+    if not is_owner and sender_uname in CONFIG.get('blacklist', {}):
         return
 
     text = ""
@@ -2006,7 +2088,7 @@ def process_business_album(media_group_id):
     trigger = False
     if is_gpt or is_reply_to_bot:
         trigger = True
-    elif not is_owner and CONFIG['auto_reply_enabled']:
+    elif not is_owner and is_auto_reply_active_for(chat_id, sender_uname):
         if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
             trigger = True
 
@@ -2083,6 +2165,32 @@ def handle_business_message(message):
         save_chat_memory_async(chat_id, [])
         msg = bot.send_message(chat_id, f"Память очищена.\ncontext: 0/{CONFIG.get('context_limit', 100)}", business_connection_id=message.business_connection_id)
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        return
+
+    # Быстрое скрытое включение/выключение автоответчика прямо внутри чата с собеседником: "ао вкл" / "ао выкл"
+    if is_owner and lower_text in ['ао вкл', 'ао выкл', 'автоответчик вкл', 'автоответчик выкл']:
+        try:
+            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
+        except Exception:
+            pass
+        ar_chats = CONFIG.setdefault('auto_reply_chats', {})
+        chat_label = f"@{ message.chat.username }" if getattr(message.chat, 'username', None) else (getattr(message.chat, 'first_name', None) or f"id:{chat_id}")
+        if 'вкл' in lower_text:
+            ar_chats[str(chat_id)] = chat_label
+            if getattr(message.chat, 'username', None):
+                CONFIG.setdefault('auto_reply_users', {})[message.chat.username.lower()] = True
+            state_lbl = "🟢 ВКЛ"
+        else:
+            ar_chats.pop(str(chat_id), None)
+            if getattr(message.chat, 'username', None):
+                CONFIG.get('auto_reply_users', {}).pop(message.chat.username.lower(), None)
+            state_lbl = "🔴 ВЫКЛ"
+        save_config()
+        if CREATOR_ID:
+            try:
+                bot.send_message(CREATOR_ID, f"🎯 Автоответчик для чата <b>{html.escape(chat_label)}</b>: <b>{state_lbl}</b>")
+            except Exception:
+                pass
         return
 
     if is_owner and lower_text.startswith('будильник '):
@@ -2168,8 +2276,9 @@ def handle_business_message(message):
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
     explicit_call = is_gpt or is_draw or is_reply_to_bot
 
+    # Проверяем автоответчик (общий ИЛИ индивидуальный для этого пользователя/чата)
     if not explicit_call:
-        if not is_owner and message.content_type in ['text', 'document', 'photo'] and CONFIG.get('auto_reply_enabled', True):
+        if not is_owner and message.content_type in ['text', 'document', 'photo'] and is_auto_reply_active_for(chat_id, sender_uname):
             if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
                 if message.content_type == 'text':
                     trigger_buffered_auto_reply(chat_id, message)
@@ -2295,5 +2404,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Полный пакет команд активен.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Точечный автоответчик по юзерам активен.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
