@@ -51,9 +51,16 @@ MODEL_HIERARCHY = [
     'gemini-3-flash',
     'gemini-3.1-pro'
 ]
+# Каскад лучших бесплатных моделей Groq для быстрого автоответчика
+GROQ_AUTOREPLY_FALLBACKS = [
+    'groq/openai/gpt-oss-120b',
+    'groq/qwen/qwen3.8-27b',
+    'groq/openai/gpt-oss-20b'
+]
+
 DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
 DEFAULT_CONTEXT_LIMIT = 100
-DEFAULT_SYSTEM_PROMPT = "Ты — умный, живой и остроумный собеседник. Отвечай четко, естественно и на русском языке."
+DEFAULT_SYSTEM_PROMPT = "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."
 
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 GROQ_API_BASE = 'https://api.groq.com/openai/v1'
@@ -63,17 +70,18 @@ OLD_KEYBOARD_CLEARED = False
 TRAINING_MODE_ACTIVE = False  # Режим диалогового обучения в админке
 
 CONFIG = {
-    'auto_reply_enabled': False,      # Общий автоответчик (для всех)
-    'auto_reply_users': {},           # Индивидуальный автоответчик по @username
-    'auto_reply_chats': {},           # Индивидуальный автоответчик по chat_id
+    'auto_reply_enabled': False,                     # Общий автоответчик (для всех)
+    'auto_reply_users': {},                          # Индивидуальный автоответчик по @username
+    'auto_reply_chats': {},                          # Индивидуальный автоответчик по chat_id
+    'auto_reply_model': 'groq/openai/gpt-oss-120b',  # Отдельная быстрая модель для Автоответчика!
     'spy_enabled': True,
-    'stealth_mode': False,            # Режим «Человек» (без плашек ИИ и без редактирования)
-    'human_reply_chance': 100,        # Шанс ответа автоответчика в % (10..100)
-    'third_wheel_interval': 0,        # Через сколько сообщений вставлять «5 копеек» (0 = выкл)
-    'learned_persona': '',            # Правила стиля, выученные в режиме обучения
+    'stealth_mode': True,                            # Работает ТОЛЬКО для автоответчика!
+    'human_reply_chance': 100,                       # Шанс ответа автоответчика в % (10..100)
+    'third_wheel_interval': 0,                       # Через сколько сообщений вставлять «5 копеек» (0 = выкл)
+    'learned_persona': '',                           # Правила стиля ТОЛЬКО для автоответчика
     'voice_auto_all': False,
     'voice_auto_users': {},
-    'known_chats': {},                # {username: {'chat_id': id, 'biz_id': biz_id, 'name': name}}
+    'known_chats': {},
     'creator_id': None,
     'context_limit': DEFAULT_CONTEXT_LIMIT,
     'afk_minutes': 10,
@@ -91,7 +99,9 @@ CHAT_MSG_COUNTER = {}
 PENDING_AUTO_REPLY = {}
 ACTIVE_ALARMS = []
 
-BOT_BUSINESS_MESSAGES = set()
+# Раздельные множества сообщений бота: обычные ответы ГПТ vs сообщения Автоответчика
+BOT_GPT_MESSAGES = set()
+BOT_AUTOREPLY_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
 
 MESSAGE_CACHE = {}
@@ -138,7 +148,7 @@ def sync_available_models_on_startup():
                     MODEL_HIERARCHY = valid_hierarchy
                     if ACTIVE_MODEL not in MODEL_HIERARCHY and not ACTIVE_MODEL.startswith('groq/'):
                         ACTIVE_MODEL = MODEL_HIERARCHY[0]
-                    print(f"✅ Проверенная очередь моделей: {MODEL_HIERARCHY}")
+                    print(f"✅ Проверенная очередь моделей ГПТ: {MODEL_HIERARCHY}")
     except Exception as e:
         print(f"⚠️ Не удалось сверить список моделей при старте: {e}")
 
@@ -156,10 +166,12 @@ def init_firebase():
             CONFIG.update(data)
             if CONFIG.get('creator_id'):
                 CREATOR_ID = int(CONFIG['creator_id'])
+            if not CONFIG.get('auto_reply_model'):
+                CONFIG['auto_reply_model'] = 'groq/openai/gpt-oss-120b'
             for dict_key in ('voice_auto_users', 'blacklist', 'known_chats', 'auto_reply_users', 'auto_reply_chats'):
                 if not isinstance(CONFIG.get(dict_key), dict):
                     CONFIG[dict_key] = {}
-            print("🔥 Настройки и обученный профиль загружены из Firebase.")
+            print("🔥 Настройки загружены из Firebase.")
     except Exception as e:
         print(f"⚠️ Ошибка загрузки настроек Firebase: {e}")
 
@@ -189,16 +201,30 @@ def save_config():
 def save_chat_memory_async(chat_id, history):
     if not FIREBASE_URL:
         return
+    chat_id = int(chat_id)
     def _worker():
         try:
-            get_http_session().put(f'{FIREBASE_URL}/chat_memory/{chat_id}.json', json=history, timeout=5)
+            if not history:
+                get_http_session().delete(f'{FIREBASE_URL}/chat_memory/{chat_id}.json', timeout=5)
+            else:
+                get_http_session().put(f'{FIREBASE_URL}/chat_memory/{chat_id}.json', json=history, timeout=5)
         except Exception:
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
+def reset_single_chat_memory(chat_id):
+    """Полностью очищает память и лог конкретного чата (общую для владельца и собеседника)."""
+    cid = int(chat_id)
+    CHAT_MEMORY[cid] = []
+    CHAT_LOG[cid] = []
+    CHAT_MSG_COUNTER[cid] = 0
+    save_chat_memory_async(cid, [])
+
 def clear_all_memory_firebase():
+    """Полностью очищает память всех чатов в ОЗУ и в Firebase."""
     CHAT_MEMORY.clear()
     CHAT_LOG.clear()
+    CHAT_MSG_COUNTER.clear()
     if not FIREBASE_URL:
         return
     def _worker():
@@ -243,18 +269,20 @@ def check_cooldown(chat_id):
     LAST_REQUEST_TIME[chat_id] = now
     return True
 
-# --- УЧЕТ РОЛЕЙ И ИСТОРИИ ЖИВОГО ЧАТА ---
+# --- УЧЕТ РОЛЕЙ И ОБЩЕГО КОНТЕКСТА ЧАТА ---
 def get_speaker_tag(user, is_owner):
-    """Формирует понятную для ИИ метку, кто именно пишет сообщение."""
     if is_owner:
         return f"[Владелец аккаунта @{CREATOR_USERNAME}]"
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "Собеседник"
     uname = f"@{user.username}" if user.username else f"id:{user.id}"
     return f"[Собеседник {full_name} ({uname})]"
 
-def record_chat_log(message, is_owner, custom_text=None):
-    """Записывает каждое сообщение чата в буфер последних 60 реплик с указанием автора."""
-    chat_id = message.chat.id
+def record_chat_log(message, is_owner, custom_text=None, add_to_memory=True):
+    """
+    Записывает сообщение в лог чата (CHAT_LOG) для '5 копеек'/'рассуди'.
+    В CHAT_MEMORY записывает только если это обычная реплика (не команда 'гпт', т.к. 'гпт' сам сохраняет вопрос-ответ).
+    """
+    chat_id = int(message.chat.id)
     user = message.from_user
     if not user:
         return
@@ -292,41 +320,55 @@ def record_chat_log(message, is_owner, custom_text=None):
     if len(log_list) > 60:
         CHAT_LOG[chat_id] = log_list[-60:]
 
-    mem_list = CHAT_MEMORY.setdefault(chat_id, [])
-    mem_list.append({"role": "user", "content": f"{speaker}: {text}"})
-    limit = CONFIG.get('context_limit', 100)
-    if len(mem_list) > limit:
-        CHAT_MEMORY[chat_id] = mem_list[-limit:]
+    if add_to_memory:
+        mem_list = CHAT_MEMORY.setdefault(chat_id, [])
+        mem_list.append({"role": "user", "content": f"{speaker}: {text}"})
+        limit = CONFIG.get('context_limit', 100)
+        if len(mem_list) > limit:
+            CHAT_MEMORY[chat_id] = mem_list[-limit:]
 
-def build_full_system_instruction(human_imitation=False):
-    """Собирает системную инструкцию с пониманием Telegram, ролей собеседников и обученного стиля."""
+def build_gpt_system_instruction():
+    """
+    Чистая системная инструкция ТОЛЬКО для обычного вызова 'гпт'.
+    Обучение автоответчика и стелс-режим сюда НЕ попадают!
+    """
     base = CONFIG.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
-    learned = (CONFIG.get('learned_persona') or '').strip()
-
     tg_context = (
-        "ВАЖНЫЙ КОНТЕКСТ СРЕДЫ:\n"
-        f"1. Ты находишься внутри мессенджера Telegram и подключен через Telegram Business к личному аккаунту владельца @{CREATOR_USERNAME}.\n"
-        f"2. В истории чата перед каждым сообщением указана роль автора:\n"
-        f"   • `[Владелец аккаунта @{CREATOR_USERNAME}]` — это хозяин аккаунта (твой создатель и босс).\n"
-        f"   • `[Собеседник Имя (@юзернейм)]` — это другой человек, с которым переписывается владелец.\n"
-        "3. Всегда четко различай, кто именно к тебе обращается в текущем сообщении, и никогда не путай владельца и собеседника.\n"
-        "4. Никогда не пиши в начале своего ответа метки вроде `[Бот]:` или `[Ответ]:` — пиши сразу чистый текст ответа."
+        "КОНТЕКСТ СРЕДЫ:\n"
+        f"1. Ты находишься в мессенджере Telegram (аккаунт владельца @{CREATOR_USERNAME}).\n"
+        f"2. В истории чата перед сообщениями указано, кто пишет: `[Владелец аккаунта @{CREATOR_USERNAME}]` или `[Собеседник Имя (@юзернейм)]`.\n"
+        "3. Четко различай, кто именно задает тебе вопрос. Пиши сразу чистый ответ без меток `[Бот]:` в начале."
     )
+    return f"{base}\n\n{tg_context}"
 
-    parts = [base, tg_context]
+def build_autoreply_system_instruction():
+    """
+    Системная инструкция ТОЛЬКО для Автоответчика (включает выученный стиль learned_persona и режим человека).
+    """
+    learned = (CONFIG.get('learned_persona') or '').strip()
+    stealth = CONFIG.get('stealth_mode', True)
+
+    parts = [
+        f"Ты — автоответчик и живой собеседник в личных сообщениях Telegram на аккаунте владельца @{CREATOR_USERNAME}.",
+        "В истории чата видно, где писал `[Владелец аккаунта]`, а где `[Собеседник ...]`. Сейчас ты отвечаешь собеседнику от лица аккаунта владельца (или как его представитель, согласно правилам ниже).",
+        "Никогда не пиши в начале ответа технические метки вроде `[Ответ]:` или `[Владелец]:` — выводи только сам текст сообщения."
+    ]
 
     if learned:
         parts.append(
-            f"ОБУЧЕННЫЙ СТИЛЬ И ПРАВИЛА ПОВЕДЕНИЯ (СТРОГО СОБЛЮДАЙ ЭТИ УКАЗАНИЯ ВЛАДЕЛЬЦА):\n{learned}"
+            f"ГЛАВНЫЕ ПРАВИЛА СТИЛЯ И ПОВЕДЕНИЯ (СТРОГО ИХ ВЫПОЛНЯЙ):\n{learned}"
+        )
+    else:
+        parts.append(
+            "Общайся живо, естественно, как реальный человек в Телеграме, на русском языке."
         )
 
-    if human_imitation or CONFIG.get('stealth_mode', False):
+    if stealth:
         parts.append(
-            "РЕЖИМ ИМИТАЦИИ ЧЕЛОВЕКА (СТЕЛС):\n"
-            "• Веди себя максимально как живой человек в переписке Telegram.\n"
-            "• Ни при каких обстоятельствах не признавайся, что ты ИИ, бот или нейросеть.\n"
-            "• Не используй канцелярит, длинные нумерованные списки и шаблонные фразы ИИ («Чем могу помочь?», «Конечно!»).\n"
-            "• Пиши живо, естественно и соразмерно длине сообщений собеседника."
+            "ВАЖНО (РЕЖИМ ЧЕЛОВЕКА):\n"
+            "• Максимально имитируй живого человека в переписке.\n"
+            "• Никогда не признавайся, что ты ИИ, бот или автоответчик.\n"
+            "• Не используй шаблонные фразы ИИ и канцелярит."
         )
 
     return "\n\n".join(parts)
@@ -373,11 +415,14 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
         except Exception:
             pass
 
-def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None):
-    reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
+def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False):
+    reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*|Собеседник[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
+    # Убираем блоки <think>...</think>, если рассуждающая модель Groq решила их вывести
+    reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
     total = len(raw_chunks)
+    target_set = BOT_AUTOREPLY_MESSAGES if is_autoreply else BOT_GPT_MESSAGES
 
     for idx, chunk in enumerate(raw_chunks):
         formatted_chunk = format_markdown_to_html(chunk)
@@ -392,6 +437,8 @@ def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, bu
             plain_chunk = f"(Часть {idx + 1}/{total})\n\n" + plain_chunk
 
         if idx == 0 and loading_msg_id is not None:
+            if business_id:
+                target_set.add(loading_msg_id)
             try:
                 bot.edit_message_text(formatted_chunk, chat_id, loading_msg_id, business_connection_id=business_id)
             except Exception:
@@ -410,7 +457,7 @@ def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, bu
                     reply_to_message_id=reply_to_msg_id if idx == 0 else None
                 )
                 if business_id and sent:
-                    BOT_BUSINESS_MESSAGES.add(sent.message_id)
+                    target_set.add(sent.message_id)
             except Exception:
                 try:
                     sent = bot.send_message(
@@ -421,7 +468,7 @@ def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, bu
                         reply_to_message_id=reply_to_msg_id if idx == 0 else None
                     )
                     if business_id and sent:
-                        BOT_BUSINESS_MESSAGES.add(sent.message_id)
+                        target_set.add(sent.message_id)
                 except Exception:
                     pass
 
@@ -440,44 +487,41 @@ def mask_key(key_str):
 def get_full_commands_text():
     return (
         "📜 <b>Полный список всех команд бота:</b>\n\n"
-        "🔹 <b>1. Классические команды (Нейросеть и Модели):</b>\n"
+        "🔹 <b>1. Обычный ГПТ и Модели (ВСЕГДА показывает context и model):</b>\n"
         "• <code>/panel</code> (или <code>панель</code>) — главный пульт с кнопками\n"
-        "• <code>модели</code> — выбрать текстовую модель (Gemini / Groq)\n"
+        "• <code>модели</code> — выбрать модель для обычного <code>гпт</code>\n"
+        "• <code>авто-модели</code> — выбрать модель отдельно для Автоответчика (Groq / Gemini)\n"
         "• <code>фото-модели</code> — выбрать модель для рисования\n"
         "• <code>гпт [текст]</code> — задать вопрос ИИ (или Reply на фото/файл/ГС)\n"
         "• <code>нарисуй [описание]</code> — сгенерировать картинку\n"
         "• <code>контекст 100</code> — изменить глубину памяти диалога\n"
-        "• <code>сброс</code> (или <code>гпт сброс</code>) — очистить память текущего чата\n"
+        "• <code>сброс</code> — очистить общий контекст чата (у тебя и у собеседника!)\n"
         "• <code>сброс все</code> — очистить память вообще всех чатов\n"
-        "• <code>характер [текст]</code> — задать кастомный промпт/роль для Gemini\n"
-        "• <code>характер сброс</code> — вернуть стандартный характер\n"
-        "• <code>ключи</code> — статус всех ключей, их паузы и пинг-тест\n"
-        "• <code>список</code> — посмотреть все списки (у кого включен автоответчик, авто-ГС, ЧС)\n\n"
-        "🔹 <b>2. Автоответчик (для отдельных юзеров и общий):</b>\n"
+        "• <code>характер [текст]</code> — задать системный промпт для обычного <code>гпт</code>\n"
+        "• <code>характер сброс</code> — вернуть стандартный промпт для <code>гпт</code>\n"
+        "• <code>ключи</code> — статус всех ключей Gemini и пинг-тест\n"
+        "• <code>список</code> — посмотреть все списки и настройки\n\n"
+        "🔹 <b>2. Автоответчик (Работает отдельно на Groq + Обучение + Стелс):</b>\n"
         "• <code>автоответчик @юзер</code> (или <code>ао @юзер</code>) — вкл/выкл автоответчик для конкретного человека\n"
         "• <code>ао вкл</code> / <code>ао выкл</code> — (прямо в чате с человеком) скрытно вкл/выкл автоответчик для этого чата\n"
-        "• <code>автоответчик вкл</code> / <code>автоответчик выкл</code> — глобальный автоответчик для всех\n"
-        "• <code>таймер 5</code> — через сколько минут молчания включается автоответчик\n"
-        "• <code>кд 3</code> — задержка анти-спама между запросами в секундах (0 = без КД)\n"
-        "• <code>шпион вкл</code> / <code>шпион выкл</code> — перехват удаленных и измененных СМС\n"
-        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота\n\n"
+        "• <code>автоответчик вкл</code> / <code>выкл</code> — глобальный автоответчик для всех\n"
+        "• <code>обучение</code> — диалоговое обучение ТОЛЬКО для автоответчика (выход: <code>стоп</code>)\n"
+        "• <code>обучение сброс</code> — стереть выученные правила автоответчика\n"
+        "• <code>стелс вкл</code> / <code>выкл</code> — скрывать model/context и часики в режиме автоответчика\n"
+        "• <code>таймер 5</code> — через сколько минут молчания отвечает автоответчик\n"
+        "• <code>шанс 75</code> — вероятность ответа автоответчика в % (от 10 до 100)\n\n"
         "🔹 <b>3. Голосовые и Кружки (рс + живой ответ):</b>\n"
         "• Ответь <code>рс</code> на ГС/кружок — чистая текстовая расшифровка без воды\n"
-        "• Ответь <code>рс [вопрос/задача]</code> — например: <code>рс перескажи кратко</code>\n"
-        "• <code>рс @юзер</code> — вкл/выкл постоянную авто-расшифровку для этого юзера\n"
-        "• <code>рс все вкл</code> / <code>рс все выкл</code> — авто-расшифровка для всех чатов\n"
-        "• <i>Фишка: если ответить на сообщение бота голосовым — он сам расшифрует его и ответит в диалоге!</i>\n\n"
-        "🔹 <b>4. Обучение, Стелс (Человек), Третий собеседник и Будильник:</b>\n"
-        "• <code>обучение</code> — войти в режим диалогового обучения автоответчика (выход: <code>стоп</code>)\n"
-        "• <code>обучение сброс</code> — стереть выученные правила\n"
-        "• <code>стелс вкл</code> / <code>стелс выкл</code> — режим Человека (убирает подпись model/context, часики и пометку «изменено»)\n"
-        "• <code>шанс 75</code> — вероятность ответа автоответчика в % (от 10 до 100)\n"
-        "• <code>вставка 25</code> (или <code>вставка выкл</code>) — раз в N сообщений бот сам вставляет свои «5 копеек» в чат\n"
-        "• <code>рассуди</code> (или <code>кто прав</code>) — прочитать последние 50 СМС чата и рассудить спор\n"
-        "• <code>5 копеек</code> — вставить комментарий по последним сообщениям чата\n"
-        "• <code>анализ</code> — сделать разбор последних 50 сообщений переписки\n"
-        "• <code>будильник 30 [задача]</code> — (в чате или админке) через 30 мин бот сам напишет сообщение\n"
-        "• <code>будильник @юзер 60 [задача]</code> — завести будильник для конкретного юзера из админки"
+        "• Ответь <code>рс [задача]</code> — например: <code>рс перескажи кратко</code>\n"
+        "• <code>рс @юзер</code> / <code>рс все вкл</code> — постоянная авто-расшифровка\n"
+        "• <i>Если ответить на сообщение бота голосовым — он сам расшифрует его и ответит!</i>\n\n"
+        "🔹 <b>4. Третий собеседник, Будильник и Шпион:</b>\n"
+        "• <code>вставка 25</code> (или <code>вставка выкл</code>) — раз в N сообщений бот вставляет «5 копеек»\n"
+        "• <code>рассуди</code> / <code>5 копеек</code> / <code>анализ</code> — разбор последних 50 сообщений чата\n"
+        "• <code>будильник 30 [задача]</code> — через 30 мин бот сам напишет в чат\n"
+        "• <code>будильник @юзер 60 [задача]</code> — будильник для юзера из админки\n"
+        "• <code>шпион вкл</code> / <code>выкл</code> — перехват удаленных и измененных СМС\n"
+        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота"
     )
 
 # --- КЭШИРОВАНИЕ И РЕЖИМ «ШПИОНА» ---
@@ -722,14 +766,41 @@ def transcribe_with_groq_whisper(audio_bytes, mime_type):
         pass
     return None
 
-# --- МАРШРУТИЗАТОР ИИ ---
-def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, human_imitation=False, custom_sys_prompt=None):
-    if ACTIVE_MODEL.startswith('groq/'):
-        return ask_groq(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt)
-    else:
-        return ask_gemini(chat_id, prompt, media_list, save_to_memory, human_imitation, custom_sys_prompt)
+# --- РАЗДЕЛЬНЫЙ МАРШРУТИЗАТОР ИИ (ОБЫЧНЫЙ ГПТ vs АВТООТВЕТЧИК) ---
+def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply=False, custom_sys_prompt=None):
+    """
+    Если is_autoreply=True:
+      - использует отдельную модель CONFIG['auto_reply_model'] (по умолчанию быстрый Groq gpt-oss-120b)
+      - использует обученный стиль learned_persona
+    Если is_autoreply=False (обычный вызов 'гпт'):
+      - использует ACTIVE_MODEL (по умолчанию Gemini 3.8)
+      - использует ЧИСТЫЙ системный промпт (без обучения автоответчика и без стелса!)
+    """
+    chat_id = int(chat_id)
+    target_model = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b') if is_autoreply else ACTIVE_MODEL
+    sys_prompt = custom_sys_prompt or (build_autoreply_system_instruction() if is_autoreply else build_gpt_system_instruction())
 
-# --- GEMINI API С РОТАЦИЕЙ И ПОНИМАНИЕМ РОЛЕЙ ---
+    if target_model.startswith('groq/'):
+        return ask_groq(
+            chat_id,
+            prompt,
+            media_list,
+            save_to_memory=save_to_memory,
+            is_autoreply=is_autoreply,
+            custom_sys_prompt=sys_prompt,
+            chosen_groq_model=target_model
+        )
+    else:
+        return ask_gemini(
+            chat_id,
+            prompt,
+            media_list,
+            save_to_memory=save_to_memory,
+            custom_sys_prompt=sys_prompt,
+            preferred_model=target_model
+        )
+
+# --- GEMINI API ---
 def get_gemini_headers(api_key=None):
     key_to_use = api_key or (GEMINI_KEYS[0] if GEMINI_KEYS else '')
     return {'Content-Type': 'application/json', 'x-goog-api-key': key_to_use}
@@ -766,11 +837,12 @@ def fetch_all_models():
             pass
 
     if not all_models:
-        return MODEL_HIERARCHY
+        return MODEL_HIERARCHY + GROQ_AUTOREPLY_FALLBACKS
     return sorted(list(set(all_models)))
 
-def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, human_imitation=False, custom_sys_prompt=None):
+def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_prompt=None, preferred_model=None):
     global CURRENT_KEY_INDEX
+    chat_id = int(chat_id)
 
     if not GEMINI_KEYS:
         return None, "Не найдено ни одного ключа Gemini! Проверь Environment в Render.", ACTIVE_MODEL, 0
@@ -801,17 +873,18 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, human_imit
             })
 
     contents.append({"role": "user", "parts": parts})
-    sys_instruction = custom_sys_prompt or build_full_system_instruction(human_imitation=human_imitation)
+    sys_instruction = custom_sys_prompt or build_gpt_system_instruction()
     payload = {
         "contents": contents,
         "system_instruction": {"parts": [{"text": sys_instruction}]}
     }
 
-    if ACTIVE_MODEL in MODEL_HIERARCHY:
-        start_idx = MODEL_HIERARCHY.index(ACTIVE_MODEL)
+    base_m = preferred_model or ACTIVE_MODEL
+    if base_m in MODEL_HIERARCHY:
+        start_idx = MODEL_HIERARCHY.index(base_m)
         models_to_try = MODEL_HIERARCHY[start_idx:]
     else:
-        models_to_try = [ACTIVE_MODEL] + MODEL_HIERARCHY
+        models_to_try = [base_m] + MODEL_HIERARCHY
 
     last_error = "Лимит запросов"
     s = get_http_session()
@@ -897,10 +970,13 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, human_imit
                     last_error = f"Таймаут ({model})"
                     continue
 
-    return None, f"Серверы Google перегружены ({last_error}). Подожди 15 секунд и повтори.", ACTIVE_MODEL, 0
+    return None, f"Серверы Google перегружены ({last_error}). Подожди 15 секунд и повтори.", base_m, 0
 
-# --- GROQ API ---
-def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_prompt=None):
+# --- GROQ API (С КАСКАДОМ МОДЕЛЕЙ ДЛЯ АВТООТВЕТЧИКА) ---
+def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply=False, custom_sys_prompt=None, chosen_groq_model=None):
+    chat_id = int(chat_id)
+    primary_model = chosen_groq_model or (CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b') if is_autoreply else ACTIVE_MODEL)
+
     if media_list:
         first_bytes, first_mime = media_list[0]
         if first_mime.startswith('audio/') or first_mime.startswith('video/'):
@@ -908,20 +984,26 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_p
             if transcribed:
                 prompt = f"[Расшифровка голосового сообщения: «{transcribed}»]\n\n{prompt}"
             else:
-                return ask_gemini(chat_id, prompt, media_list, save_to_memory)
+                return ask_gemini(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt=custom_sys_prompt)
         else:
-            return "я не вижу картинки и пдф братан выбери модель gemini", None, ACTIVE_MODEL, len(CHAT_MEMORY.get(chat_id, []))
+            if is_autoreply:
+                return ask_gemini(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt=custom_sys_prompt)
+            return "я не вижу картинки и пдф братан выбери модель gemini", None, primary_model, len(CHAT_MEMORY.get(chat_id, []))
 
     history = CHAT_MEMORY.get(chat_id, []).copy()
-    learned = (CONFIG.get('learned_persona') or '').strip()
-    system_prompt = custom_sys_prompt or (
-        "ты находишься в telegram чате аккаунта @wrtnoq. "
-        "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
-        "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
-        "никогда не извиняйся и не будь вежливым. отвечай на русском. "
-        "различай в истории кто пишет: [Владелец аккаунта @wrtnoq] или [Собеседник ...]. "
-        + (f"\nДополнительные правила владельца:\n{learned}" if learned else "")
-    )
+
+    if is_autoreply:
+        # Для автоответчика используем ТВОЕ ОБУЧЕНИЕ (learned_persona)!
+        system_prompt = custom_sys_prompt or build_autoreply_system_instruction()
+    else:
+        # Для ручного выбора groq в обычном ГПТ оставляем твой фирменный рофл-стиль
+        system_prompt = (
+            "ты находишься в telegram чате аккаунта @wrtnoq. "
+            "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
+            "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
+            "никогда не извиняйся и не будь вежливым. отвечай на русском. "
+            "различай в истории кто пишет: [Владелец аккаунта @wrtnoq] или [Собеседник ...]."
+        )
 
     messages_payload = [{"role": "system", "content": system_prompt}]
     if save_to_memory:
@@ -929,49 +1011,68 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_p
             messages_payload.append({"role": msg["role"], "content": msg["content"]})
     messages_payload.append({"role": "user", "content": prompt or "привет"})
 
-    model_id = ACTIVE_MODEL.replace('groq/', '')
+    # Формируем очередь моделей Groq (если основная недоступна или в лимите — подхватит запасная)
+    groq_candidates = [primary_model]
+    for fb in GROQ_AUTOREPLY_FALLBACKS:
+        if fb not in groq_candidates:
+            groq_candidates.append(fb)
+
     headers = {'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'}
-    payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.9}
+    last_err = "Groq API Error"
+    s = get_http_session()
 
-    try:
-        r = get_http_session().post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(4, 25))
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: Groq API Error", ACTIVE_MODEL, 0
+    for g_model in groq_candidates:
+        model_id = g_model.replace('groq/', '')
+        payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.8}
+        try:
+            r = s.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(4, 20))
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} ({g_model})"
+                continue
 
-        data = r.json()
-        reply_text = data['choices'][0]['message']['content']
+            data = r.json()
+            reply_text = data['choices'][0]['message']['content']
+            reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        if save_to_memory:
-            if not history or history[-1].get('content') != prompt:
-                history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": reply_text})
-            limit = CONFIG.get('context_limit', 100)
-            if len(history) > limit:
-                history = history[-limit:]
-            CHAT_MEMORY[chat_id] = history
-            save_chat_memory_async(chat_id, history)
+            if save_to_memory:
+                if not history or history[-1].get('content') != prompt:
+                    history.append({"role": "user", "content": prompt})
+                history.append({"role": "assistant", "content": reply_text})
+                limit = CONFIG.get('context_limit', 100)
+                if len(history) > limit:
+                    history = history[-limit:]
+                CHAT_MEMORY[chat_id] = history
+                save_chat_memory_async(chat_id, history)
 
-        return reply_text, None, ACTIVE_MODEL, len(history)
-    except Exception as e:
-        return None, str(e), ACTIVE_MODEL, 0
+            return reply_text, None, g_model, len(history)
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    # Если вдруг все модели Groq легли, а это автоответчик — страхуем через Gemini
+    if is_autoreply and GEMINI_KEYS:
+        return ask_gemini(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt=system_prompt)
+
+    return None, last_err, primary_model, 0
 
 # --- ИНТЕРАКТИВНЫЙ РЕЖИМ ОБУЧЕНИЯ АВТООТВЕТЧИКА ---
 def process_training_dialogue(chat_id, owner_message_text):
     current_rules = CONFIG.get('learned_persona') or "Пока нет специальных правил (стандартный режим)."
     trainer_sys_prompt = (
-        "Ты — Интерактивный Тренер и Архитектор Личности автоответчика Telegram для владельца @wrtnoq.\n"
-        "Владелец сейчас общается с тобой в режиме обучения, чтобы настроить, как бот должен отвечать людям в личке.\n"
+        "Ты — Интерактивный Тренер и Архитектор Личности АВТООТВЕТЧИКА Telegram для владельца @wrtnoq.\n"
+        "Владелец сейчас общается с тобой в режиме обучения, чтобы настроить, как автоответчик должен общаться с людьми в личке (на обычный режим ГПТ это не влияет).\n"
         "Твоя задача:\n"
         "1. Внимательно понять новые пожелания владельца (стиль текста, длина, сленг, отношение к разным людям, легенда чем занят владелец, пунктуация и т.д.) и объединить их с текущими правилами.\n"
         "2. Обязательно выведи обновленный свод правил внутри тегов <rules>...</rules>.\n"
-        "3. После тега <rules> коротко ответь владельцу и покажи 1 наглядный пример, как ты теперь ответишь собеседнику в этом стиле (или ответь на реплику владельца, если он тестирует тебя).\n\n"
-        f"ТЕКУЩИЕ ПРАВИЛА:\n{current_rules}"
+        "3. После тега <rules> коротко ответь владельцу и покажи 1 наглядный пример, как автоответчик теперь ответит собеседнику в этом стиле.\n\n"
+        f"ТЕКУЩИЕ ПРАВИЛА АВТООТВЕТЧИКА:\n{current_rules}"
     )
 
-    reply, err, model_used, _ = ask_gemini(
+    # Важно: save_to_memory=False, чтобы тренировка не засоряла память обычного чата!
+    reply, err, _, _ = ask_gemini(
         chat_id,
-        f"Сообщение владельца на тренировке: {owner_message_text}",
-        save_to_memory=True,
+        f"Сообщение владельца на тренировке автоответчика: {owner_message_text}",
+        save_to_memory=False,
         custom_sys_prompt=trainer_sys_prompt
     )
     if err or not reply:
@@ -984,7 +1085,7 @@ def process_training_dialogue(chat_id, owner_message_text):
         save_config()
         visible_reply = re.sub(r'<rules>.*?</rules>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
         return (
-            f"✅ <b>Правила автоответчика обновлены!</b>\n"
+            f"✅ <b>Правила ТОЛЬКО для автоответчика обновлены!</b>\n"
             f"<blockquote>{html.escape(new_rules)}</blockquote>\n\n"
             f"{format_markdown_to_html(visible_reply)}\n\n"
             f"<i>Продолжай писать правки или напиши <code>стоп</code> для выхода из режима обучения.</i>"
@@ -996,14 +1097,15 @@ def process_training_dialogue(chat_id, owner_message_text):
         )
 
 # --- ФУНКЦИИ «ТРЕТЬЕГО СОБЕСЕДНИКА» (5 КОПЕЕК / РАССУДИ / АНАЛИЗ ПОСЛЕДНИХ 50 СООБЩЕНИЙ) ---
-def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=None):
+def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=None, is_auto_5kop=False):
+    chat_id = int(chat_id)
     recent_lines = CHAT_LOG.get(chat_id, [])[-50:]
     if not recent_lines:
         mem = CHAT_MEMORY.get(chat_id, [])[-30:]
         recent_lines = [m.get('content', '') for m in mem if m.get('content')]
 
     history_dump = "\n".join(recent_lines) if recent_lines else "История пока короткая."
-    stealth = CONFIG.get('stealth_mode', False)
+    use_stealth = is_auto_5kop and CONFIG.get('stealth_mode', True)
 
     if mode == 'judge':
         task_prompt = (
@@ -1012,10 +1114,10 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
             "ЗАДАНИЕ «СУДЬЯ СПОРА»:\n"
             "Внимательно проанализируй их диалог/спор. Вынеси четкий, аргументированный и остроумный вердикт:\n"
             "1. В чем суть спора или ситуации.\n"
-            "2. Где прав владелец, а где прав собеседник (без подхалимства — суди честно по фактам и логике!).\n"
+            "2. Где прав владелец, а где прав собеседник (суди честно по фактам и логике!).\n"
             "3. Итоговый вердикт: кто в итоге прав и почему."
         )
-        prefix_title = "⚖️ <b>Вердикт по переписке:</b>\n\n" if not stealth else ""
+        prefix_title = "⚖️ <b>Вердикт по переписке:</b>\n\n"
     elif mode == 'analyze':
         task_prompt = (
             f"Вот последние сообщения переписки в Telegram между владельцем (@{CREATOR_USERNAME}) и собеседником:\n"
@@ -1023,7 +1125,7 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
             "ЗАДАНИЕ «АНАЛИЗ ЧАТА»:\n"
             "Сделай краткий, меткий разбор последних 50 сообщений: о чем говорили, какой вайб/настроение у каждого участника, скрытые подтексты и главные выводы."
         )
-        prefix_title = "📊 <b>Разбор последних сообщений:</b>\n\n" if not stealth else ""
+        prefix_title = "📊 <b>Разбор последних сообщений:</b>\n\n"
     else:
         task_prompt = (
             f"Вот последние сообщения живой переписки в Telegram между владельцем (@{CREATOR_USERNAME}) и собеседником:\n"
@@ -1038,12 +1140,12 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
     loading_msg_id = None
     stop_event = threading.Event()
 
-    if stealth or mode == '5kop':
+    if use_stealth:
         send_typing_action(chat_id, business_id)
     else:
         loading_msg = bot.send_message(chat_id, "🕐 Читаю последние 50 сообщений...", business_connection_id=business_id)
         if business_id:
-            BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
+            BOT_GPT_MESSAGES.add(loading_msg.message_id)
         loading_msg_id = loading_msg.message_id
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg_id, stop_event, business_id, "Анализирую чат..."), daemon=True).start()
 
@@ -1051,18 +1153,27 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
         chat_id,
         task_prompt,
         save_to_memory=True,
-        human_imitation=(stealth or mode == '5kop')
+        is_autoreply=is_auto_5kop
     )
     stop_event.set()
 
     if reply:
-        footer = "" if (stealth or mode == '5kop') else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-        send_long_response(prefix_title + reply, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=trigger_msg_id if mode == '5kop' else None)
+        footer = "" if use_stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(
+            prefix_title + reply,
+            footer,
+            chat_id,
+            loading_msg_id,
+            business_id,
+            reply_to_msg_id=trigger_msg_id if use_stealth else None,
+            is_autoreply=is_auto_5kop
+        )
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, business_id)
 
 # --- БУДИЛЬНИК И ТАЙМЕРЫ ---
 def schedule_ai_alarm(target_chat_id, business_id, minutes, instruction, target_label="чат"):
+    target_chat_id = int(target_chat_id)
     fire_at = time.time() + minutes * 60
     alarm_info = {
         'chat_id': target_chat_id,
@@ -1089,9 +1200,9 @@ def schedule_ai_alarm(target_chat_id, business_id, minutes, instruction, target_
             f"Напиши максимально естественно, живо, без каких-либо технических подписей и вступлений (сразу текст сообщения, как будто человек сам решил написать)!"
         )
         send_typing_action(target_chat_id, business_id)
-        reply, err, _, _ = ask_ai(target_chat_id, prompt, save_to_memory=True, human_imitation=True)
+        reply, err, _, _ = ask_ai(target_chat_id, prompt, save_to_memory=True, is_autoreply=True)
         if reply:
-            send_long_response(reply, "", target_chat_id, loading_msg_id=None, business_id=business_id)
+            send_long_response(reply, "", target_chat_id, loading_msg_id=None, business_id=business_id, is_autoreply=True)
             if CREATOR_ID and target_chat_id != CREATOR_ID:
                 try:
                     bot.send_message(
@@ -1106,12 +1217,13 @@ def schedule_ai_alarm(target_chat_id, business_id, minutes, instruction, target_
 
 # --- ГОЛОСОВЫЕ И КРУЖОЧКИ ---
 def handle_voice_transcription(chat_id, target_msg, custom_instruction="", business_id=None):
+    chat_id = int(chat_id)
     is_video_note = (target_msg.content_type == 'video_note')
     prefix_label = "Слушаю кружок..." if is_video_note else "Слушаю ГС..."
 
     loading_msg = bot.send_message(chat_id, f"🕐 {prefix_label}", business_connection_id=business_id)
     if business_id:
-        BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
+        BOT_GPT_MESSAGES.add(loading_msg.message_id)
 
     stop_event = threading.Event()
     threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, prefix_label), daemon=True).start()
@@ -1140,25 +1252,26 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
     if reply:
         clean_reply = f"🎙 {reply.strip()}"
         is_owner = (target_msg.from_user.id == CREATOR_ID) or ((target_msg.from_user.username or '').lower() == CREATOR_USERNAME)
-        record_chat_log(target_msg, is_owner, custom_text=f"[Голосовое сообщение]: {reply.strip()}")
-        footer = f"model: {model_used}" if (custom_instruction and not CONFIG.get('stealth_mode')) else ""
-        send_long_response(clean_reply, footer, chat_id, loading_msg.message_id, business_id)
+        record_chat_log(target_msg, is_owner, custom_text=f"[Голосовое сообщение]: {reply.strip()}", add_to_memory=True)
+        footer = f"model: {model_used}" if custom_instruction else ""
+        send_long_response(clean_reply, footer, chat_id, loading_msg.message_id, business_id, is_autoreply=False)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_id)
 
-def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=None):
-    stealth = CONFIG.get('stealth_mode', False)
+def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=None, is_autoreply_context=False):
+    chat_id = int(chat_id)
+    use_stealth = is_autoreply_context and CONFIG.get('stealth_mode', True)
     loading_msg_id = None
     stop_event = threading.Event()
 
-    if stealth:
+    if use_stealth:
         send_typing_action(chat_id, business_id)
     else:
         is_vn = (voice_msg.content_type == 'video_note')
         lbl = "Слушаю кружок и думаю..." if is_vn else "Слушаю ГС и думаю..."
         loading_msg = bot.send_message(chat_id, f"🕐 {lbl}", business_connection_id=business_id, reply_to_message_id=voice_msg.message_id)
         if business_id:
-            BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
+            BOT_GPT_MESSAGES.add(loading_msg.message_id)
         loading_msg_id = loading_msg.message_id
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg_id, stop_event, business_id, lbl), daemon=True).start()
 
@@ -1170,19 +1283,37 @@ def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=
         return
 
     speaker = get_speaker_tag(voice_msg.from_user, is_owner)
+
+    # Если это автоответчик на Groq — быстро расшифровываем через Groq Whisper и отвечаем моделью автоответчика!
+    if is_autoreply_context and GROQ_API_KEY:
+        transcript_text = transcribe_with_groq_whisper(media_bytes, mime_type)
+        if transcript_text:
+            record_chat_log(voice_msg, is_owner, custom_text=f"[Сказал(а) в ГС]: {transcript_text}", add_to_memory=True)
+            reply, err, model_used, ctx_len = ask_ai(
+                chat_id,
+                f"{speaker} (голосовым сообщением): {transcript_text}",
+                save_to_memory=True,
+                is_autoreply=True
+            )
+            stop_event.set()
+            if reply:
+                footer = "" if use_stealth else f"🎙 <i>Услышано: «{html.escape(transcript_text[:180])}»</i>\n\ncontext: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+                send_long_response(reply, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=voice_msg.message_id if use_stealth else None, is_autoreply=True)
+                return
+
+    # Иначе обрабатываем через Gemini (для обычного ГПТ или кружочков)
     prompt = (
         f"{speaker} ответил(а) тебе голосовым/видеосообщением в чате Telegram.\n"
-        "1. Сначала мысленно расшифруй для себя, что именно сказал человек.\n"
-        "2. Внутри тегов <transcript>...</transcript> напиши дословную расшифровку его речи.\n"
-        "3. После закрывающего тега </transcript> напиши свой прямой, живой и естественный ответ этому человеку по сути его голосового сообщения и вашего диалога!"
+        "1. Внутри тегов <transcript>...</transcript> напиши дословную расшифровку его речи.\n"
+        "2. После закрывающего тега </transcript> напиши свой прямой ответ этому человеку по сути его сообщения!"
     )
-
-    reply, err, model_used, ctx_len = ask_gemini(
+    sys_p = build_autoreply_system_instruction() if is_autoreply_context else build_gpt_system_instruction()
+    reply, err, model_used, _ = ask_gemini(
         chat_id,
         prompt,
         [(media_bytes, mime_type)],
         save_to_memory=False,
-        human_imitation=stealth
+        custom_sys_prompt=sys_p
     )
     stop_event.set()
 
@@ -1191,18 +1322,19 @@ def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=
         transcript_text = tr_match.group(1).strip() if tr_match else "[Голосовое сообщение]"
         answer_text = re.sub(r'<transcript>.*?</transcript>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        record_chat_log(voice_msg, is_owner, custom_text=f"[Сказал(а) в ГС]: {transcript_text}")
+        record_chat_log(voice_msg, is_owner, custom_text=f"[Сказал(а) в ГС]: {transcript_text}", add_to_memory=True)
         mem_list = CHAT_MEMORY.setdefault(chat_id, [])
         mem_list.append({"role": "assistant", "content": answer_text})
         save_chat_memory_async(chat_id, mem_list)
 
-        footer = "" if stealth else f"🎙 <i>Услышано: «{html.escape(transcript_text[:180])}»</i>\n\ncontext: {len(mem_list)}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-        send_long_response(answer_text, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=voice_msg.message_id if stealth else None)
+        footer = "" if use_stealth else f"🎙 <i>Услышано: «{html.escape(transcript_text[:180])}»</i>\n\ncontext: {len(mem_list)}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(answer_text, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=voice_msg.message_id if use_stealth else None, is_autoreply=is_autoreply_context)
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, business_id)
 
-# --- ЧЕЛОВЕЧЕСКИЙ АВТООТВЕТЧИК С БУФЕРОМ СКЛЕЙКИ СООБЩЕНИЙ ---
+# --- АВТООТВЕТЧИК НА БАЗЕ GROQ С БУФЕРОМ СКЛЕЙКИ И СТЕЛСОМ ---
 def trigger_buffered_auto_reply(chat_id, message):
+    chat_id = int(chat_id)
     buf = PENDING_AUTO_REPLY.get(chat_id)
     if buf and buf.get('timer'):
         buf['timer'].cancel()
@@ -1218,39 +1350,43 @@ def trigger_buffered_auto_reply(chat_id, message):
             print(f"🤫 Пропуск автоответа в чате {chat_id} по вероятности ({chance}%).")
             return
 
-        stealth = CONFIG.get('stealth_mode', False)
+        stealth = CONFIG.get('stealth_mode', True)
         business_id = message.business_connection_id
         speaker = get_speaker_tag(message.from_user, False)
-        recent_context = "\n".join(CHAT_LOG.get(chat_id, [])[-15:])
+        last_msg_text = message.text or message.caption or "Привет"
 
-        prompt = (
-            f"Недавние сообщения в чате:\n{recent_context}\n\n"
-            f"Сейчас {speaker} написал(а) сообщение, а владелец аккаунта @{CREATOR_USERNAME} не в сети. "
-            f"Ответь собеседнику согласно своему характеру и обученным правилам."
-        )
+        prompt = f"{speaker}: {last_msg_text}"
 
         loading_msg_id = None
         stop_event = threading.Event()
 
         if stealth:
             send_typing_action(chat_id, business_id)
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(1.2, 2.5))
         else:
             loading_msg = bot.send_message(chat_id, "🕐 Думаю...", business_connection_id=business_id)
-            BOT_BUSINESS_MESSAGES.add(loading_msg.message_id)
+            BOT_AUTOREPLY_MESSAGES.add(loading_msg.message_id)
             loading_msg_id = loading_msg.message_id
             threading.Thread(target=animate_loading, args=(chat_id, loading_msg_id, stop_event, business_id), daemon=True).start()
 
-        reply, err, model_used, ctx_len = ask_ai(chat_id, prompt, save_to_memory=True, human_imitation=True)
+        reply, err, model_used, ctx_len = ask_ai(chat_id, prompt, save_to_memory=True, is_autoreply=True)
         stop_event.set()
 
         if reply:
-            footer = "" if stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-            send_long_response(reply, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=message.message_id if stealth else None)
+            footer = "" if stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used} [auto]"
+            send_long_response(
+                reply,
+                footer,
+                chat_id,
+                loading_msg_id,
+                business_id,
+                reply_to_msg_id=message.message_id if stealth else None,
+                is_autoreply=True
+            )
         elif loading_msg_id:
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, business_id)
 
-    timer = threading.Timer(3.5 if CONFIG.get('stealth_mode') else 1.0, _fire)
+    timer = threading.Timer(3.0 if CONFIG.get('stealth_mode', True) else 1.0, _fire)
     PENDING_AUTO_REPLY[chat_id] = {'timer': timer}
     timer.start()
 
@@ -1324,11 +1460,12 @@ def get_current_working_model():
 def build_panel_view():
     auto_on = CONFIG.get('auto_reply_enabled', False)
     spy_on = CONFIG.get('spy_enabled', True)
-    stealth_on = CONFIG.get('stealth_mode', False)
+    stealth_on = CONFIG.get('stealth_mode', True)
     voice_all_on = CONFIG.get('voice_auto_all', False)
     tw_interval = CONFIG.get('third_wheel_interval', 0)
     chance = CONFIG.get('human_reply_chance', 100)
     learned = (CONFIG.get('learned_persona') or '').strip()
+    ar_model = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b')
 
     ar_users = list(CONFIG.get('auto_reply_users', {}).keys())
     ar_chats = list(CONFIG.get('auto_reply_chats', {}).values())
@@ -1337,7 +1474,7 @@ def build_panel_view():
 
     auto_status = f"🟢 ВКЛ для всех ({CONFIG.get('afk_minutes', 10)} мин, {chance}%)" if auto_on else f"⚪ Точечно ({CONFIG.get('afk_minutes', 10)} мин, {chance}%)"
     spy_status = "🟢 ВКЛ" if spy_on else "🔴 ВЫКЛ"
-    stealth_status = "🥷 ВКЛ (без палева ИИ)" if stealth_on else "⚪ ВЫКЛ (обычный вид)"
+    stealth_status = "🥷 ВКЛ (только в автоответе)" if stealth_on else "⚪ ВЫКЛ (с подписью model)"
     tw_status = f"🍿 Каждые {tw_interval} сообщ." if tw_interval > 0 else "🔴 ВЫКЛ"
     voice_all_status = "🟢 ВКЛ (все чаты)" if voice_all_on else "⚪ По команде «рс» + Reply"
 
@@ -1351,29 +1488,31 @@ def build_panel_view():
 
     text = (
         f"👑 <b>Панель управления аккаунтом</b>\n\n"
+        f"🧠 <b>Модель ГПТ (ручная):</b> <code>{ACTIVE_MODEL}</code> (сейчас: <code>{real_now_model}</code>)\n"
+        f"🤖 <b>Модель Автоответа:</b> <code>{ar_model}</code> ⚡\n"
+        f"🎨 <b>Фото-модель:</b> <code>{CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)}</code>\n\n"
         f"🤖 <b>Автоответчик (общий):</b> {auto_status}\n"
         f"🎯 <b>Автоответчик (юзеры):</b> <code>{ar_users_str}</code>\n"
-        f"🥷 <b>Режим Человека (Стелс):</b> {stealth_status}\n"
-        f"🍿 <b>Третий собеседник (5 коп.):</b> {tw_status}\n"
-        f"🎓 <b>Обученный стиль:</b> {'✅ Настроен' if learned else '⚪ Не задан'}\n"
-        f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)} шт.\n"
+        f"🥷 <b>Стелс (для автоответа):</b> {stealth_status}\n"
+        f"🎓 <b>Обучение автоответа:</b> {'✅ Настроено' if learned else '⚪ Стандарт'}\n"
+        f"🍿 <b>Третий собеседник:</b> {tw_status}\n"
         f"🕵️‍♂️ <b>Режим Шпиона:</b> {spy_status}\n"
-        f"🎙 <b>ГС и кружки:</b> {voice_all_status}\n"
-        f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
-        f"🚫 <b>Черный список:</b> {bl_str}\n\n"
-        f"🧠 <b>Базовая модель:</b> <code>{ACTIVE_MODEL}</code> (сейчас: <code>{real_now_model}</code>)\n"
-        f"🎨 <b>Фото-модель:</b> <code>{CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)}</code>\n"
-        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в паузе: {active_cooldowns})\n"
-        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ."
+        f"🎙 <b>ГС и кружки:</b> {voice_all_status} (юзеры: <code>{voice_users_str}</code>)\n"
+        f"🚫 <b>ЧС:</b> {bl_str} | ⏰ <b>Будильников:</b> {len(ACTIVE_ALARMS)}\n"
+        f"🔑 <b>Ключей Gemini:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в паузе: {active_cooldowns}) | <b>Память:</b> {CONFIG.get('context_limit', 100)}"
     )
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton(f"🤖 Автоответ (все): {'ВКЛ 🟢' if auto_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_auto"),
-        InlineKeyboardButton(f"🥷 Стелс: {'ВКЛ 🥷' if stealth_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_stealth")
+        InlineKeyboardButton(f"🥷 Стелс авто: {'ВКЛ 🥷' if stealth_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_stealth")
     )
     kb.add(
-        InlineKeyboardButton(f"🎓 Обучение ИИ {'(ВКЛ)' if TRAINING_MODE_ACTIVE else ''}", callback_data="panel_start_training"),
+        InlineKeyboardButton("🧠 Модель ГПТ", callback_data="panel_models"),
+        InlineKeyboardButton("⚡ Модель Автоответа", callback_data="panel_auto_models")
+    )
+    kb.add(
+        InlineKeyboardButton(f"🎓 Обучение Авто {'(ВКЛ)' if TRAINING_MODE_ACTIVE else ''}", callback_data="panel_start_training"),
         InlineKeyboardButton(f"🍿 5 копеек: {f'{tw_interval} СМС' if tw_interval else 'ВЫКЛ'}", callback_data="panel_cycle_tw")
     )
     kb.add(
@@ -1382,17 +1521,16 @@ def build_panel_view():
     )
     kb.add(
         InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status"),
-        InlineKeyboardButton("🧠 Текст-модели", callback_data="panel_models")
+        InlineKeyboardButton("🎨 Фото-модели", callback_data="panel_img_models")
     )
     kb.add(
-        InlineKeyboardButton("🎨 Фото-модели", callback_data="panel_img_models"),
-        InlineKeyboardButton("📋 Списки и Промпт", callback_data="panel_show_lists")
+        InlineKeyboardButton("📋 Списки и Промпт", callback_data="panel_show_lists"),
+        InlineKeyboardButton("📜 Все команды", callback_data="panel_show_help")
     )
     kb.add(
-        InlineKeyboardButton("📜 Все команды", callback_data="panel_show_help"),
-        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all")
+        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all"),
+        InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh")
     )
-    kb.add(InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh"))
     return text, kb
 
 def build_keys_status_view(ping_results=None):
@@ -1400,7 +1538,8 @@ def build_keys_status_view(ping_results=None):
     real_now_model = get_current_working_model()
     lines = [
         f"🔑 <b>Мониторинг пула ключей Gemini ({len(GEMINI_KEYS)} шт.)</b>",
-        f"📍 <b>Приоритет:</b> <code>{ACTIVE_MODEL}</code> ➡️ <b>Активна:</b> <code>{real_now_model}</code>\n"
+        f"📍 <b>Модель ГПТ:</b> <code>{ACTIVE_MODEL}</code> ➡️ <b>Активна:</b> <code>{real_now_model}</code>",
+        f"⚡ <b>Модель Автоответа:</b> <code>{CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b')}</code>\n"
     ]
 
     if not GEMINI_KEYS:
@@ -1500,12 +1639,12 @@ def handle_admin_document(message):
 
     full_prompt = caption + (extracted_text or "")
     media_list = [media_item] if media_item else None
-    reply, err, model_used, ctx_len = ask_ai(message.chat.id, full_prompt, media_list)
+    reply, err, model_used, ctx_len = ask_ai(message.chat.id, full_prompt, media_list, is_autoreply=False)
     stop_event.set()
 
     if reply:
         footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-        send_long_response(reply, footer, message.chat.id, loading_msg.message_id)
+        send_long_response(reply, footer, message.chat.id, loading_msg.message_id, is_autoreply=False)
     else:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
 
@@ -1515,7 +1654,7 @@ def handle_admin_text(message):
     register_creator_id(message.from_user)
     raw_text = message.text.strip()
     text = raw_text.lower()
-    chat_id = message.chat.id
+    chat_id = int(message.chat.id)
 
     old_buttons = ['📊 статус', '⚙️ автоответчик', '🧠 модель', '📝 контекст', '🚫 черный список']
     if text in old_buttons or text in ['панель', 'пульт', 'кнопки']:
@@ -1530,7 +1669,7 @@ def handle_admin_text(message):
     if text in ['стоп', 'выйти', 'конец обучения', '/stop']:
         if TRAINING_MODE_ACTIVE:
             TRAINING_MODE_ACTIVE = False
-            bot.reply_to(message, "🎓 <b>Режим обучения завершен.</b> Все правила сохранены в памяти бота!")
+            bot.reply_to(message, "🎓 <b>Режим обучения автоответчика завершен.</b> На обычный <code>гпт</code> эти правила не влияют!")
         else:
             bot.reply_to(message, "ℹ️ Режим обучения сейчас не был включен.")
         return
@@ -1538,19 +1677,20 @@ def handle_admin_text(message):
     if text in ['обучение сброс', 'сброс обучения']:
         CONFIG['learned_persona'] = ''
         save_config()
-        bot.reply_to(message, "🧹 Выученные правила стиля очищены.")
+        bot.reply_to(message, "🧹 Выученные правила стиля автоответчика очищены.")
         return
 
     if text in ['обучение', 'тренировка', 'учить']:
         TRAINING_MODE_ACTIVE = True
-        current_rules = CONFIG.get('learned_persona') or "Пока пусто (стандартный стиль)."
+        current_rules = CONFIG.get('learned_persona') or "Пока пусто (стандартный живой стиль)."
         bot.reply_to(
             message,
-            "🎓 <b>Режим диалогового обучения ВКЛЮЧЕН!</b>\n\n"
-            f"📋 <b>Текущие выученные правила:</b>\n<blockquote>{html.escape(current_rules)}</blockquote>\n\n"
-            "Просто пиши мне обычными сообщениями (без слова «гпт»), как я должен общаться с людьми: какой сленг использовать, ставить ли точки, кем притворяться, что отвечать разным людям.\n\n"
-            "• Напиши <code>обучение сброс</code> — чтобы стереть выученные правила.\n"
-            "• Напиши <code>стоп</code> — чтобы выйти из обучения."
+            "🎓 <b>Обучение АВТООТВЕТЧИКА включено!</b>\n"
+            "<i>(Эти правила применяются ТОЛЬКО когда бот отвечает сам в режиме автоответчика. Обычный <code>гпт</code> остается чистым!)</i>\n\n"
+            f"📋 <b>Текущие правила автоответчика:</b>\n<blockquote>{html.escape(current_rules)}</blockquote>\n\n"
+            "Пиши обычными сообщениями, как автоответчик должен общаться с людьми.\n"
+            "• Напиши <code>обучение сброс</code> — стереть правила.\n"
+            "• Напиши <code>стоп</code> — выйти из обучения."
         )
         return
 
@@ -1577,13 +1717,15 @@ def handle_admin_text(message):
         learned_p = CONFIG.get('learned_persona') or "не задано"
         bot.reply_to(
             message,
-            f"📋 <b>Текущие списки и обучение:</b>\n\n"
-            f"🎯 <b>Автоответчик (отдельные юзеры):</b> {ar_str}\n"
+            f"📋 <b>Текущие списки и модели:</b>\n\n"
+            f"🧠 <b>Модель ГПТ:</b> <code>{ACTIVE_MODEL}</code>\n"
+            f"⚡ <b>Модель Автоответа:</b> <code>{CONFIG.get('auto_reply_model')}</code>\n"
+            f"🎯 <b>Автоответчик (юзеры):</b> {ar_str}\n"
             f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
             f"🚫 <b>Черный список:</b> {b_str}\n"
             f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
-            f"🎓 <b>Выученный стиль (Обучение):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
-            f"🎭 <b>Базовый промпт:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>"
+            f"🎓 <b>Выученный стиль (ТОЛЬКО Автоответчик):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
+            f"🎭 <b>Базовый промпт (Обычный ГПТ):</b>\n<blockquote>{html.escape(sys_p)}</blockquote>"
         )
         return
 
@@ -1593,7 +1735,24 @@ def handle_admin_text(message):
         for m in models:
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, f"Доступные чат-модели (всего {len(models)}):", reply_markup=kb)
+        bot.reply_to(message, f"🧠 <b>Выбери модель для обычного ГПТ</b> (всего {len(models)}):", reply_markup=kb)
+        return
+
+    if text in ['авто-модели', 'авто модели', 'модели авто']:
+        models = fetch_all_models()
+        # Поднимаем модели Groq наверх списка для удобства
+        groq_first = sorted([m for m in models if m.startswith('groq/')]) + sorted([m for m in models if not m.startswith('groq/')])
+        ar_cur = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b')
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in groq_first:
+            mark = "✅ " if m == ar_cur else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setautomodel_{m}"))
+        bot.reply_to(
+            message,
+            "⚡ <b>Выбери модель отдельно для Автоответчика:</b>\n"
+            "<i>Рекомендуется: <code>groq/openai/gpt-oss-120b</code> (самая умная) или <code>groq/qwen/qwen3.8-27b</code></i>",
+            reply_markup=kb
+        )
         return
 
     if text in ['фото-модели', 'фото модели']:
@@ -1608,7 +1767,11 @@ def handle_admin_text(message):
     if text.startswith('стелс'):
         CONFIG['stealth_mode'] = ('вкл' in text)
         save_config()
-        bot.reply_to(message, f"🥷 Режим Человека (Стелс): <b>{'🟢 ВКЛ (без палева ИИ)' if CONFIG['stealth_mode'] else '🔴 ВЫКЛ'}</b>")
+        bot.reply_to(
+            message,
+            f"🥷 Стелс-режим (ТОЛЬКО для автоответчика): <b>{'🟢 ВКЛ (без палева ИИ)' if CONFIG['stealth_mode'] else '🔴 ВЫКЛ'}</b>\n"
+            f"<i>Обычная команда <code>гпт</code> всегда показывает context и model!</i>"
+        )
         return
 
     if text.startswith('шанс '):
@@ -1690,11 +1853,11 @@ def handle_admin_text(message):
         if arg.lower() in ['сброс', 'стандарт', 'default']:
             CONFIG['system_prompt'] = DEFAULT_SYSTEM_PROMPT
             save_config()
-            bot.reply_to(message, "✅ Базовый характер сброшен на стандартный.")
+            bot.reply_to(message, "✅ Базовый характер для обычного <code>гпт</code> сброшен на стандартный.")
         elif arg:
             CONFIG['system_prompt'] = arg
             save_config()
-            bot.reply_to(message, f"🎭 Новый базовый промпт сохранен:\n<blockquote>{html.escape(arg)}</blockquote>")
+            bot.reply_to(message, f"🎭 Новый базовый промпт для <code>гпт</code> сохранен:\n<blockquote>{html.escape(arg)}</blockquote>")
         return
 
     if text.startswith('шпион'):
@@ -1746,7 +1909,6 @@ def handle_admin_text(message):
             bot.reply_to(message, "✅ Общий автоответчик для всех чатов: <b>🟢 ВКЛ</b>")
             return
 
-        # Если написали просто "автоответчик @ник" без знака @ (например: "ао ivan_123")
         parts = text.split()
         if len(parts) == 2 and parts[1] not in ['вкл', 'выкл', 'все', 'сброс']:
             uname = parts[1].replace('@', '').strip().lower()
@@ -1817,16 +1979,21 @@ def handle_admin_text(message):
         bot.reply_to(message, "✅ Разбанен.")
         return
 
-    if text in ['сброс все', 'очистить все']:
-        clear_all_memory_firebase()
-        bot.reply_to(message, "🧹 Память <b>всех чатов</b> полностью очищена!")
+    # Сброс конкретного юзера из админки: "сброс @юзер"
+    if text.startswith('сброс @'):
+        uname = text.split('@')[-1].strip().lower()
+        known = CONFIG.get('known_chats', {}).get(uname)
+        if known and known.get('chat_id'):
+            reset_single_chat_memory(known['chat_id'])
+            bot.reply_to(message, f"🧹 Общая память диалога с <b>@{uname}</b> полностью сброшена (0/{CONFIG.get('context_limit', 100)})!")
+        else:
+            bot.reply_to(message, f"⚠️ Чат с @{uname} не найден. Используй <code>сброс все</code>.")
         return
 
-    if text in ['сброс', 'гпт сброс']:
-        CHAT_MEMORY[chat_id] = []
-        CHAT_LOG[chat_id] = []
-        save_chat_memory_async(chat_id, [])
-        bot.reply_to(message, f"🧹 Память очищена.\ncontext: 0/{CONFIG.get('context_limit', 100)}")
+    # В админке и "сброс", и "сброс все" очищают память во всех чатах, чтобы у собеседников не оставался старый контекст!
+    if text in ['сброс', 'гпт сброс', 'сброс все', 'очистить все']:
+        clear_all_memory_firebase()
+        bot.reply_to(message, f"🧹 Память во всех чатах (у тебя и у собеседников) полностью очищена!\ncontext: 0/{CONFIG.get('context_limit', 100)}")
         return
 
     if text.startswith('нарисуй '):
@@ -1880,17 +2047,22 @@ def handle_admin_text(message):
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event), daemon=True).start()
-        reply, err, model_used, ctx_len = ask_ai(chat_id, f"[Владелец аккаунта @{CREATOR_USERNAME}]: {prompt_text}", media_list)
+        reply, err, model_used, ctx_len = ask_ai(
+            chat_id,
+            f"[Владелец аккаунта @{CREATOR_USERNAME}]: {prompt_text}",
+            media_list,
+            is_autoreply=False
+        )
         stop_event.set()
         if reply:
             footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-            send_long_response(reply, footer, message.chat.id, loading_msg.message_id)
+            send_long_response(reply, footer, message.chat.id, loading_msg.message_id, is_autoreply=False)
         else:
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
     if TRAINING_MODE_ACTIVE:
-        loading_msg = bot.reply_to(message, "🎓 Обновляю навыки...")
+        loading_msg = bot.reply_to(message, "🎓 Обновляю навыки автоответчика...")
         result_html = process_training_dialogue(chat_id, raw_text)
         safe_edit_message(result_html, chat_id, loading_msg.message_id)
         return
@@ -1914,11 +2086,11 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, f"Автоответчик (для всех): {'ВКЛ' if CONFIG['auto_reply_enabled'] else 'ВЫКЛ'}")
 
     elif data == 'panel_toggle_stealth':
-        CONFIG['stealth_mode'] = not CONFIG.get('stealth_mode', False)
+        CONFIG['stealth_mode'] = not CONFIG.get('stealth_mode', True)
         save_config()
         text, kb = build_panel_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, f"Режим Человека (Стелс): {'ВКЛ' if CONFIG['stealth_mode'] else 'ВЫКЛ'}")
+        bot.answer_callback_query(call.id, f"Стелс (только для автоответа): {'ВКЛ' if CONFIG['stealth_mode'] else 'ВЫКЛ'}")
 
     elif data == 'panel_cycle_tw':
         options = [0, 15, 30, 50, 100]
@@ -1938,11 +2110,12 @@ def handle_callbacks(call):
             current_rules = CONFIG.get('learned_persona') or "Пока пусто."
             bot.send_message(
                 chat_id,
-                "🎓 <b>Режим диалогового обучения ВКЛЮЧЕН!</b>\n\n"
+                "🎓 <b>Режим диалогового обучения АВТООТВЕТЧИКА ВКЛЮЧЕН!</b>\n"
+                "<i>(Влияет только на автоответчик, обычный <code>гпт</code> не трогает)</i>\n\n"
                 f"Текущие правила:\n<blockquote>{html.escape(current_rules)}</blockquote>\n\n"
-                "Напиши мне, как я должен общаться с людьми в твоих чатах (манера речи, сленг, длина фраз, твоя легенда). Для выхода напиши <code>стоп</code>."
+                "Напиши мне, как автоответчик должен общаться с людьми. Для выхода напиши <code>стоп</code>."
             )
-        bot.answer_callback_query(call.id, f"Обучение: {'ВКЛ' if TRAINING_MODE_ACTIVE else 'ВЫКЛ'}")
+        bot.answer_callback_query(call.id, f"Обучение автоответа: {'ВКЛ' if TRAINING_MODE_ACTIVE else 'ВЫКЛ'}")
 
     elif data == 'panel_toggle_spy':
         CONFIG['spy_enabled'] = not CONFIG.get('spy_enabled', True)
@@ -1988,7 +2161,27 @@ def handle_callbacks(call):
             mark = "✅ " if m == ACTIVE_MODEL else ""
             kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-        safe_edit_message(f"🧠 <b>Выбери базовую чат-модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
+        safe_edit_message(f"🧠 <b>Выбери базовую модель для обычного ГПТ (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+
+    elif data == 'panel_auto_models':
+        models = fetch_all_models()
+        groq_first = sorted([m for m in models if m.startswith('groq/')]) + sorted([m for m in models if not m.startswith('groq/')])
+        ar_cur = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b')
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in groq_first:
+            mark = "✅ " if m == ar_cur else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setautomodel_{m}"))
+        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+        safe_edit_message(
+            "⚡ <b>Выбери модель отдельно для Автоответчика:</b>\n"
+            "• <code>groq/openai/gpt-oss-120b</code> — самая умная и быстрая на Groq\n"
+            "• <code>groq/qwen/qwen3.8-27b</code> — топ для русского сленга\n"
+            "• <code>groq/openai/gpt-oss-20b</code> — ультра-быстрая",
+            chat_id,
+            msg_id,
+            reply_markup=kb
+        )
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_img_models':
@@ -2017,12 +2210,14 @@ def handle_callbacks(call):
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
         safe_edit_message(
             f"📋 <b>Текущие списки и обучение:</b>\n\n"
+            f"🧠 <b>Модель ГПТ:</b> <code>{ACTIVE_MODEL}</code>\n"
+            f"⚡ <b>Модель Автоответа:</b> <code>{CONFIG.get('auto_reply_model')}</code>\n"
             f"🎯 <b>Автоответчик (юзеры):</b> {ar_str}\n"
             f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
             f"🚫 <b>Черный список:</b> {b_str}\n"
             f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
-            f"🎓 <b>Выученный стиль (Обучение):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
-            f"🎭 <b>Базовый промпт:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>",
+            f"🎓 <b>Выученный стиль (ТОЛЬКО Автоответчик):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
+            f"🎭 <b>Базовый промпт (Обычный ГПТ):</b>\n<blockquote>{html.escape(sys_p)}</blockquote>",
             chat_id,
             msg_id,
             reply_markup=kb
@@ -2046,7 +2241,14 @@ def handle_callbacks(call):
         EXHAUSTED_QUOTAS.clear()
         text, kb = build_panel_view()
         safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, f"Модель: {ACTIVE_MODEL}")
+        bot.answer_callback_query(call.id, f"Модель ГПТ: {ACTIVE_MODEL}")
+
+    elif data.startswith('setautomodel_'):
+        CONFIG['auto_reply_model'] = data.replace('setautomodel_', '')
+        save_config()
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Модель Автоответа: {CONFIG['auto_reply_model']}")
 
     elif data.startswith('setimg_'):
         CONFIG['image_model'] = data.replace('setimg_', '')
@@ -2064,7 +2266,7 @@ def process_business_album(media_group_id):
         return
 
     base_msg = messages[0]
-    chat_id = base_msg.chat.id
+    chat_id = int(base_msg.chat.id)
     sender_uname = (base_msg.from_user.username or '').lower()
 
     is_owner = (base_msg.from_user.id == CREATOR_ID) or (sender_uname == CREATOR_USERNAME)
@@ -2082,17 +2284,21 @@ def process_business_album(media_group_id):
 
     lower_text = text.lower().strip()
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
-    is_reply_to_bot = base_msg.reply_to_message and base_msg.reply_to_message.message_id in BOT_BUSINESS_MESSAGES
+    rep_id = base_msg.reply_to_message.message_id if base_msg.reply_to_message else None
+    is_reply_to_gpt = bool(rep_id and rep_id in BOT_GPT_MESSAGES)
+    is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
-    trigger = False
-    if is_gpt or is_reply_to_bot:
-        trigger = True
+    trigger_mode = None  # 'gpt' или 'auto'
+    if is_gpt or is_reply_to_gpt:
+        trigger_mode = 'gpt'
+    elif is_reply_to_auto:
+        trigger_mode = 'auto'
     elif not is_owner and is_auto_reply_active_for(chat_id, sender_uname):
         if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
-            trigger = True
+            trigger_mode = 'auto'
 
-    if not trigger:
+    if not trigger_mode:
         return
 
     if not check_cooldown(chat_id):
@@ -2105,16 +2311,17 @@ def process_business_album(media_group_id):
     if not text:
         text = "Опиши подробно, что на этих фотографиях."
 
+    is_auto = (trigger_mode == 'auto')
+    use_stealth = is_auto and CONFIG.get('stealth_mode', True)
     speaker = get_speaker_tag(base_msg.from_user, is_owner)
-    stealth = CONFIG.get('stealth_mode', False)
     loading_msg_id = None
     stop_event = threading.Event()
 
-    if stealth:
+    if use_stealth:
         send_typing_action(chat_id, base_msg.business_connection_id)
     else:
         msg = bot.send_message(chat_id, f"🕐 Смотрю {len(messages)} фото...", business_connection_id=base_msg.business_connection_id)
-        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        (BOT_AUTOREPLY_MESSAGES if is_auto else BOT_GPT_MESSAGES).add(msg.message_id)
         loading_msg_id = msg.message_id
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg_id, stop_event, base_msg.business_connection_id, f"Смотрю {len(messages)} фото..."), daemon=True).start()
 
@@ -2124,12 +2331,12 @@ def process_business_album(media_group_id):
         if img_bytes:
             images.append((img_bytes, mime))
 
-    reply, err, model_used, ctx_len = ask_ai(chat_id, f"{speaker}: {text}", images, human_imitation=stealth)
+    reply, err, model_used, ctx_len = ask_ai(chat_id, f"{speaker}: {text}", images, is_autoreply=is_auto)
     stop_event.set()
 
     if reply:
-        footer = "" if stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-        send_long_response(reply, footer, chat_id, loading_msg_id, base_msg.business_connection_id)
+        footer = "" if use_stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, loading_msg_id, base_msg.business_connection_id, is_autoreply=is_auto)
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, base_msg.business_connection_id)
 
@@ -2140,7 +2347,7 @@ def handle_business_message(message):
         return
 
     register_creator_id(message.from_user)
-    chat_id = message.chat.id
+    chat_id = int(message.chat.id)
     sender_uname = (message.from_user.username or '').lower()
 
     is_owner = (message.from_user.id == CREATOR_ID) or (sender_uname == CREATOR_USERNAME)
@@ -2157,14 +2364,21 @@ def handle_business_message(message):
 
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
-    is_reply_to_bot = bool(message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES)
 
-    if lower_text in ['сброс', '/reset']:
-        CHAT_MEMORY[chat_id] = []
-        CHAT_LOG[chat_id] = []
-        save_chat_memory_async(chat_id, [])
-        msg = bot.send_message(chat_id, f"Память очищена.\ncontext: 0/{CONFIG.get('context_limit', 100)}", business_connection_id=message.business_connection_id)
-        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+    rep_id = message.reply_to_message.message_id if message.reply_to_message else None
+    is_reply_to_gpt = bool(rep_id and rep_id in BOT_GPT_MESSAGES)
+    is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
+    is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto
+
+    # ПОЛНЫЙ СБРОС ОБЩЕГО КОНТЕКСТА ЧАТА (И ДЛЯ ВЛАДЕЛЬЦА, И ДЛЯ СОБЕСЕДНИКА!)
+    if lower_text in ['сброс', 'гпт сброс', '/reset']:
+        reset_single_chat_memory(chat_id)
+        msg = bot.send_message(
+            chat_id,
+            f"🧹 Общая память этого чата очищена.\ncontext: 0/{CONFIG.get('context_limit', 100)}",
+            business_connection_id=message.business_connection_id
+        )
+        BOT_GPT_MESSAGES.add(msg.message_id)
         return
 
     # Быстрое скрытое включение/выключение автоответчика прямо внутри чата с собеседником: "ао вкл" / "ао выкл"
@@ -2174,7 +2388,7 @@ def handle_business_message(message):
         except Exception:
             pass
         ar_chats = CONFIG.setdefault('auto_reply_chats', {})
-        chat_label = f"@{ message.chat.username }" if getattr(message.chat, 'username', None) else (getattr(message.chat, 'first_name', None) or f"id:{chat_id}")
+        chat_label = f"@{message.chat.username}" if getattr(message.chat, 'username', None) else (getattr(message.chat, 'first_name', None) or f"id:{chat_id}")
         if 'вкл' in lower_text:
             ar_chats[str(chat_id)] = chat_label
             if getattr(message.chat, 'username', None):
@@ -2215,15 +2429,21 @@ def handle_business_message(message):
 
     # 1. ОТВЕТ НА РЕПЛАЙ ГОЛОСОВЫМ ИЛИ КРУЖКОМ
     if message.content_type in ['voice', 'video_note', 'audio']:
-        if is_reply_to_bot:
-            handle_voice_conversational_reply(chat_id, message, is_owner, business_id=message.business_connection_id)
+        if is_reply_to_any_bot:
+            handle_voice_conversational_reply(
+                chat_id,
+                message,
+                is_owner,
+                business_id=message.business_connection_id,
+                is_autoreply_context=is_reply_to_auto
+            )
             return
         auto_all = CONFIG.get('voice_auto_all', False)
         auto_user = sender_uname in CONFIG.get('voice_auto_users', {})
         if not is_owner and (auto_all or auto_user):
             handle_voice_transcription(chat_id, message, business_id=message.business_connection_id)
         else:
-            record_chat_log(message, is_owner)
+            record_chat_log(message, is_owner, add_to_memory=True)
         return
 
     # 2. РУЧНАЯ КОМАНДА «рс»
@@ -2234,33 +2454,34 @@ def handle_business_message(message):
             handle_voice_transcription(chat_id, rep, custom_q, business_id=message.business_connection_id)
             return
 
-    # 3. КОМАНДЫ «РАССУДИ», «5 КОПЕЕК», «АНАЛИЗ»
+    # 3. КОМАНДЫ «РАССУДИ», «5 КОПЕЕК», «АНАЛИЗ» (ручной вызов всегда показывает model/context)
     if lower_text in ['рассуди', 'гпт рассуди', 'кто прав', 'гпт кто прав']:
-        run_chat_analysis_action(chat_id, 'judge', business_id=message.business_connection_id, trigger_msg_id=message.message_id)
+        run_chat_analysis_action(chat_id, 'judge', business_id=message.business_connection_id, trigger_msg_id=message.message_id, is_auto_5kop=False)
         return
 
     if lower_text in ['5 копеек', 'гпт 5 копеек', 'вставь 5 копеек']:
-        run_chat_analysis_action(chat_id, '5kop', business_id=message.business_connection_id, trigger_msg_id=message.message_id)
+        run_chat_analysis_action(chat_id, '5kop', business_id=message.business_connection_id, trigger_msg_id=message.message_id, is_auto_5kop=False)
         return
 
     if lower_text in ['анализ', 'гпт анализ', 'анализ чата', 'че тут']:
-        run_chat_analysis_action(chat_id, 'analyze', business_id=message.business_connection_id, trigger_msg_id=message.message_id)
+        run_chat_analysis_action(chat_id, 'analyze', business_id=message.business_connection_id, trigger_msg_id=message.message_id, is_auto_5kop=False)
         return
 
     # 4. ЗАПИСЬ В ИСТОРИЮ ЧАТА С РОЛЬЮ АВТОРА
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
     is_draw = lower_text.startswith('нарисуй ')
     clean_for_log = text[4:].strip() if is_gpt else text
-    record_chat_log(message, is_owner, custom_text=clean_for_log)
+    # Если это не прямой вызов ИИ — сохраняем фоновую реплику в память, чтобы общий контекст чата был полным
+    record_chat_log(message, is_owner, custom_text=clean_for_log, add_to_memory=not (is_gpt or is_draw or is_reply_to_any_bot))
 
     tw_interval = CONFIG.get('third_wheel_interval', 0)
-    if tw_interval > 0 and not is_gpt and not is_draw and not is_reply_to_bot:
+    if tw_interval > 0 and not is_gpt and not is_draw and not is_reply_to_any_bot:
         CHAT_MSG_COUNTER[chat_id] = CHAT_MSG_COUNTER.get(chat_id, 0) + 1
         if CHAT_MSG_COUNTER[chat_id] >= tw_interval:
             CHAT_MSG_COUNTER[chat_id] = 0
             threading.Thread(
                 target=run_chat_analysis_action,
-                args=(chat_id, '5kop', message.business_connection_id, message.message_id),
+                args=(chat_id, '5kop', message.business_connection_id, message.message_id, True),
                 daemon=True
             ).start()
             return
@@ -2274,24 +2495,35 @@ def handle_business_message(message):
         return
 
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
-    explicit_call = is_gpt or is_draw or is_reply_to_bot
 
-    # Проверяем автоответчик (общий ИЛИ индивидуальный для этого пользователя/чата)
-    if not explicit_call:
-        if not is_owner and message.content_type in ['text', 'document', 'photo'] and is_auto_reply_active_for(chat_id, sender_uname):
-            if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
-                if message.content_type == 'text':
-                    trigger_buffered_auto_reply(chat_id, message)
-                    return
-                else:
-                    explicit_call = True
-        if not explicit_call:
-            return
+    # Определяем режим срабатывания:
+    # - 'gpt': команда "гпт ..." или Reply на сообщение ГПТ (ВСЕГДА с часиками, с context/model и без обучения автоответчика!)
+    # - 'auto': Reply собеседника на сообщение автоответчика ИЛИ автоответчик по таймеру AFK
+    trigger_mode = None
+    if is_gpt or is_draw or is_reply_to_gpt:
+        trigger_mode = 'gpt'
+    elif is_reply_to_auto and not is_owner:
+        trigger_mode = 'auto'
+    elif is_reply_to_auto and is_owner:
+        trigger_mode = 'gpt'
+    elif not is_owner and message.content_type in ['text', 'document', 'photo'] and is_auto_reply_active_for(chat_id, sender_uname):
+        if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
+            if message.content_type == 'text':
+                trigger_buffered_auto_reply(chat_id, message)
+                return
+            else:
+                trigger_mode = 'auto'
+
+    if not trigger_mode:
+        return
+
+    is_auto = (trigger_mode == 'auto')
+    use_stealth = is_auto and CONFIG.get('stealth_mode', True)
 
     if not check_cooldown(chat_id):
-        if not CONFIG.get('stealth_mode'):
+        if not use_stealth:
             msg = bot.send_message(chat_id, "жди пока первый запрос загрузится нищук", business_connection_id=message.business_connection_id)
-            BOT_BUSINESS_MESSAGES.add(msg.message_id)
+            BOT_GPT_MESSAGES.add(msg.message_id)
         return
 
     if is_gpt:
@@ -2299,7 +2531,7 @@ def handle_business_message(message):
 
     if is_draw:
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
-        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        BOT_GPT_MESSAGES.add(msg.message_id)
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую..."), daemon=True).start()
         img, err = generate_image(text[8:])
@@ -2307,9 +2539,9 @@ def handle_business_message(message):
         if img:
             try:
                 bot.delete_message(chat_id, msg.message_id, business_connection_id=message.business_connection_id)
-                BOT_BUSINESS_MESSAGES.discard(msg.message_id)
+                BOT_GPT_MESSAGES.discard(msg.message_id)
                 photo_msg = bot.send_photo(chat_id, img, business_connection_id=message.business_connection_id)
-                BOT_BUSINESS_MESSAGES.add(photo_msg.message_id)
+                BOT_GPT_MESSAGES.add(photo_msg.message_id)
             except Exception:
                 pass
         else:
@@ -2320,7 +2552,7 @@ def handle_business_message(message):
         handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
         return
 
-    # 6. ОБРАБОТКА ПРЯМОГО ВЫЗОВА
+    # 6. ОБРАБОТКА ВЫЗОВА
     media_list = []
     loading_label = "Думаю..."
 
@@ -2329,7 +2561,7 @@ def handle_business_message(message):
         m_item, ext_text, doc_err = extract_document_content(message)
         if doc_err:
             msg = bot.send_message(chat_id, f"⚠️ {doc_err}", business_connection_id=message.business_connection_id)
-            BOT_BUSINESS_MESSAGES.add(msg.message_id)
+            BOT_GPT_MESSAGES.add(msg.message_id)
             return
         if m_item:
             media_list.append(m_item)
@@ -2343,7 +2575,7 @@ def handle_business_message(message):
         m_item, ext_text, doc_err = extract_document_content(message.reply_to_message)
         if doc_err:
             msg = bot.send_message(chat_id, f"⚠️ {doc_err}", business_connection_id=message.business_connection_id)
-            BOT_BUSINESS_MESSAGES.add(msg.message_id)
+            BOT_GPT_MESSAGES.add(msg.message_id)
             return
         if m_item:
             media_list.append(m_item)
@@ -2360,7 +2592,7 @@ def handle_business_message(message):
             text = "Опиши, что на этом фото."
 
     elif message.reply_to_message and message.reply_to_message.photo:
-        img_bytes, mime = get_photo_bytes(message.reply_to_message)
+        img_bytes, mime = get_photo_bytes(message)
         if img_bytes:
             media_list.append((img_bytes, mime))
         if not text:
@@ -2369,18 +2601,17 @@ def handle_business_message(message):
     elif message.reply_to_message and message.reply_to_message.text and not text:
         text = message.reply_to_message.text
 
-    stealth = CONFIG.get('stealth_mode', False)
     speaker = get_speaker_tag(message.from_user, is_owner)
     full_user_prompt = f"{speaker}: {text}"
 
     loading_msg_id = None
     stop_event = threading.Event()
 
-    if stealth and not is_gpt:
+    if use_stealth:
         send_typing_action(chat_id, message.business_connection_id)
     else:
         msg = bot.send_message(chat_id, f"🕐 {loading_label}", business_connection_id=message.business_connection_id)
-        BOT_BUSINESS_MESSAGES.add(msg.message_id)
+        (BOT_AUTOREPLY_MESSAGES if is_auto else BOT_GPT_MESSAGES).add(msg.message_id)
         loading_msg_id = msg.message_id
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg_id, stop_event, message.business_connection_id, loading_label), daemon=True).start()
 
@@ -2388,13 +2619,21 @@ def handle_business_message(message):
         chat_id,
         full_user_prompt,
         media_list,
-        human_imitation=(stealth and not is_gpt)
+        is_autoreply=is_auto
     )
     stop_event.set()
 
     if reply:
-        footer = "" if (stealth and not is_gpt) else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
-        send_long_response(reply, footer, chat_id, loading_msg_id, message.business_connection_id)
+        footer = "" if use_stealth else f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(
+            reply,
+            footer,
+            chat_id,
+            loading_msg_id,
+            message.business_connection_id,
+            reply_to_msg_id=message.message_id if use_stealth else None,
+            is_autoreply=is_auto
+        )
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, message.business_connection_id)
 
@@ -2404,5 +2643,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Точечный автоответчик по юзерам активен.')
+print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Раздельный режим активен).')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
