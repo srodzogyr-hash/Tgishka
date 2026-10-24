@@ -84,11 +84,10 @@ CONFIG = {
 LAST_OWNER_ACTIVITY = {}
 LAST_REQUEST_TIME = {}
 CHAT_MEMORY = {}
-# Полный лог последних 60 сообщений чата с подписями ролей (для «5 копеек», «рассуди» и контекста)
 CHAT_LOG = {}
 CHAT_MSG_COUNTER = {}
-PENDING_AUTO_REPLY = {}  # Буфер склейки сообщений для человеческого автоответчика
-ACTIVE_ALARMS = []       # Список активных будильников
+PENDING_AUTO_REPLY = {}
+ACTIVE_ALARMS = []
 
 BOT_BUSINESS_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
@@ -248,7 +247,6 @@ def record_chat_log(message, is_owner, custom_text=None):
     if not user:
         return
 
-    # Запоминаем чат собеседника для будильников по @username
     if not is_owner and user.username:
         uname_clean = user.username.lower()
         full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -282,7 +280,6 @@ def record_chat_log(message, is_owner, custom_text=None):
     if len(log_list) > 60:
         CHAT_LOG[chat_id] = log_list[-60:]
 
-    # Также добавляем реплику в контекст диалога, чтобы ИИ всегда знал, о чем шла речь до его вызова
     mem_list = CHAT_MEMORY.setdefault(chat_id, [])
     mem_list.append({"role": "user", "content": f"{speaker}: {text}"})
     limit = CONFIG.get('context_limit', 100)
@@ -322,7 +319,7 @@ def build_full_system_instruction(human_imitation=False):
 
     return "\n\n".join(parts)
 
-# --- ФОРМАТИРОВАНИЕ И ОТПРАВКА (С ПОДДЕРЖКОЙ СТЕЛС-РЕЖИМА БЕЗ «ИЗМЕНЕНО») ---
+# --- ФОРМАТИРОВАНИЕ И ОТПРАВКА ---
 def format_markdown_to_html(text):
     escaped = html.escape(text)
     escaped = re.sub(r'```(?:\w+)?\n?(.*?)```', r'<pre>\1</pre>', escaped, flags=re.DOTALL)
@@ -365,11 +362,6 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
             pass
 
 def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None):
-    """
-    Отправляет ответ (разбивая на несколько СМС, если текст > 3600 символов).
-    Если loading_msg_id=None (в режиме «Человек/Стелс»), отправляет сразу чистое сообщение без пометки «изменено»!
-    """
-    # Убираем случайные префиксы ролей, если модель попыталась их скопировать
     reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
@@ -830,7 +822,6 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, human_imit
                     CURRENT_KEY_INDEX = (key_idx + 1) % len(GEMINI_KEYS)
 
                     if save_to_memory:
-                        # Если последняя запись в памяти еще не совпадает с текущим промптом, добавляем её
                         if not history or history[-1].get('content') != prompt:
                             history.append({"role": "user", "content": prompt or "[Медиафайл]"})
                         history.append({"role": "assistant", "content": reply_text})
@@ -910,10 +901,6 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_p
 
 # --- ИНТЕРАКТИВНЫЙ РЕЖИМ ОБУЧЕНИЯ АВТООТВЕТЧИКА ---
 def process_training_dialogue(chat_id, owner_message_text):
-    """
-    Ведет диалог с владельцем, обновляет правила стиля автоответчика (learned_persona)
-    и сразу показывает тестовый пример ответа в новом стиле.
-    """
     current_rules = CONFIG.get('learned_persona') or "Пока нет специальных правил (стандартный режим)."
     trainer_sys_prompt = (
         "Ты — Интерактивный Тренер и Архитектор Личности автоответчика Telegram для владельца @wrtnoq.\n"
@@ -934,13 +921,12 @@ def process_training_dialogue(chat_id, owner_message_text):
     if err or not reply:
         return f"⚠️ Ошибка обучения: {err}"
 
-    # Извлекаем обновленные правила из <rules>...</rules>
     match = re.search(r'<rules>(.*?)</rules>', reply, flags=re.DOTALL | re.IGNORECASE)
     if match:
         new_rules = match.group(1).strip()
         CONFIG['learned_persona'] = new_rules
         save_config()
-         visible_reply = re.sub(r'<rules>.*?</rules>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
+        visible_reply = re.sub(r'<rules>.*?</rules>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
         return (
             f"✅ <b>Правила автоответчика обновлены!</b>\n"
             f"<blockquote>{html.escape(new_rules)}</blockquote>\n\n"
@@ -955,12 +941,6 @@ def process_training_dialogue(chat_id, owner_message_text):
 
 # --- ФУНКЦИИ «ТРЕТЬЕГО СОБЕСЕДНИКА» (5 КОПЕЕК / РАССУДИ / АНАЛИЗ ПОСЛЕДНИХ 50 СООБЩЕНИЙ) ---
 def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=None):
-    """
-    mode:
-      - '5kop': вставить свои 5 копеек в разговор
-      - 'judge': рассудить спор (кто прав, кто виноват)
-      - 'analyze': психологический и смысловой разбор последних 50 сообщений
-    """
     recent_lines = CHAT_LOG.get(chat_id, [])[-50:]
     if not recent_lines:
         mem = CHAT_MEMORY.get(chat_id, [])[-30:]
@@ -989,7 +969,6 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
         )
         prefix_title = "📊 <b>Разбор последних сообщений:</b>\n\n" if not stealth else ""
     else:
-        # 5 копеек (третий лишний в чате)
         task_prompt = (
             f"Вот последние сообщения живой переписки в Telegram между владельцем (@{CREATOR_USERNAME}) и собеседником:\n"
             f"---\n{history_dump}\n---\n\n"
@@ -1026,9 +1005,8 @@ def run_chat_analysis_action(chat_id, mode, business_id=None, trigger_msg_id=Non
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, business_id)
 
-# --- БУДИЛЬНИК И ТАЙМЕРЫ (ПРОАКТИВНЫЕ СООБЩЕНИЯ ОТ ИИ) ---
+# --- БУДИЛЬНИК И ТАЙМЕРЫ ---
 def schedule_ai_alarm(target_chat_id, business_id, minutes, instruction, target_label="чат"):
-    """Запускает фоновый будильник, который через N минут сам сгенерирует и напишет сообщение."""
     fire_at = time.time() + minutes * 60
     alarm_info = {
         'chat_id': target_chat_id,
@@ -1070,9 +1048,8 @@ def schedule_ai_alarm(target_chat_id, business_id, minutes, instruction, target_
 
     threading.Thread(target=_alarm_worker, daemon=True).start()
 
-# --- ГОЛОСОВЫЕ И КРУЖОЧКИ (РАСШИФРОВКА «рс» + ЖИВОЙ ОТВЕТ НА РЕПЛАЙ ГС) ---
+# --- ГОЛОСОВЫЕ И КРУЖОЧКИ ---
 def handle_voice_transcription(chat_id, target_msg, custom_instruction="", business_id=None):
-    """Чистая расшифровка ГС/кружков по команде 'рс' или в режиме авто-расшифровки."""
     is_video_note = (target_msg.content_type == 'video_note')
     prefix_label = "Слушаю кружок..." if is_video_note else "Слушаю ГС..."
 
@@ -1106,7 +1083,6 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
 
     if reply:
         clean_reply = f"🎙 {reply.strip()}"
-        # Записываем расшифровку в лог чата, чтобы бот помнил, что было в ГС!
         is_owner = (target_msg.from_user.id == CREATOR_ID) or ((target_msg.from_user.username or '').lower() == CREATOR_USERNAME)
         record_chat_log(target_msg, is_owner, custom_text=f"[Голосовое сообщение]: {reply.strip()}")
         footer = f"model: {model_used}" if (custom_instruction and not CONFIG.get('stealth_mode')) else ""
@@ -1115,10 +1091,6 @@ def handle_voice_transcription(chat_id, target_msg, custom_instruction="", busin
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id, business_id)
 
 def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=None):
-    """
-    Когда человек отвечает голосовым сообщением или кружочком РЕПЛАЕМ на сообщение бота:
-    бот сам расшифровывает ГС для себя, сохраняет в память и отвечает собеседнику по смыслу диалога!
-    """
     stealth = CONFIG.get('stealth_mode', False)
     loading_msg_id = None
     stop_event = threading.Event()
@@ -1163,35 +1135,28 @@ def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=
         transcript_text = tr_match.group(1).strip() if tr_match else "[Голосовое сообщение]"
         answer_text = re.sub(r'<transcript>.*?</transcript>', '', reply, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        # Сохраняем в память чата и расшифровку ГС собеседника, и наш ответ
         record_chat_log(voice_msg, is_owner, custom_text=f"[Сказал(а) в ГС]: {transcript_text}")
         mem_list = CHAT_MEMORY.setdefault(chat_id, [])
         mem_list.append({"role": "assistant", "content": answer_text})
         save_chat_memory_async(chat_id, mem_list)
 
-        footer = "" if stealth else f"🎙 <i>Услышано: «{html.escape(transcript_text[:180])}»</i>\n\ncontext: { len(mem_list) }/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        footer = "" if stealth else f"🎙 <i>Услышано: «{html.escape(transcript_text[:180])}»</i>\n\ncontext: {len(mem_list)}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
         send_long_response(answer_text, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=voice_msg.message_id if stealth else None)
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, business_id)
 
 # --- ЧЕЛОВЕЧЕСКИЙ АВТООТВЕТЧИК С БУФЕРОМ СКЛЕЙКИ СООБЩЕНИЙ ---
 def trigger_buffered_auto_reply(chat_id, message):
-    """
-    Ждет 3.5 секунды, пока собеседник допишет серию коротких сообщений,
-    и отвечает одним живым сообщением с учетом шанса ответа и стелс-режима.
-    """
     buf = PENDING_AUTO_REPLY.get(chat_id)
     if buf and buf.get('timer'):
         buf['timer'].cancel()
 
     def _fire():
         PENDING_AUTO_REPLY.pop(chat_id, None)
-        # Если владелец за эти секунды сам написал в чат — отменяем автоответ
         afk_seconds = CONFIG.get('afk_minutes', 10) * 60
         if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) < afk_seconds:
             return
 
-        # Проверяем вероятность ответа (чтобы в режиме человека не отвечать как робот на 100% реплик)
         chance = CONFIG.get('human_reply_chance', 100)
         if chance < 100 and random.randint(1, 100) > chance:
             print(f"🤫 Пропуск автоответа в чате {chat_id} по вероятности ({chance}%).")
@@ -1486,14 +1451,12 @@ def handle_admin_text(message):
 
     remove_old_reply_keyboard(chat_id)
 
-    # Выход из режима обучения
     if text in ['стоп', 'выйти', 'конец обучения', '/stop']:
         if TRAINING_MODE_ACTIVE:
             TRAINING_MODE_ACTIVE = False
             bot.reply_to(message, "🎓 <b>Режим обучения завершен.</b> Все правила сохранены в памяти бота!")
             return
 
-    # Вход в интерактивный режим обучения
     if text in ['обучение', 'тренировка', 'учить']:
         TRAINING_MODE_ACTIVE = True
         current_rules = CONFIG.get('learned_persona') or "Пока пусто (стандартный стиль)."
@@ -1513,7 +1476,6 @@ def handle_admin_text(message):
         bot.reply_to(message, "🧹 Выученные правила стиля очищены.")
         return
 
-    # Если сейчас включен режим обучения — каждое сообщение идет в диалог с тренером!
     if TRAINING_MODE_ACTIVE and not text.startswith(('команды', '/help', 'ключи', 'будильник', 'стелс', 'вставка')):
         loading_msg = bot.reply_to(message, "🎓 Обновляю навыки...")
         result_html = process_training_dialogue(chat_id, raw_text)
@@ -1583,7 +1545,6 @@ def handle_admin_text(message):
                 bot.reply_to(message, "⚠️ Укажи число сообщений (например: <code>вставка 25</code> или <code>вставка выкл</code>)")
         return
 
-    # Будильник из админки: "будильник @юзер 30 текст" или "будильник 15 текст"
     if text.startswith('будильник '):
         parts = raw_text.split(maxsplit=3)
         if len(parts) >= 3 and parts[1].startswith('@'):
@@ -2025,7 +1986,6 @@ def handle_business_message(message):
     is_owner = (message.from_user.id == CREATOR_ID) or (sender_uname == CREATOR_USERNAME)
     if is_owner:
         LAST_OWNER_ACTIVITY[chat_id] = time.time()
-        # Если владелец сам заговорил в чате — отменяем ожидающий таймер автоответчика
         buf = PENDING_AUTO_REPLY.pop(chat_id, None)
         if buf and buf.get('timer'):
             buf['timer'].cancel()
@@ -2039,7 +1999,6 @@ def handle_business_message(message):
     lower_text = text.lower().strip()
     is_reply_to_bot = bool(message.reply_to_message and message.reply_to_message.message_id in BOT_BUSINESS_MESSAGES)
 
-    # Очистка памяти чата
     if lower_text in ['сброс', '/reset']:
         CHAT_MEMORY[chat_id] = []
         CHAT_LOG[chat_id] = []
@@ -2048,14 +2007,12 @@ def handle_business_message(message):
         BOT_BUSINESS_MESSAGES.add(msg.message_id)
         return
 
-    # Стелс-будильник прямо из бизнес-чата: "будильник 30 спроси как дела"
     if is_owner and lower_text.startswith('будильник '):
         parts = text.split(maxsplit=2)
         if len(parts) >= 2:
             try:
                 mins = float(parts[1])
                 task = parts[2] if len(parts) > 2 else "Напиши собеседнику в продолжение вашего диалога"
-                # Мгновенно удаляем команду владельца из чата, чтобы собеседник ничего не заметил!
                 try:
                     bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
                 except Exception:
@@ -2070,7 +2027,7 @@ def handle_business_message(message):
             except ValueError:
                 pass
 
-    # 1. ЕСЛИ ОТВЕТИЛИ ГОЛОСОВЫМ ИЛИ КРУЖКОМ РЕПЛАЕМ НА СООБЩЕНИЕ БОТА — ОН САМ СЛУШАЕТ И ОТВЕЧАЕТ В ДИАЛОГЕ!
+    # 1. ОТВЕТ НА РЕПЛАЙ ГОЛОСОВЫМ ИЛИ КРУЖКОМ
     if message.content_type in ['voice', 'video_note', 'audio']:
         if is_reply_to_bot:
             handle_voice_conversational_reply(chat_id, message, is_owner, business_id=message.business_connection_id)
@@ -2083,7 +2040,7 @@ def handle_business_message(message):
             record_chat_log(message, is_owner)
         return
 
-    # 2. РУЧНАЯ КОМАНДА «рс» (РАСШИФРОВКА ГС/КРУЖКА)
+    # 2. РУЧНАЯ КОМАНДА «рс»
     if (lower_text == 'рс' or lower_text.startswith('рс ')) and message.reply_to_message:
         rep = message.reply_to_message
         if rep.content_type in ['voice', 'video_note', 'audio']:
@@ -2091,7 +2048,7 @@ def handle_business_message(message):
             handle_voice_transcription(chat_id, rep, custom_q, business_id=message.business_connection_id)
             return
 
-    # 3. КОМАНДЫ «РАССУДИ», «КТО ПРАВ», «5 КОПЕЕК», «АНАЛИЗ» ПРЯМО В ЧАТЕ
+    # 3. КОМАНДЫ «РАССУДИ», «5 КОПЕЕК», «АНАЛИЗ»
     if lower_text in ['рассуди', 'гпт рассуди', 'кто прав', 'гпт кто прав']:
         run_chat_analysis_action(chat_id, 'judge', business_id=message.business_connection_id, trigger_msg_id=message.message_id)
         return
@@ -2104,13 +2061,12 @@ def handle_business_message(message):
         run_chat_analysis_action(chat_id, 'analyze', business_id=message.business_connection_id, trigger_msg_id=message.message_id)
         return
 
-    # 4. ЗАПИСЫВАЕМ КАЖДОЕ СООБЩЕНИЕ В ИСТОРИЮ ЧАТА С РОЛЬЮ АВТОРА (ВЛАДЕЛЕЦ VS СОБЕСЕДНИК)
+    # 4. ЗАПИСЬ В ИСТОРИЮ ЧАТА С РОЛЬЮ АВТОРА
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
     is_draw = lower_text.startswith('нарисуй ')
     clean_for_log = text[4:].strip() if is_gpt else text
     record_chat_log(message, is_owner, custom_text=clean_for_log)
 
-    # Проверяем счетчик «Третьего собеседника» (вставить 5 копеек каждые N сообщений)
     tw_interval = CONFIG.get('third_wheel_interval', 0)
     if tw_interval > 0 and not is_gpt and not is_draw and not is_reply_to_bot:
         CHAT_MSG_COUNTER[chat_id] = CHAT_MSG_COUNTER.get(chat_id, 0) + 1
@@ -2134,7 +2090,6 @@ def handle_business_message(message):
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
     explicit_call = is_gpt or is_draw or is_reply_to_bot
 
-    # Если это не прямой вызов, а собеседник пишет, когда владелец AFK — запускаем буферизованный человеческий автоответчик!
     if not explicit_call:
         if not is_owner and message.content_type in ['text', 'document', 'photo'] and CONFIG.get('auto_reply_enabled', True):
             if time.time() - LAST_OWNER_ACTIVITY.get(chat_id, 0) >= afk_seconds:
@@ -2178,7 +2133,7 @@ def handle_business_message(message):
         handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
         return
 
-    # 6. ОБРАБОТКА ПРЯМОГО ВЫЗОВА (ТЕКСТ, ФОТО, ДОКУМЕНТЫ, РЕПЛАЙ НА БОТА)
+    # 6. ОБРАБОТКА ПРЯМОГО ВЫЗОВА
     media_list = []
     loading_label = "Думаю..."
 
