@@ -424,6 +424,49 @@ def mask_key(key_str):
         return "***"
     return f"{key_str[:6]}...{key_str[-4:]}"
 
+# --- ПОЛНЫЙ ТЕКСТ ВСЕХ КОМАНД (СТАРЫХ И НОВЫХ) ---
+def get_full_commands_text():
+    return (
+        "📜 <b>Полный список всех команд бота:</b>\n\n"
+        "🔹 <b>1. Классические команды (Нейросеть и Модели):</b>\n"
+        "• <code>/panel</code> (или <code>панель</code>) — главный пульт с кнопками\n"
+        "• <code>модели</code> — выбрать текстовую модель (Gemini / Groq)\n"
+        "• <code>фото-модели</code> — выбрать модель для рисования\n"
+        "• <code>гпт [текст]</code> — задать вопрос ИИ (или Reply на фото/файл/ГС)\n"
+        "• <code>нарисуй [описание]</code> — сгенерировать картинку\n"
+        "• <code>контекст 100</code> — изменить глубину памяти диалога\n"
+        "• <code>сброс</code> (или <code>гпт сброс</code>) — очистить память текущего чата\n"
+        "• <code>сброс все</code> — очистить память вообще всех чатов\n"
+        "• <code>характер [текст]</code> — задать кастомный промпт/роль для Gemini\n"
+        "• <code>характер сброс</code> — вернуть стандартный характер\n"
+        "• <code>ключи</code> — статус всех ключей, их паузы и пинг-тест\n"
+        "• <code>список</code> — посмотреть ЧС, список авто-ГС, промпт и будильники\n\n"
+        "🔹 <b>2. Автоответчик, Шпион и Доступ:</b>\n"
+        "• <code>автоответчик вкл</code> / <code>автоответчик выкл</code> — переключить автоответчик\n"
+        "• <code>таймер 5</code> — через сколько минут молчания включается автоответчик\n"
+        "• <code>кд 3</code> — задержка анти-спама между запросами в секундах (0 = без КД)\n"
+        "• <code>шпион вкл</code> / <code>шпион выкл</code> — перехват удаленных и измененных СМС\n"
+        "• <code>запретить @юзер</code> — добавить человека в ЧС бота\n"
+        "• <code>разрешить @юзер</code> — убрать человека из ЧС\n\n"
+        "🔹 <b>3. Голосовые и Кружки (рс + живой ответ):</b>\n"
+        "• Ответь <code>рс</code> на ГС/кружок — чистая текстовая расшифровка без воды\n"
+        "• Ответь <code>рс [вопрос/задача]</code> — например: <code>рс перескажи кратко</code>\n"
+        "• <code>рс @юзер</code> — вкл/выкл постоянную авто-расшифровку для этого юзера\n"
+        "• <code>рс все вкл</code> / <code>рс все выкл</code> — авто-расшифровка для всех чатов\n"
+        "• <i>Фишка: если ответить на сообщение бота голосовым — он сам расшифрует его и ответит в диалоге!</i>\n\n"
+        "🔹 <b>4. Обучение, Стелс (Человек), Третий собеседник и Будильник:</b>\n"
+        "• <code>обучение</code> — войти в режим диалогового обучения автоответчика (выход: <code>стоп</code>)\n"
+        "• <code>обучение сброс</code> — стереть выученные правила\n"
+        "• <code>стелс вкл</code> / <code>стелс выкл</code> — режим Человека (убирает подпись model/context, часики и пометку «изменено»)\n"
+        "• <code>шанс 75</code> — вероятность ответа автоответчика в % (от 10 до 100)\n"
+        "• <code>вставка 25</code> (или <code>вставка выкл</code>) — раз в N сообщений бот сам вставляет свои «5 копеек» в чат\n"
+        "• <code>рассуди</code> (или <code>кто прав</code>) — прочитать последние 50 СМС чата и рассудить спор\n"
+        "• <code>5 копеек</code> — вставить комментарий по последним сообщениям чата\n"
+        "• <code>анализ</code> — сделать разбор последних 50 сообщений переписки\n"
+        "• <code>будильник 30 [задача]</code> — (в чате или админке) через 30 мин бот сам напишет сообщение\n"
+        "• <code>будильник @юзер 60 [задача]</code> — завести будильник для конкретного юзера из админки"
+    )
+
 # --- КЭШИРОВАНИЕ И РЕЖИМ «ШПИОНА» ---
 def cache_incoming_message(message, is_owner):
     if len(MESSAGE_CACHE) >= MAX_CACHE_SIZE:
@@ -1280,6 +1323,11 @@ def build_panel_view():
     tw_status = f"🍿 Каждые {tw_interval} сообщ." if tw_interval > 0 else "🔴 ВЫКЛ"
     voice_all_status = "🟢 ВКЛ (все чаты)" if voice_all_on else "⚪ По команде «рс» + Reply"
 
+    voice_users = list(CONFIG.get('voice_auto_users', {}).keys())
+    voice_users_str = ", ".join([f"@{u}" for u in voice_users]) if voice_users else "нет"
+    bl_users = list(CONFIG.get('blacklist', {}).keys())
+    bl_str = f"{len(bl_users)} чел." if bl_users else "пусто"
+
     active_cooldowns = sum(1 for v in EXHAUSTED_QUOTAS.values() if v > time.time())
     real_now_model = get_current_working_model()
 
@@ -1291,9 +1339,13 @@ def build_panel_view():
         f"🎓 <b>Обученный стиль:</b> {'✅ Настроен' if learned else '⚪ Не задан'}\n"
         f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)} шт.\n"
         f"🕵️‍♂️ <b>Режим Шпиона:</b> {spy_status}\n"
-        f"🎙 <b>ГС и кружки:</b> {voice_all_status}\n\n"
+        f"🎙 <b>ГС и кружки:</b> {voice_all_status}\n"
+        f"👥 <b>Авто-ГС юзеры:</b> <code>{voice_users_str}</code>\n"
+        f"🚫 <b>Черный список:</b> {bl_str}\n\n"
         f"🧠 <b>Базовая модель:</b> <code>{ACTIVE_MODEL}</code> (сейчас: <code>{real_now_model}</code>)\n"
-        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в паузе: {active_cooldowns})"
+        f"🎨 <b>Фото-модель:</b> <code>{CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)}</code>\n"
+        f"🔑 <b>Пул ключей:</b> <b>{len(GEMINI_KEYS)} шт.</b> (в паузе: {active_cooldowns})\n"
+        f"⏱ <b>КД:</b> {CONFIG.get('cooldown_seconds', 5)} сек | <b>Память:</b> {CONFIG.get('context_limit', 100)} сообщ. (чатов: {len(CHAT_MEMORY)})"
     )
 
     kb = InlineKeyboardMarkup(row_width=2)
@@ -1302,7 +1354,7 @@ def build_panel_view():
         InlineKeyboardButton(f"🥷 Стелс: {'ВКЛ 🥷' if stealth_on else 'ВЫКЛ ⚪'}", callback_data="panel_toggle_stealth")
     )
     kb.add(
-        InlineKeyboardButton(f"🎓 Обучение ИИ {'(АКТИВНО)' if TRAINING_MODE_ACTIVE else ''}", callback_data="panel_start_training"),
+        InlineKeyboardButton(f"🎓 Обучение ИИ {'(ВКЛ)' if TRAINING_MODE_ACTIVE else ''}", callback_data="panel_start_training"),
         InlineKeyboardButton(f"🍿 5 копеек: {f'{tw_interval} СМС' if tw_interval else 'ВЫКЛ'}", callback_data="panel_cycle_tw")
     )
     kb.add(
@@ -1311,12 +1363,17 @@ def build_panel_view():
     )
     kb.add(
         InlineKeyboardButton("🔑 Статус ключей", callback_data="panel_keys_status"),
-        InlineKeyboardButton("🧠 Сменить модель", callback_data="panel_models")
+        InlineKeyboardButton("🧠 Текст-модели", callback_data="panel_models")
     )
     kb.add(
-        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all"),
-        InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh")
+        InlineKeyboardButton("🎨 Фото-модели", callback_data="panel_img_models"),
+        InlineKeyboardButton("📋 Списки и Промпт", callback_data="panel_show_lists")
     )
+    kb.add(
+        InlineKeyboardButton("📜 Все команды", callback_data="panel_show_help"),
+        InlineKeyboardButton("🧹 Очистить ВСЕ чаты", callback_data="panel_clear_all")
+    )
+    kb.add(InlineKeyboardButton("🔄 Обновить панель", callback_data="panel_refresh"))
     return text, kb
 
 def build_keys_status_view(ping_results=None):
@@ -1451,11 +1508,20 @@ def handle_admin_text(message):
 
     remove_old_reply_keyboard(chat_id)
 
+    # 1. ВСЕ КОМАНДЫ АДМИНКИ СРАБАТЫВАЮТ ПЕРВЫМИ (даже если включен режим обучения!)
     if text in ['стоп', 'выйти', 'конец обучения', '/stop']:
         if TRAINING_MODE_ACTIVE:
             TRAINING_MODE_ACTIVE = False
             bot.reply_to(message, "🎓 <b>Режим обучения завершен.</b> Все правила сохранены в памяти бота!")
-            return
+        else:
+            bot.reply_to(message, "ℹ️ Режим обучения сейчас не был включен.")
+        return
+
+    if text in ['обучение сброс', 'сброс обучения']:
+        CONFIG['learned_persona'] = ''
+        save_config()
+        bot.reply_to(message, "🧹 Выученные правила стиля очищены.")
+        return
 
     if text in ['обучение', 'тренировка', 'учить']:
         TRAINING_MODE_ACTIVE = True
@@ -1470,47 +1536,49 @@ def handle_admin_text(message):
         )
         return
 
-    if text in ['обучение сброс', 'сброс обучения']:
-        CONFIG['learned_persona'] = ''
-        save_config()
-        bot.reply_to(message, "🧹 Выученные правила стиля очищены.")
-        return
-
-    if TRAINING_MODE_ACTIVE and not text.startswith(('команды', '/help', 'ключи', 'будильник', 'стелс', 'вставка')):
-        loading_msg = bot.reply_to(message, "🎓 Обновляю навыки...")
-        result_html = process_training_dialogue(chat_id, raw_text)
-        safe_edit_message(result_html, chat_id, loading_msg.message_id)
-        return
-
     if text in ['ключи', 'статус ключей', '/keys']:
         k_text, k_kb = build_keys_status_view()
         bot.send_message(chat_id, k_text, reply_markup=k_kb)
         return
 
-    if text in ['команды', '/help']:
+    if text in ['команды', '/help', 'помощь', 'хелп']:
+        bot.reply_to(message, get_full_commands_text())
+        return
+
+    if text == 'список':
+        v_users = list(CONFIG.get('voice_auto_users', {}).keys())
+        b_users = list(CONFIG.get('blacklist', {}).keys())
+        v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
+        b_str = ", ".join([f"@{u}" for u in b_users]) if b_users else "пусто"
+        sys_p = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
+        learned_p = CONFIG.get('learned_persona') or "не задано"
         bot.reply_to(
             message,
-            "📜 <b>Все команды управления:</b>\n\n"
-            "🎓 <b>Обучение и Режим Человека (Стелс):</b>\n"
-            "• <code>обучение</code> — войти в диалог обучения автоответчика (выход: <code>стоп</code>)\n"
-            "• <code>обучение сброс</code> — стереть выученные правила\n"
-            "• <code>стелс вкл</code> / <code>выкл</code> — режим Человека (без подписи модели и без пометки «изменено»)\n"
-            "• <code>шанс 75</code> — шанс ответа автоответчика в % (от 10 до 100)\n\n"
-            "🍿 <b>Третий собеседник и Судья (в чате):</b>\n"
-            "• <code>вставка 25</code> (или <code>вставка выкл</code>) — каждые 25 СМС бот сам вставляет «5 копеек» в чат\n"
-            "• <code>рассуди</code> (или <code>кто прав</code>) — разбор спора по последним 50 СМС\n"
-            "• <code>5 копеек</code> — мгновенный комментарий бота по текущей беседе\n"
-            "• <code>анализ</code> — психологический разбор последних 50 СМС чата\n\n"
-            "⏰ <b>ИИ-Будильник (пишет сам по таймеру):</b>\n"
-            "• В чате с человеком: <code>будильник 30 спроси как дела</code> (команда удалится, а через 30 мин бот напишет сам)\n"
-            "• В админке: <code>будильник @юзер 60 напомни про встречу</code>\n"
-            "• В админке себе: <code>будильник 15 разбуди меня на пары</code>\n\n"
-            "🎙 <b>Голосовые и Кружки:</b>\n"
-            "• Если ответить ГС/кружком реплаем на сообщение бота — он сам расшифрует и ответит в диалоге!\n"
-            "• <code>рс</code> реплаем — чистая текстовая расшифровка ГС\n"
-            "• <code>рс @юзер</code> / <code>рс все вкл</code> — постоянная авто-расшифровка\n\n"
-            "🎛 <b>Базовые:</b> <code>/panel</code>, <code>ключи</code>, <code>список</code>, <code>модели</code>, <code>таймер 5</code>, <code>кд 3</code>, <code>гпт [вопрос]</code>, <code>нарисуй [промпт]</code>"
+            f"📋 <b>Текущие списки и обучение:</b>\n\n"
+            f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
+            f"🚫 <b>Черный список:</b> {b_str}\n"
+            f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
+            f"🎓 <b>Выученный стиль (Обучение):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
+            f"🎭 <b>Базовый промпт:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>"
         )
+        return
+
+    if text == 'модели':
+        models = fetch_all_models()
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in models:
+            mark = "✅ " if m == ACTIVE_MODEL else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
+        bot.reply_to(message, f"Доступные чат-модели (всего {len(models)}):", reply_markup=kb)
+        return
+
+    if text in ['фото-модели', 'фото модели']:
+        image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in image_models:
+            mark = "✅ " if m == CONFIG.get('image_model') else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
+        bot.reply_to(message, "Модель рисования:", reply_markup=kb)
         return
 
     if text.startswith('стелс'):
@@ -1571,42 +1639,6 @@ def handle_admin_text(message):
             except ValueError:
                 pass
         bot.reply_to(message, "⚠️ Формат:\n• Себе: <code>будильник 15 разбуди меня</code>\n• Собеседнику: <code>будильник @юзер 30 спроси как дела</code>")
-        return
-
-    if text == 'список':
-        v_users = list(CONFIG.get('voice_auto_users', {}).keys())
-        b_users = list(CONFIG.get('blacklist', {}).keys())
-        v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
-        b_str = ", ".join([f"@{u}" for u in b_users]) if b_users else "пусто"
-        sys_p = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
-        learned_p = CONFIG.get('learned_persona') or "не задано"
-        bot.reply_to(
-            message,
-            f"📋 <b>Текущие списки и обучение:</b>\n\n"
-            f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
-            f"🚫 <b>Черный список:</b> {b_str}\n"
-            f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
-            f"🎓 <b>Выученный стиль (Обучение):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
-            f"🎭 <b>Базовый промпт:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>"
-        )
-        return
-
-    if text == 'модели':
-        models = fetch_all_models()
-        kb = InlineKeyboardMarkup(row_width=1)
-        for m in models:
-            mark = "✅ " if m == ACTIVE_MODEL else ""
-            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setmodel_{m}"))
-        bot.reply_to(message, f"Доступные чат-модели (всего {len(models)}):", reply_markup=kb)
-        return
-
-    if text in ['фото-модели', 'фото модели']:
-        image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
-        kb = InlineKeyboardMarkup(row_width=1)
-        for m in image_models:
-            mark = "✅ " if m == CONFIG.get('image_model') else ""
-            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
-        bot.reply_to(message, "Модель рисования:", reply_markup=kb)
         return
 
     if text.startswith('таймер '):
@@ -1781,6 +1813,13 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", message.chat.id, loading_msg.message_id)
         return
 
+    # 2. ЕСЛИ ЭТО НЕ КОМАНДА, И ВКЛЮЧЕН РЕЖИМ ОБУЧЕНИЯ — ОБУЧАЕМ БОТА
+    if TRAINING_MODE_ACTIVE:
+        loading_msg = bot.reply_to(message, "🎓 Обновляю навыки...")
+        result_html = process_training_dialogue(chat_id, raw_text)
+        safe_edit_message(result_html, chat_id, loading_msg.message_id)
+        return
+
 # --- ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК АДМИНКИ ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
@@ -1877,6 +1916,44 @@ def handle_callbacks(call):
         safe_edit_message(f"🧠 <b>Выбери базовую чат-модель (всего {len(models)}):</b>", chat_id, msg_id, reply_markup=kb)
         bot.answer_callback_query(call.id)
 
+    elif data == 'panel_img_models':
+        image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
+        kb = InlineKeyboardMarkup(row_width=1)
+        for m in image_models:
+            mark = "✅ " if m == CONFIG.get('image_model') else ""
+            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
+        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+        safe_edit_message("🎨 <b>Выбери модель рисования:</b>", chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+
+    elif data == 'panel_show_lists':
+        v_users = list(CONFIG.get('voice_auto_users', {}).keys())
+        b_users = list(CONFIG.get('blacklist', {}).keys())
+        v_str = ", ".join([f"@{u}" for u in v_users]) if v_users else "пусто"
+        b_str = ", ".join([f"@{u}" for u in b_users]) if b_users else "пусто"
+        sys_p = CONFIG.get('system_prompt', DEFAULT_SYSTEM_PROMPT)
+        learned_p = CONFIG.get('learned_persona') or "не задано"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+        safe_edit_message(
+            f"📋 <b>Текущие списки и обучение:</b>\n\n"
+            f"🎙 <b>Авто-ГС юзеры:</b> {v_str}\n"
+            f"🚫 <b>Черный список:</b> {b_str}\n"
+            f"⏰ <b>Активных будильников:</b> {len(ACTIVE_ALARMS)}\n\n"
+            f"🎓 <b>Выученный стиль (Обучение):</b>\n<blockquote>{html.escape(learned_p)}</blockquote>\n\n"
+            f"🎭 <b>Базовый промпт:</b>\n<blockquote>{html.escape(sys_p)}</blockquote>",
+            chat_id,
+            msg_id,
+            reply_markup=kb
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data == 'panel_show_help':
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+        safe_edit_message(get_full_commands_text(), chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+
     elif data == 'panel_clear_all':
         clear_all_memory_firebase()
         text, kb = build_panel_view()
@@ -1893,8 +1970,9 @@ def handle_callbacks(call):
     elif data.startswith('setimg_'):
         CONFIG['image_model'] = data.replace('setimg_', '')
         save_config()
-        bot.edit_message_text(f"✅ Рисование: <b>{CONFIG['image_model']}</b>", chat_id, msg_id)
-        bot.answer_callback_query(call.id, "Модель рисования изменена")
+        text, kb = build_panel_view()
+        safe_edit_message(text, chat_id, msg_id, reply_markup=kb)
+        bot.answer_callback_query(call.id, f"Рисование: {CONFIG['image_model']}")
 
 # --- ОБРАБОТКА ФОТО-АЛЬБОМОВ ---
 def process_business_album(media_group_id):
@@ -2217,5 +2295,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Обучение + Стелс + 5 копеек + Будильник активны.')
+print(f'⚡ БОТ ЗАПУЩЕН! Ключей Gemini: {len(GEMINI_KEYS)} | Полный пакет команд активен.')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
