@@ -278,10 +278,6 @@ def get_speaker_tag(user, is_owner):
     return f"[Собеседник {full_name} ({uname})]"
 
 def record_chat_log(message, is_owner, custom_text=None, add_to_memory=True):
-    """
-    Записывает сообщение в лог чата (CHAT_LOG) для '5 копеек'/'рассуди'.
-    В CHAT_MEMORY записывает только если это обычная реплика (не команда 'гпт', т.к. 'гпт' сам сохраняет вопрос-ответ).
-    """
     chat_id = int(message.chat.id)
     user = message.from_user
     if not user:
@@ -329,15 +325,15 @@ def record_chat_log(message, is_owner, custom_text=None, add_to_memory=True):
 
 def build_gpt_system_instruction():
     """
-    Чистая системная инструкция ТОЛЬКО для обычного вызова 'гпт'.
-    Обучение автоответчика и стелс-режим сюда НЕ попадают!
+    Чистая системная инструкция ТОЛЬКО для обычного вызова 'гпт' (работает одинаково и на Gemini, и на Groq).
+    Никаких принудительных матов и никакого обучения автоответчика!
     """
     base = CONFIG.get('system_prompt') or DEFAULT_SYSTEM_PROMPT
     tg_context = (
         "КОНТЕКСТ СРЕДЫ:\n"
         f"1. Ты находишься в мессенджере Telegram (аккаунт владельца @{CREATOR_USERNAME}).\n"
         f"2. В истории чата перед сообщениями указано, кто пишет: `[Владелец аккаунта @{CREATOR_USERNAME}]` или `[Собеседник Имя (@юзернейм)]`.\n"
-        "3. Четко различай, кто именно задает тебе вопрос. Пиши сразу чистый ответ без меток `[Бот]:` в начале."
+        "3. Четко различай, кто именно задает тебе вопрос, и отвечай на русском языке. Пиши сразу чистый ответ без технических меток в начале."
     )
     return f"{base}\n\n{tg_context}"
 
@@ -349,26 +345,23 @@ def build_autoreply_system_instruction():
     stealth = CONFIG.get('stealth_mode', True)
 
     parts = [
-        f"Ты — автоответчик и живой собеседник в личных сообщениях Telegram на аккаунте владельца @{CREATOR_USERNAME}.",
-        "В истории чата видно, где писал `[Владелец аккаунта]`, а где `[Собеседник ...]`. Сейчас ты отвечаешь собеседнику от лица аккаунта владельца (или как его представитель, согласно правилам ниже).",
-        "Никогда не пиши в начале ответа технические метки вроде `[Ответ]:` или `[Владелец]:` — выводи только сам текст сообщения."
+        f"Ты ведешь переписку в личных сообщениях Telegram на аккаунте владельца @{CREATOR_USERNAME}.",
+        "В истории чата видно, где писал `[Владелец аккаунта]`, а где `[Собеседник ...]`. Сейчас ты отвечаешь собеседнику.",
+        "Никогда не пиши в начале ответа технические метки вроде `[Ответ]:` или `[Владелец]:` — выводи только сам текст сообщения на русском языке."
     ]
 
     if learned:
         parts.append(
-            f"ГЛАВНЫЕ ПРАВИЛА СТИЛЯ И ПОВЕДЕНИЯ (СТРОГО ИХ ВЫПОЛНЯЙ):\n{learned}"
+            f"ПРАВИЛА СТИЛЯ И ПОВЕДЕНИЯ:\n{learned}"
         )
     else:
         parts.append(
-            "Общайся живо, естественно, как реальный человек в Телеграме, на русском языке."
+            "Общайся живо, естественно, как обычный человек в Телеграме."
         )
 
     if stealth:
         parts.append(
-            "ВАЖНО (РЕЖИМ ЧЕЛОВЕКА):\n"
-            "• Максимально имитируй живого человека в переписке.\n"
-            "• Никогда не признавайся, что ты ИИ, бот или автоответчик.\n"
-            "• Не используй шаблонные фразы ИИ и канцелярит."
+            "Стиль общения: пиши кратко и естественно, как живой собеседник в мессенджере, без длинных списков и шаблонных фраз."
         )
 
     return "\n\n".join(parts)
@@ -417,7 +410,6 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
 
 def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False):
     reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*|Собеседник[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
-    # Убираем блоки <think>...</think>, если рассуждающая модель Groq решила их вывести
     reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
@@ -768,14 +760,6 @@ def transcribe_with_groq_whisper(audio_bytes, mime_type):
 
 # --- РАЗДЕЛЬНЫЙ МАРШРУТИЗАТОР ИИ (ОБЫЧНЫЙ ГПТ vs АВТООТВЕТЧИК) ---
 def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply=False, custom_sys_prompt=None):
-    """
-    Если is_autoreply=True:
-      - использует отдельную модель CONFIG['auto_reply_model'] (по умолчанию быстрый Groq gpt-oss-120b)
-      - использует обученный стиль learned_persona
-    Если is_autoreply=False (обычный вызов 'гпт'):
-      - использует ACTIVE_MODEL (по умолчанию Gemini 3.8)
-      - использует ЧИСТЫЙ системный промпт (без обучения автоответчика и без стелса!)
-    """
     chat_id = int(chat_id)
     target_model = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b') if is_autoreply else ACTIVE_MODEL
     sys_prompt = custom_sys_prompt or (build_autoreply_system_instruction() if is_autoreply else build_gpt_system_instruction())
@@ -972,7 +956,7 @@ def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys
 
     return None, f"Серверы Google перегружены ({last_error}). Подожди 15 секунд и повтори.", base_m, 0
 
-# --- GROQ API (С КАСКАДОМ МОДЕЛЕЙ ДЛЯ АВТООТВЕТЧИКА) ---
+# --- GROQ API (ЧИСТЫЙ ПРОМПТ ДЛЯ ГПТ + ОБУЧЕНИЕ ДЛЯ АВТООТВЕТЧИКА) ---
 def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply=False, custom_sys_prompt=None, chosen_groq_model=None):
     chat_id = int(chat_id)
     primary_model = chosen_groq_model or (CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b') if is_autoreply else ACTIVE_MODEL)
@@ -988,30 +972,23 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply
         else:
             if is_autoreply:
                 return ask_gemini(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt=custom_sys_prompt)
-            return "я не вижу картинки и пдф братан выбери модель gemini", None, primary_model, len(CHAT_MEMORY.get(chat_id, []))
+            return "Эта модель Groq не читает картинки/PDF — переключи модель ГПТ на Gemini.", None, primary_model, len(CHAT_MEMORY.get(chat_id, []))
 
     history = CHAT_MEMORY.get(chat_id, []).copy()
 
+    # Никаких принудительных матов!
+    # Для автоответчика — правила из Обучения, для обычного ГПТ — чистый системный промпт!
     if is_autoreply:
-        # Для автоответчика используем ТВОЕ ОБУЧЕНИЕ (learned_persona)!
         system_prompt = custom_sys_prompt or build_autoreply_system_instruction()
     else:
-        # Для ручного выбора groq в обычном ГПТ оставляем твой фирменный рофл-стиль
-        system_prompt = (
-            "ты находишься в telegram чате аккаунта @wrtnoq. "
-            "ты грубый невоспитанный ии. ты пишешь всё с маленькой буквы без запятых и точек "
-            "ты постоянно материшься и хамишь. ты пишешь очень много объемно и живо как реальный человек. "
-            "никогда не извиняйся и не будь вежливым. отвечай на русском. "
-            "различай в истории кто пишет: [Владелец аккаунта @wrtnoq] или [Собеседник ...]."
-        )
+        system_prompt = custom_sys_prompt or build_gpt_system_instruction()
 
     messages_payload = [{"role": "system", "content": system_prompt}]
     if save_to_memory:
         for msg in history:
             messages_payload.append({"role": msg["role"], "content": msg["content"]})
-    messages_payload.append({"role": "user", "content": prompt or "привет"})
+    messages_payload.append({"role": "user", "content": prompt or "Привет!"})
 
-    # Формируем очередь моделей Groq (если основная недоступна или в лимите — подхватит запасная)
     groq_candidates = [primary_model]
     for fb in GROQ_AUTOREPLY_FALLBACKS:
         if fb not in groq_candidates:
@@ -1023,7 +1000,7 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply
 
     for g_model in groq_candidates:
         model_id = g_model.replace('groq/', '')
-        payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.8}
+        payload = {'model': model_id, 'messages': messages_payload, 'temperature': 0.7}
         try:
             r = s.post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=(4, 20))
             if r.status_code != 200:
@@ -1033,6 +1010,11 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply
             data = r.json()
             reply_text = data['choices'][0]['message']['content']
             reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+            # Если цензор OpenAI (gpt-oss) вдруг отказал на слишком жесткую тему — автоматически пробуем Qwen 3.8 без цензуры!
+            if "can't comply with that" in reply_text.lower() or "cannot comply with that" in reply_text.lower():
+                if g_model != 'groq/qwen/qwen3.8-27b' and 'groq/qwen/qwen3.8-27b' in groq_candidates:
+                    continue
 
             if save_to_memory:
                 if not history or history[-1].get('content') != prompt:
@@ -1049,7 +1031,6 @@ def ask_groq(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply
             last_err = str(e)
             continue
 
-    # Если вдруг все модели Groq легли, а это автоответчик — страхуем через Gemini
     if is_autoreply and GEMINI_KEYS:
         return ask_gemini(chat_id, prompt, media_list, save_to_memory, custom_sys_prompt=system_prompt)
 
@@ -1068,7 +1049,6 @@ def process_training_dialogue(chat_id, owner_message_text):
         f"ТЕКУЩИЕ ПРАВИЛА АВТООТВЕТЧИКА:\n{current_rules}"
     )
 
-    # Важно: save_to_memory=False, чтобы тренировка не засоряла память обычного чата!
     reply, err, _, _ = ask_gemini(
         chat_id,
         f"Сообщение владельца на тренировке автоответчика: {owner_message_text}",
@@ -1284,7 +1264,6 @@ def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=
 
     speaker = get_speaker_tag(voice_msg.from_user, is_owner)
 
-    # Если это автоответчик на Groq — быстро расшифровываем через Groq Whisper и отвечаем моделью автоответчика!
     if is_autoreply_context and GROQ_API_KEY:
         transcript_text = transcribe_with_groq_whisper(media_bytes, mime_type)
         if transcript_text:
@@ -1301,7 +1280,6 @@ def handle_voice_conversational_reply(chat_id, voice_msg, is_owner, business_id=
                 send_long_response(reply, footer, chat_id, loading_msg_id, business_id, reply_to_msg_id=voice_msg.message_id if use_stealth else None, is_autoreply=True)
                 return
 
-    # Иначе обрабатываем через Gemini (для обычного ГПТ или кружочков)
     prompt = (
         f"{speaker} ответил(а) тебе голосовым/видеосообщением в чате Telegram.\n"
         "1. Внутри тегов <transcript>...</transcript> напиши дословную расшифровку его речи.\n"
@@ -1740,7 +1718,6 @@ def handle_admin_text(message):
 
     if text in ['авто-модели', 'авто модели', 'модели авто']:
         models = fetch_all_models()
-        # Поднимаем модели Groq наверх списка для удобства
         groq_first = sorted([m for m in models if m.startswith('groq/')]) + sorted([m for m in models if not m.startswith('groq/')])
         ar_cur = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b')
         kb = InlineKeyboardMarkup(row_width=1)
@@ -1866,7 +1843,6 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🕵️‍♂️ Режим Шпиона: {'🟢 ВКЛ' if CONFIG['spy_enabled'] else '🔴 ВЫКЛ'}")
         return
 
-    # УПРАВЛЕНИЕ АВТООТВЕТЧИКОМ: ДЛЯ ОТДЕЛЬНЫХ ЮЗЕРОВ (@username) И ДЛЯ ВСЕХ
     if text.startswith('автоответчик') or text.startswith('ао '):
         if '@' in text:
             uname = text.split('@')[-1].split()[0].strip().lower()
@@ -1979,7 +1955,6 @@ def handle_admin_text(message):
         bot.reply_to(message, "✅ Разбанен.")
         return
 
-    # Сброс конкретного юзера из админки: "сброс @юзер"
     if text.startswith('сброс @'):
         uname = text.split('@')[-1].strip().lower()
         known = CONFIG.get('known_chats', {}).get(uname)
@@ -1990,7 +1965,6 @@ def handle_admin_text(message):
             bot.reply_to(message, f"⚠️ Чат с @{uname} не найден. Используй <code>сброс все</code>.")
         return
 
-    # В админке и "сброс", и "сброс все" очищают память во всех чатах, чтобы у собеседников не оставался старый контекст!
     if text in ['сброс', 'гпт сброс', 'сброс все', 'очистить все']:
         clear_all_memory_firebase()
         bot.reply_to(message, f"🧹 Память во всех чатах (у тебя и у собеседников) полностью очищена!\ncontext: 0/{CONFIG.get('context_limit', 100)}")
@@ -2289,7 +2263,7 @@ def process_business_album(media_group_id):
     is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
-    trigger_mode = None  # 'gpt' или 'auto'
+    trigger_mode = None
     if is_gpt or is_reply_to_gpt:
         trigger_mode = 'gpt'
     elif is_reply_to_auto:
@@ -2370,7 +2344,6 @@ def handle_business_message(message):
     is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
     is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto
 
-    # ПОЛНЫЙ СБРОС ОБЩЕГО КОНТЕКСТА ЧАТА (И ДЛЯ ВЛАДЕЛЬЦА, И ДЛЯ СОБЕСЕДНИКА!)
     if lower_text in ['сброс', 'гпт сброс', '/reset']:
         reset_single_chat_memory(chat_id)
         msg = bot.send_message(
@@ -2381,7 +2354,6 @@ def handle_business_message(message):
         BOT_GPT_MESSAGES.add(msg.message_id)
         return
 
-    # Быстрое скрытое включение/выключение автоответчика прямо внутри чата с собеседником: "ао вкл" / "ао выкл"
     if is_owner and lower_text in ['ао вкл', 'ао выкл', 'автоответчик вкл', 'автоответчик выкл']:
         try:
             bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
@@ -2454,7 +2426,7 @@ def handle_business_message(message):
             handle_voice_transcription(chat_id, rep, custom_q, business_id=message.business_connection_id)
             return
 
-    # 3. КОМАНДЫ «РАССУДИ», «5 КОПЕЕК», «АНАЛИЗ» (ручной вызов всегда показывает model/context)
+    # 3. КОМАНДЫ «РАССУДИ», «5 КОПЕЕК», «АНАЛИЗ»
     if lower_text in ['рассуди', 'гпт рассуди', 'кто прав', 'гпт кто прав']:
         run_chat_analysis_action(chat_id, 'judge', business_id=message.business_connection_id, trigger_msg_id=message.message_id, is_auto_5kop=False)
         return
@@ -2471,7 +2443,6 @@ def handle_business_message(message):
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
     is_draw = lower_text.startswith('нарисуй ')
     clean_for_log = text[4:].strip() if is_gpt else text
-    # Если это не прямой вызов ИИ — сохраняем фоновую реплику в память, чтобы общий контекст чата был полным
     record_chat_log(message, is_owner, custom_text=clean_for_log, add_to_memory=not (is_gpt or is_draw or is_reply_to_any_bot))
 
     tw_interval = CONFIG.get('third_wheel_interval', 0)
@@ -2496,9 +2467,6 @@ def handle_business_message(message):
 
     afk_seconds = CONFIG.get('afk_minutes', 10) * 60
 
-    # Определяем режим срабатывания:
-    # - 'gpt': команда "гпт ..." или Reply на сообщение ГПТ (ВСЕГДА с часиками, с context/model и без обучения автоответчика!)
-    # - 'auto': Reply собеседника на сообщение автоответчика ИЛИ автоответчик по таймеру AFK
     trigger_mode = None
     if is_gpt or is_draw or is_reply_to_gpt:
         trigger_mode = 'gpt'
@@ -2592,7 +2560,7 @@ def handle_business_message(message):
             text = "Опиши, что на этом фото."
 
     elif message.reply_to_message and message.reply_to_message.photo:
-        img_bytes, mime = get_photo_bytes(message)
+        img_bytes, mime = get_photo_bytes(message.reply_to_message)
         if img_bytes:
             media_list.append((img_bytes, mime))
         if not text:
@@ -2643,5 +2611,5 @@ try:
 except Exception:
     pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Раздельный режим активен).')
+print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Groq без матерного блока).')
 bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
