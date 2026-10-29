@@ -2604,6 +2604,582 @@ def handle_business_message(message):
         )
     elif loading_msg_id:
         safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg_id, message.business_connection_id)
+# =====================================================================
+# 🃏 ИГРА «ПОДКИДНОЙ ДУРАК» НА КЛИКАБЕЛЬНЫХ СМАЙЛИКАХ (PvE + PvP)
+# =====================================================================
+DURAK_GAMES = {}
+DURAK_SUITS = ['♠️', '♣️', '♥️', '♦️']
+DURAK_RANKS = [
+    ('6', 6), ('7', 7), ('8', 8), ('9', 9), ('10', 10),
+    ('В', 11), ('Д', 12), ('К', 13), ('Т', 14)
+]
+
+def durak_card_label(card, trump_suit):
+    """Форматирует карту в смайлик (козырь помечается огоньком 🔥)."""
+    r_name, _, suit = card
+    return f"{r_name}{suit}🔥" if suit == trump_suit else f"{r_name}{suit}"
+
+def durak_can_beat(atk_card, def_card, trump_suit):
+    """Проверяет, бьет ли карта защиты карту атаки."""
+    _, a_val, a_suit = atk_card
+    _, d_val, d_suit = def_card
+    if a_suit == d_suit:
+        return d_val > a_val
+    if d_suit == trump_suit and a_suit != trump_suit:
+        return True
+    return False
+
+def durak_sort_hand(hand, trump_suit):
+    """Сортирует карты в руке: сначала обычные по возрастанию, справа — козыри."""
+    hand.sort(key=lambda c: (1 if c[2] == trump_suit else 0, c[1], c[2]))
+
+def durak_table_ranks(table):
+    """Возвращает все достоинства карт, которые уже лежат на столе."""
+    ranks = set()
+    for atk, dfn in table:
+        ranks.add(atk[0])
+        if dfn:
+            ranks.add(dfn[0])
+    return ranks
+
+def durak_refill_hands(game):
+    """Добирает карты из колоды до 6 штук (сначала атакующему, затем защищающемуся)."""
+    deck = game['deck']
+    order = ['p1', 'p2'] if game['attacker'] == 'p1' else ['p2', 'p1']
+    for who in order:
+        hand = game[f'{who}_hand']
+        while len(hand) < 6 and deck:
+            hand.append(deck.pop(0))
+        durak_sort_hand(hand, game['trump_suit'])
+
+def durak_check_winner(game):
+    """Проверяет, закончилась ли игра, когда колода пуста."""
+    if game['deck']:
+        return None
+    p1_empty = (len(game['p1_hand']) == 0)
+    p2_empty = (len(game['p2_hand']) == 0)
+    if p1_empty and p2_empty:
+        return "🤝 <b>Ничья!</b> Оба игрока вышли одновременно!"
+    if p1_empty:
+        return f"🏆 <b>Победил {html.escape(game['p1_name'])}!</b>\n🤡 {html.escape(game['p2_name'])} остался в дураках!"
+    if p2_empty:
+        return f"🏆 <b>Победил {html.escape(game['p2_name'])}!</b>\n🤡 {html.escape(game['p1_name'])} остался в дураках!"
+    return None
+
+def durak_bot_ai_turn(game):
+    """Логика хода и защиты ИИ-бота в режиме против Бота."""
+    trump = game['trump_suit']
+    table = game['table']
+    bot_hand = game['p2_hand']
+
+    # Случай 1: Бот защищается от непокрытой карты
+    if game['attacker'] == 'p1' and table and table[-1][1] is None:
+        atk_card = table[-1][0]
+        valid = [idx for idx, c in enumerate(bot_hand) if durak_can_beat(atk_card, c, trump)]
+        if valid:
+            best_idx = valid[0]
+            chosen = bot_hand.pop(best_idx)
+            table[-1][1] = chosen
+            game['status'] = f"🤖 Бот отбился картой <b>{durak_card_label(chosen, trump)}</b>! Подкидывай или жми «✅ Бито»."
+        else:
+            # Бот забирает все карты со стола
+            for a_c, d_c in table:
+                bot_hand.append(a_c)
+                if d_c:
+                    bot_hand.append(d_c)
+            table.clear()
+            durak_refill_hands(game)
+            game['status'] = "📥 <b>Бот не смог отбиться и забрал карты!</b> Твой ход!"
+        return
+
+    # Случай 2: Бот атакует или подкидывает
+    if game['attacker'] == 'p2':
+        if not table:
+            if not bot_hand:
+                return
+            chosen = bot_hand.pop(0)
+            table.append([chosen, None])
+            game['status'] = f"⚔️ Бот походил: <b>{durak_card_label(chosen, trump)}</b>. Чем будешь крыть?"
+        else:
+            # Бот думает, подкинуть ли еще карту после твоей защиты
+            t_ranks = durak_table_ranks(table)
+            can_throw = [
+                idx for idx, c in enumerate(bot_hand)
+                if c[0] in t_ranks and (c[2] != trump or len(game['deck']) == 0)
+            ]
+            if can_throw and len(game['p1_hand']) > 0 and len(table) < 6:
+                chosen = bot_hand.pop(can_throw[0])
+                table.append([chosen, None])
+                game['status'] = f"😈 Бот подкинул: <b>{durak_card_label(chosen, trump)}</b>! Отбивайся!"
+            else:
+                table.clear()
+                game['attacker'] = 'p1'
+                durak_refill_hands(game)
+                game['status'] = "✅ <b>Бот сказал «Бито»!</b> Теперь твоя очередь ходить!"
+
+def durak_build_text(game, viewer_role):
+    """Собирает красивое текстовое табло стола."""
+    trump = game['trump_suit']
+    trump_lbl = durak_card_label(game['trump_card'], trump)
+    deck_cnt = len(game['deck'])
+
+    opp_role = 'p2' if viewer_role == 'p1' else 'p1'
+    opp_name = game[f'{opp_role}_name']
+    opp_cnt = len(game[f'{opp_role}_hand'])
+    opp_cards_visual = "🂠 " * min(opp_cnt, 10) if opp_cnt > 0 else "<i>(пусто)</i>"
+
+    table_lines = []
+    if not game['table']:
+        table_lines.append("<i>🟢 Стол чист — ожидание хода...</i>")
+    else:
+        for idx, (atk, dfn) in enumerate(game['table'], 1):
+            a_str = durak_card_label(atk, trump)
+            d_str = durak_card_label(dfn, trump) if dfn else "⏳ <i>ждет защиты...</i>"
+            table_lines.append(f"  {idx}. <b>{a_str}</b>  ➔  <b>{d_str}</b>")
+
+    turn_who = game['p1_name'] if (
+        (game['attacker'] == 'p1' and (not game['table'] or game['table'][-1][1] is not None)) or
+        (game['attacker'] == 'p2' and game['table'] and game['table'][-1][1] is None)
+    ) else game['p2_name']
+
+    return (
+        f"🃏 <b>ПОДКИДНОЙ ДУРАК</b>\n"
+        f"📦 Колода: <b>{deck_cnt}</b> шт. | Козырь: <b>{trump_lbl}</b>\n"
+        f"👤 Соперник (<b>{html.escape(opp_name)}</b>): <b>{opp_cnt}</b> карт {opp_cards_visual}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🍽 <b>На столе:</b>\n" + "\n".join(table_lines) + "\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💬 {game['status']}\n"
+        f"👉 Сейчас очередь: <b>{html.escape(turn_who)}</b>"
+    )
+
+def durak_build_keyboard(game, screen_type):
+    """
+    Формирует кликабельные смайлик-кнопки:
+    - 'bot_game': игра против бота (открытые смайлик-карты игрока)
+    - 'pvp_dm': секретный экран владельца в ЛС бота (открытые смайлик-карты владельца)
+    - 'pvp_chat': общий экран в чате (смайлик-карты собеседника + секретные слоты владельца)
+    """
+    cid = game['chat_id']
+    trump = game['trump_suit']
+    kb = InlineKeyboardMarkup(row_width=4)
+
+    if game.get('finished'):
+        kb.add(InlineKeyboardButton("🔄 Сыграть еще раз", callback_data=f"durak_menu_{cid}"))
+        return kb
+
+    table = game['table']
+    uncovered = (len(table) > 0 and table[-1][1] is None)
+    atk_role = game['attacker']
+    def_role = 'p2' if atk_role == 'p1' else 'p1'
+
+    # 1. Кнопки действий («Бито!» или «Беру!»)
+    action_btns = []
+    if table and not uncovered:
+        action_btns.append(InlineKeyboardButton("✅ Бито! (Отбой)", callback_data=f"durak_bito_{cid}"))
+    if uncovered:
+        action_btns.append(InlineKeyboardButton("📥 Беру! (Забрать стол)", callback_data=f"durak_take_{cid}"))
+    if action_btns:
+        kb.row(*action_btns)
+
+    # 2. Кнопки карт в зависимости от экрана
+    if screen_type in ('bot_game', 'pvp_dm'):
+        hand = game['p1_hand']
+        btns = [
+            InlineKeyboardButton(durak_card_label(c, trump), callback_data=f"durak_play_{cid}_p1_{i}")
+            for i, c in enumerate(hand)
+        ]
+        for i in range(0, len(btns), 4):
+            kb.row(*btns[i:i + 4])
+    elif screen_type == 'pvp_chat':
+        # На общем экране: смайлик-карты Собеседника (p2)
+        p2_hand = game['p2_hand']
+        p2_btns = [
+            InlineKeyboardButton(durak_card_label(c, trump), callback_data=f"durak_play_{cid}_p2_{i}")
+            for i, c in enumerate(p2_hand)
+        ]
+        for i in range(0, len(p2_btns), 4):
+            kb.row(*p2_btns[i:i + 4])
+
+        # Секретная панель для Владельца (p1) прямо в чате, чтобы не светить свои карты!
+        kb.row(InlineKeyboardButton("👁 Мои карты (Секретно без палева)", callback_data=f"durak_peek_{cid}"))
+        p1_hand = game['p1_hand']
+        if p1_hand:
+            secret_btns = [
+                InlineKeyboardButton(f"🎴#{i + 1}", callback_data=f"durak_play_{cid}_p1_{i}")
+                for i in range(len(p1_hand))
+            ]
+            for i in range(0, len(secret_btns), 6):
+                kb.row(*secret_btns[i:i + 6])
+
+    kb.row(InlineKeyboardButton("🏳️ Завершить игру", callback_data=f"durak_stop_{cid}"))
+    return kb
+
+def durak_sync_screens(game):
+    """Синхронно обновляет игровой стол в чате и секретный стол в ЛС бота."""
+    cid = game['chat_id']
+    biz_id = game.get('biz_id')
+
+    if game['mode'] == 'bot':
+        text = durak_build_text(game, 'p1')
+        kb = durak_build_keyboard(game, 'bot_game')
+        if game.get('chat_msg_id'):
+            safe_edit_message(text, cid, game['chat_msg_id'], business_id=biz_id, reply_markup=kb)
+    else:
+        # PvP: обновляем стол в бизнес-чате (для собеседника)
+        chat_text = durak_build_text(game, 'p2')
+        chat_kb = durak_build_keyboard(game, 'pvp_chat')
+        if game.get('chat_msg_id'):
+            safe_edit_message(chat_text, cid, game['chat_msg_id'], business_id=biz_id, reply_markup=chat_kb)
+
+        # PvP: обновляем секретный стол владельца в ЛС бота
+        if CREATOR_ID and game.get('dm_msg_id'):
+            dm_text = durak_build_text(game, 'p1')
+            dm_kb = durak_build_keyboard(game, 'pvp_dm')
+            safe_edit_message(dm_text, CREATOR_ID, game['dm_msg_id'], business_id=None, reply_markup=dm_kb)
+
+def start_new_durak_game(chat_id, biz_id, mode, starter_user, msg_id_to_edit=None):
+    """Создает колоду, раздает по 6 карт, определяет козырь и запускает партию."""
+    deck = [(r_name, r_val, s) for s in DURAK_SUITS for (r_name, r_val) in DURAK_RANKS]
+    random.shuffle(deck)
+
+    p1_hand = [deck.pop(0) for _ in range(6)]
+    p2_hand = [deck.pop(0) for _ in range(6)]
+    trump_card = deck[-1]
+    trump_suit = trump_card[2]
+
+    durak_sort_hand(p1_hand, trump_suit)
+    durak_sort_hand(p2_hand, trump_suit)
+
+    if mode == 'bot':
+        p1_id = starter_user.id
+        p1_name = starter_user.first_name or "Игрок"
+        p2_id = 0
+        p2_name = "🤖 Бот"
+    else:
+        p1_id = CREATOR_ID
+        p1_name = f"@{CREATOR_USERNAME}"
+        p2_id = None if starter_user.id == CREATOR_ID else starter_user.id
+        p2_name = "Собеседник" if starter_user.id == CREATOR_ID else (starter_user.first_name or "Собеседник")
+
+    game = {
+        'chat_id': int(chat_id),
+        'biz_id': biz_id,
+        'mode': mode,
+        'deck': deck,
+        'trump_card': trump_card,
+        'trump_suit': trump_suit,
+        'p1_id': p1_id,
+        'p1_name': p1_name,
+        'p1_hand': p1_hand,
+        'p2_id': p2_id,
+        'p2_name': p2_name,
+        'p2_hand': p2_hand,
+        'attacker': 'p1',
+        'table': [],
+        'status': f"🔥 Игра началась! Первым ходит <b>{html.escape(p1_name)}</b>.",
+        'chat_msg_id': msg_id_to_edit,
+        'dm_msg_id': None,
+        'finished': False
+    }
+    DURAK_GAMES[int(chat_id)] = game
+
+    if mode == 'bot':
+        text = durak_build_text(game, 'p1')
+        kb = durak_build_keyboard(game, 'bot_game')
+        if msg_id_to_edit:
+            safe_edit_message(text, chat_id, msg_id_to_edit, business_id=biz_id, reply_markup=kb)
+        else:
+            sent = bot.send_message(chat_id, text, business_connection_id=biz_id, reply_markup=kb)
+            game['chat_msg_id'] = sent.message_id
+    else:
+        # В режиме 1 на 1 отправляем владельцу секретный стол с его смайлик-картами в ЛС бота!
+        if CREATOR_ID:
+            try:
+                dm_text = durak_build_text(game, 'p1')
+                dm_kb = durak_build_keyboard(game, 'pvp_dm')
+                dm_sent = bot.send_message(
+                    CREATOR_ID,
+                    f"🕵️‍♂️ <b>Твой секретный пульт для игры 1 на 1 (видят только твои глаза):</b>\n\n{dm_text}",
+                    reply_markup=dm_kb
+                )
+                game['dm_msg_id'] = dm_sent.message_id
+            except Exception:
+                pass
+        durak_sync_screens(game)
+
+def send_durak_mode_menu(chat_id, biz_id=None):
+    """Отправляет стартовое меню выбора режима игры в Дурака."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("🤖 Играть против Бота (Смайлики)", callback_data=f"durak_start_{chat_id}_bot"),
+        InlineKeyboardButton("⚔️ Играть 1 на 1 (Ты vs Собеседник)", callback_data=f"durak_start_{chat_id}_pvp")
+    )
+    text = (
+        "🃏 <b>Подкидной Дурак на смайликах!</b>\n\n"
+        "• Все карты — кликабельные кнопки со смайликами (козыри помечены 🔥).\n"
+        "• В режиме <b>1 на 1</b> твои карты скрыты от соперника (приходят тебе в ЛС бота + доступны по секретной кнопке 👁 прямо в чате).\n\n"
+        "👇 <b>Выбери режим игры:</b>"
+    )
+    sent = bot.send_message(chat_id, text, business_connection_id=biz_id, reply_markup=kb)
+    if biz_id and sent:
+        BOT_GPT_MESSAGES.add(sent.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith('durak_'))
+def handle_durak_callbacks(call):
+    register_creator_id(call.from_user)
+    data = call.data
+    user = call.from_user
+    uid = user.id
+    is_owner = (uid == CREATOR_ID) or ((user.username or '').lower() == CREATOR_USERNAME)
+
+    # Открыть меню заново
+    if data.startswith('durak_menu_'):
+        cid = int(data.replace('durak_menu_', ''))
+        old_g = DURAK_GAMES.get(cid)
+        biz_id = old_g.get('biz_id') if old_g else getattr(call.message, 'business_connection_id', None)
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🤖 Играть против Бота (Смайлики)", callback_data=f"durak_start_{cid}_bot"),
+            InlineKeyboardButton("⚔️ Играть 1 на 1 (Ты vs Собеседник)", callback_data=f"durak_start_{cid}_pvp")
+        )
+        safe_edit_message("🃏 <b>Выбери режим игры в Дурака:</b>", call.message.chat.id, call.message.message_id, business_id=biz_id, reply_markup=kb)
+        bot.answer_callback_query(call.id)
+        return
+
+    # Старт игры
+    if data.startswith('durak_start_'):
+        parts = data.split('_')
+        cid = int(parts[2])
+        mode = parts[3]
+        biz_id = getattr(call.message, 'business_connection_id', None)
+        start_new_durak_game(cid, biz_id, mode, user, msg_id_to_edit=call.message.message_id)
+        bot.answer_callback_query(call.id, "🃏 Карты розданы!")
+        return
+
+    # Определяем chat_id игры для остальных кнопок
+    parts = data.split('_')
+    action = parts[1]
+    cid = int(parts[2])
+    game = DURAK_GAMES.get(cid)
+
+    if not game:
+        bot.answer_callback_query(call.id, "⚠️ Партия уже завершена. Напиши «дурак» для новой игры!", show_alert=True)
+        return
+
+    # Если в PvP второй игрок еще не зафиксирован, фиксируем первого нажавшего не-владельца
+    if game['mode'] == 'pvp' and not is_owner and game['p2_id'] is None:
+        game['p2_id'] = uid
+        game['p2_name'] = user.first_name or "Собеседник"
+
+    # Кнопка секретного просмотра своих карт прямо в чате (видит ТОЛЬКО нажавший!)
+    if action == 'peek':
+        role = 'p1' if is_owner else 'p2'
+        hand = game[f'{role}_hand']
+        trump = game['trump_suit']
+        if not hand:
+            bot.answer_callback_query(call.id, "У тебя пусто в руке!", show_alert=True)
+            return
+        lines = [f"🎴#{i + 1} ➔ {durak_card_label(c, trump)}" for i, c in enumerate(hand)]
+        secret_text = (
+            f"🃏 ТВОИ КАРТЫ (видишь только ты):\n"
+            f"Козырь стола: {durak_card_label(game['trump_card'], trump)}\n\n" +
+            "  |  ".join(lines) +
+            "\n\n💡 Чтобы сходить прямо тут, нажми кнопку с нужным номером 🎴#1, 🎴#2..."
+        )
+        bot.answer_callback_query(call.id, secret_text, show_alert=True)
+        return
+
+    # Завершение игры
+    if action == 'stop':
+        DURAK_GAMES.pop(cid, None)
+        safe_edit_message(f"🏳️ Игра в Дурака остановлена игроком <b>{html.escape(user.first_name or 'Игрок')}</b>.", cid, game['chat_msg_id'], business_id=game['biz_id'])
+        if CREATOR_ID and game.get('dm_msg_id'):
+            safe_edit_message("🏳️ Игра в Дурака завершена.", CREATOR_ID, game['dm_msg_id'])
+        bot.answer_callback_query(call.id, "Игра завершена")
+        return
+
+    # Определяем роль нажавшего игрока
+    if game['mode'] == 'bot':
+        if uid != game['p1_id'] and not is_owner:
+            bot.answer_callback_query(call.id, "⛔ Сейчас играет другой человек!", show_alert=True)
+            return
+        caller_role = 'p1'
+    else:
+        caller_role = 'p1' if is_owner else 'p2'
+
+    trump = game['trump_suit']
+    table = game['table']
+    uncovered = (len(table) > 0 and table[-1][1] is None)
+
+    # Действие «Бито!»
+    if action == 'bito':
+        if caller_role != game['attacker']:
+            bot.answer_callback_query(call.id, "⛔ Только атакующий может сказать «Бито!»", show_alert=True)
+            return
+        if not table or uncovered:
+            bot.answer_callback_query(call.id, "⛔ На столе еще есть неотбитая карта!", show_alert=True)
+            return
+
+        table.clear()
+        game['attacker'] = 'p2' if game['attacker'] == 'p1' else 'p1'
+        durak_refill_hands(game)
+        new_atk_name = game[f"{game['attacker']}_name"]
+        game['status'] = f"✅ <b>Бито!</b> Карты ушли в отбой. Теперь ходит <b>{html.escape(new_atk_name)}</b>!"
+
+        if game['mode'] == 'bot' and game['attacker'] == 'p2':
+            durak_bot_ai_turn(game)
+
+        win_text = durak_check_winner(game)
+        if win_text:
+            game['finished'] = True
+            game['status'] = win_text
+
+        durak_sync_screens(game)
+        bot.answer_callback_query(call.id, "✅ Бито!")
+        return
+
+    # Действие «Беру!»
+    if action == 'take':
+        def_role = 'p2' if game['attacker'] == 'p1' else 'p1'
+        if caller_role != def_role or not uncovered:
+            bot.answer_callback_query(call.id, "⛔ Сейчас не твоя очередь забирать карты!", show_alert=True)
+            return
+
+        def_hand = game[f'{def_role}_hand']
+        for a_c, d_c in table:
+            def_hand.append(a_c)
+            if d_c:
+                def_hand.append(d_c)
+        table.clear()
+        durak_refill_hands(game)
+        game['status'] = f"📥 <b>{html.escape(game[f'{def_role}_name'])} забрал(а) все карты со стола!</b> Снова ходит {html.escape(game[f\"{game['attacker']}_name\"])}."
+
+        if game['mode'] == 'bot' and game['attacker'] == 'p2':
+            durak_bot_ai_turn(game)
+
+        win_text = durak_check_winner(game)
+        if win_text:
+            game['finished'] = True
+            game['status'] = win_text
+
+        durak_sync_screens(game)
+        bot.answer_callback_query(call.id, "📥 Ты забрал(а) карты со стола")
+        return
+
+    # Нажатие на конкретную карту (durak_play_{cid}_{target_role}_{card_idx})
+    if action == 'play':
+        btn_owner_role = parts[3]
+        card_idx = int(parts[4])
+
+        # Защита от нажатия на чужие карты в общем чате!
+        if caller_role != btn_owner_role:
+            bot.answer_callback_query(
+                call.id,
+                "⛔ Это карты соперника! Нажми «👁 Мои карты» ниже или ходи со своего пульта в ЛС бота.",
+                show_alert=True
+            )
+            return
+
+        hand = game[f'{caller_role}_hand']
+        if card_idx < 0 or card_idx >= len(hand):
+            bot.answer_callback_query(call.id, "⚠️ Карта уже сыграна")
+            return
+
+        chosen_card = hand[card_idx]
+        def_role = 'p2' if game['attacker'] == 'p1' else 'p1'
+
+        # Если игрок АТАКУЕТ или ПОДКИДЫВАЕТ
+        if caller_role == game['attacker']:
+            if uncovered:
+                bot.answer_callback_query(call.id, "⏳ Подожди, пока соперник отобьет карту или возьмет!", show_alert=True)
+                return
+            if len(table) >= 6 or len(game[f'{def_role}_hand']) == 0:
+                bot.answer_callback_query(call.id, "⛔ Больше подкидывать нельзя! Жми «✅ Бито!»", show_alert=True)
+                return
+            if table:
+                t_ranks = durak_table_ranks(table)
+                if chosen_card[0] not in t_ranks:
+                    bot.answer_callback_query(
+                        call.id,
+                        f"⛔ Подкидывать можно только карты достоинством: {', '.join(t_ranks)}",
+                        show_alert=True
+                    )
+                    return
+
+            hand.pop(card_idx)
+            table.append([chosen_card, None])
+            game['status'] = f"⚔️ <b>{html.escape(game[f'{caller_role}_name'])}</b> ходит: <b>{durak_card_label(chosen_card, trump)}</b>"
+
+            if game['mode'] == 'bot':
+                durak_bot_ai_turn(game)
+
+        # Если игрок ЗАЩИЩАЕТСЯ
+        elif caller_role == def_role:
+            if not uncovered:
+                bot.answer_callback_query(call.id, "⏳ Сейчас ход атакующего!", show_alert=True)
+                return
+
+            atk_card = table[-1][0]
+            if not durak_can_beat(atk_card, chosen_card, trump):
+                bot.answer_callback_query(
+                    call.id,
+                    f"⛔ Карта {durak_card_label(chosen_card, trump)} не бьет {durak_card_label(atk_card, trump)}!",
+                    show_alert=True
+                )
+                return
+
+            hand.pop(card_idx)
+            table[-1][1] = chosen_card
+            game['status'] = f"🛡 <b>{html.escape(game[f'{caller_role}_name'])}</b> отбил(а) картой <b>{durak_card_label(chosen_card, trump)}</b>!"
+
+            if game['mode'] == 'bot' and game['attacker'] == 'p2':
+                durak_bot_ai_turn(game)
+
+        win_text = durak_check_winner(game)
+        if win_text:
+            game['finished'] = True
+            game['status'] = win_text
+
+        durak_sync_screens(game)
+        bot.answer_callback_query(call.id, f"Сыграно: {durak_card_label(chosen_card, trump)}")
+
+@bot.business_message_handler(func=lambda m: (m.text or '').lower().strip() in ['дурак', 'игра дурак', 'дурак бот', 'дурак пвп', 'дурак стоп', '/durak'])
+def handle_business_durak_command(message):
+    register_creator_id(message.from_user)
+    cid = int(message.chat.id)
+    biz_id = message.business_connection_id
+    cmd = (message.text or '').lower().strip()
+
+    if cmd == 'дурак стоп':
+        DURAK_GAMES.pop(cid, None)
+        bot.send_message(cid, "🏳️ Игра в Дурака остановлена.", business_connection_id=biz_id)
+        return
+
+    if cmd == 'дурак бот':
+        start_new_durak_game(cid, biz_id, 'bot', message.from_user)
+    elif cmd == 'дурак пвп':
+        start_new_durak_game(cid, biz_id, 'pvp', message.from_user)
+    else:
+        send_durak_mode_menu(cid, biz_id=biz_id)
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.text or '').lower().strip() in ['дурак', 'игра дурак', 'дурак бот', 'дурак стоп', '/durak'])
+def handle_private_durak_command(message):
+    register_creator_id(message.from_user)
+    cid = int(message.chat.id)
+    cmd = (message.text or '').lower().strip()
+    if cmd == 'дурак стоп':
+        DURAK_GAMES.pop(cid, None)
+        bot.send_message(cid, "🏳️ Игра в Дурака остановлена.")
+        return
+    start_new_durak_game(cid, None, 'bot', message.from_user)
+
+# Ставим обработчики Дурака в начало очереди, чтобы они срабатывали первыми в любом месте файла
+bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
+bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
+bot.message_handlers.insert(0, bot.message_handlers.pop())
+# =====================================================================
+
 
 # --- ЗАПУСК ---
 try:
