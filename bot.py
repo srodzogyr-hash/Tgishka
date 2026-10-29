@@ -3180,7 +3180,6 @@ bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
 bot.message_handlers.insert(0, bot.message_handlers.pop())
 # =====================================================================
 
-
 # --- ЗАПУСК ---
 try:
     bot.delete_webhook(drop_pending_updates=True)
