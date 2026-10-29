@@ -3053,7 +3053,8 @@ def handle_durak_callbacks(call):
                 def_hand.append(d_c)
         table.clear()
         durak_refill_hands(game)
-        game['status'] = f"📥 <b>{html.escape(game[f'{def_role}_name'])} забрал(а) все карты со стола!</b> Снова ходит {html.escape(game[f\"{game['attacker']}_name\"])}."
+                game['status'] = f"📥 <b>{html.escape(game[def_role + '_name'])} забрал(а) все карты со стола!</b> Снова ходит {html.escape(game[game['attacker'] + '_name'])}."
+
 
         if game['mode'] == 'bot' and game['attacker'] == 'p2':
             durak_bot_ai_turn(game)
