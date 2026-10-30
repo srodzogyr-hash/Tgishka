@@ -994,3 +994,23 @@ def _priv_game_router(message):
 bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
 bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
 bot.message_handlers.insert(0, bot.message_handlers.pop())
+
+# Автоматически добавляем раздел с играми в общий список команд бота
+_orig_get_full_commands = main.get_full_commands_text
+
+def _patched_full_commands_text():
+    base_text = _orig_get_full_commands()
+    games_section = (
+        "\n\n🔹 <b>5. Мини-игры, РПГ и Био-войны (Ирис):</b>\n"
+        "• <code>игры</code> (или <code>профиль</code>) — твой РПГ-профиль, ранг и редкие баффы\n"
+        "• <code>лаба</code> — Био-Лаборатория (прокачка штаммов и иммунитета)\n"
+        "• <code>заразить</code> (или <code>заразить @юзер</code>) — био-атака на собеседника\n"
+        "• <code>вакцина</code> — вылечить горячку (80 🧬)\n"
+        "• <code>виселица</code> — Поле Чудес на кнопках\n"
+        "• <code>виселица ии</code> — ИИ загадывает слово по контексту вашего чата!\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (1 на 1 или с ботом)\n"
+        "• <code>био топ</code> — рейтинг игроков"
+    )
+    return base_text + games_section
+
+main.get_full_commands_text = _patched_full_commands_text
