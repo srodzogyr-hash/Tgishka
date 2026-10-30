@@ -5,7 +5,8 @@ import random
 import threading
 import requests
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import __main__ as main
+import sys
+main = sys.modules.get('bot') or sys.modules['__main__']
 
 bot = main.bot
 CONFIG = main.CONFIG
