@@ -3160,6 +3160,98 @@ bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
 bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
 bot.message_handlers.insert(0, bot.message_handlers.pop())
 # =====================================================================
+# =====================================================================
+# 🎨 БЕСПЛАТНЫЙ ГЕНЕРАТОР КАРТИНОК (FLUX API БЕЗ КЛЮЧЕЙ + УЛУЧШАЙЗЕР ПРОМПТА)
+# =====================================================================
+FREE_IMAGE_MODELS = [
+    'flux',
+    'flux-realism',
+    'flux-anime',
+    'flux-3d',
+    'turbo'
+]
+
+if CONFIG.get('image_model') not in FREE_IMAGE_MODELS:
+    CONFIG['image_model'] = 'flux'
+
+def enhance_image_prompt(ru_prompt):
+    """Быстро переводит русский запрос в детальный английский промпт для FLUX."""
+    sys_t = (
+        "Translate the user's image description into English and make it a vivid, detailed prompt "
+        "for the FLUX image generator. Output ONLY the final English prompt without quotes or explanations."
+    )
+    if GROQ_API_KEY:
+        try:
+            headers = {'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'}
+            payload = {
+                'model': 'openai/gpt-oss-20b',
+                'messages': [
+                    {'role': 'system', 'content': sys_t},
+                    {'role': 'user', 'content': ru_prompt}
+                ],
+                'temperature': 0.5
+            }
+            r = get_http_session().post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=7)
+            if r.status_code == 200:
+                ans = r.json()['choices'][0]['message']['content'].strip()
+                ans = re.sub(r'<think>.*?</think>', '', ans, flags=re.DOTALL | re.IGNORECASE).strip()
+                if ans:
+                    return ans
+        except Exception:
+            pass
+    return ru_prompt
+
+def generate_image(prompt):
+    """Переопределяет старую платную рисовалку Gemini на бесплатный FLUX."""
+    raw_prompt = (prompt or "").strip()
+    if not raw_prompt:
+        return None, "Напиши, что именно нужно нарисовать!"
+
+    model = CONFIG.get('image_model', 'flux')
+    if model not in FREE_IMAGE_MODELS:
+        model = 'flux'
+
+    eng_prompt = enhance_image_prompt(raw_prompt)
+    seed = random.randint(1, 9999999)
+    encoded_prompt = requests.utils.quote(eng_prompt)
+
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model={model}&width=1024&height=1024&seed={seed}&nologo=true"
+
+    s = get_http_session()
+    for attempt in range(2):
+        try:
+            r = s.get(url, timeout=40)
+            if r.status_code == 200 and r.content and len(r.content) > 1000:
+                return r.content, None
+        except Exception:
+            time.sleep(1)
+
+    return None, "Сервер генерации сейчас перегружен, попробуй еще раз через 5 секунд."
+
+@bot.callback_query_handler(func=lambda call: call.data == 'panel_img_models')
+def handle_free_img_models_btn(call):
+    if (call.from_user.username or '').lower() != CREATOR_USERNAME:
+        return
+    cur_m = CONFIG.get('image_model', 'flux')
+    if cur_m not in FREE_IMAGE_MODELS:
+        cur_m = 'flux'
+    kb = InlineKeyboardMarkup(row_width=1)
+    labels = {
+        'flux': 'flux (Универсальный Топ)',
+        'flux-realism': 'flux-realism (Фотореализм)',
+        'flux-anime': 'flux-anime (Аниме)',
+        'flux-3d': 'flux-3d (3D Рендер)',
+        'turbo': 'turbo (Быстрая)'
+    }
+    for m in FREE_IMAGE_MODELS:
+        mark = "✅ " if m == cur_m else ""
+        kb.add(InlineKeyboardButton(f"{mark}{labels.get(m, m)}", callback_data=f"setimg_{m}"))
+    kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+    safe_edit_message("🎨 <b>Выбери бесплатную FLUX-модель для рисования:</b>", call.message.chat.id, call.message.message_id, reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
+# =====================================================================
 
 # --- ЗАПУСК ---
 try:
