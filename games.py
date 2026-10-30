@@ -4,8 +4,9 @@ import time
 import random
 import threading
 import requests
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import sys
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 main = sys.modules.get('bot') or sys.modules['__main__']
 
 bot = main.bot
@@ -22,6 +23,87 @@ safe_edit_message = main.safe_edit_message
 save_config = main.save_config
 ask_gemini = main.ask_gemini
 register_creator_id = main.register_creator_id
+
+# =====================================================================
+# 📜 0. ПОЛНЫЙ СПИСОК КОМАНД (ДЛЯ АДМИНКИ И ДЛЯ ОБЫЧНЫХ ЧАТОВ)
+# =====================================================================
+def get_updated_full_commands_text():
+    return (
+        "📜 <b>Полный список всех команд бота:</b>\n\n"
+        "🔹 <b>1. Обычный ГПТ и Модели (ВСЕГДА показывает context и model):</b>\n"
+        "• <code>/panel</code> (или <code>панель</code>) — главный пульт с кнопками (в ЛС бота)\n"
+        "• <code>команды</code> (или <code>помощь</code> / <code>хелп</code>) — показать этот список команд в любом чате\n"
+        "• <code>модели</code> — выбрать модель для обычного <code>гпт</code>\n"
+        "• <code>авто-модели</code> — выбрать модель отдельно для Автоответчика (Groq / Gemini)\n"
+        "• <code>фото-модели</code> — выбрать бесплатную модель FLUX для рисования\n"
+        "• <code>гпт [текст]</code> — задать вопрос ИИ (или Reply на фото/файл/ГС)\n"
+        "• <code>нарисуй [описание]</code> — сгенерировать картинку через бесплатный FLUX\n"
+        "• <code>контекст 100</code> — изменить глубину памяти диалога\n"
+        "• <code>сброс</code> — очистить общий контекст чата (у тебя и у собеседника!)\n"
+        "• <code>сброс все</code> — очистить память вообще всех чатов\n"
+        "• <code>характер [текст]</code> — задать системный промпт для обычного <code>гпт</code>\n"
+        "• <code>характер сброс</code> — вернуть стандартный промпт для <code>гпт</code>\n"
+        "• <code>ключи</code> — статус всех ключей Gemini и пинг-тест\n"
+        "• <code>список</code> — посмотреть все списки и настройки\n\n"
+        "🔹 <b>2. Автоответчик (Работает отдельно на Groq + Обучение + Стелс):</b>\n"
+        "• <code>автоответчик @юзер</code> (или <code>ао @юзер</code>) — вкл/выкл автоответчик для конкретного человека\n"
+        "• <code>ао вкл</code> / <code>ао выкл</code> — (прямо в чате с человеком) скрытно вкл/выкл автоответчик для этого чата\n"
+        "• <code>автоответчик вкл</code> / <code>выкл</code> — глобальный автоответчик для всех\n"
+        "• <code>обучение</code> — диалоговое обучение ТОЛЬКО для автоответчика (выход: <code>стоп</code>)\n"
+        "• <code>обучение сброс</code> — стереть выученные правила автоответчика\n"
+        "• <code>стелс вкл</code> / <code>выкл</code> — скрывать model/context и часики в режиме автоответчика\n"
+        "• <code>таймер 5</code> — через сколько минут молчания отвечает автоответчик\n"
+        "• <code>шанс 75</code> — вероятность ответа автоответчика в % (от 10 до 100)\n\n"
+        "🔹 <b>3. Голосовые и Кружки (рс + живой ответ):</b>\n"
+        "• Ответь <code>рс</code> на ГС/кружок — чистая текстовая расшифровка без воды\n"
+        "• Ответь <code>рс [задача]</code> — например: <code>рс перескажи кратко</code>\n"
+        "• <code>рс @юзер</code> / <code>рс все вкл</code> — постоянная авто-расшифровка\n"
+        "• <i>Если ответить на сообщение бота голосовым — он сам расшифрует его и ответит!</i>\n\n"
+        "🔹 <b>4. Третий собеседник, Будильник и Шпион:</b>\n"
+        "• <code>вставка 25</code> (или <code>вставка выкл</code>) — раз в N сообщений бот вставляет «5 копеек»\n"
+        "• <code>рассуди</code> / <code>5 копеек</code> / <code>анализ</code> — разбор последних 50 сообщений чата\n"
+        "• <code>будильник 30 [задача]</code> — через 30 мин бот сам напишет в чат\n"
+        "• <code>будильник @юзер 60 [задача]</code> — будильник для юзера из админки\n"
+        "• <code>шпион вкл</code> / <code>выкл</code> — перехват удаленных и измененных СМС\n"
+        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота\n\n"
+        "🔹 <b>5. Игры, РПГ и Био-войны (работают прямо в чате!):</b>\n"
+        "• <code>игры</code> (или <code>профиль</code> / <code>рпг</code>) — твой игровой профиль, уровень и редкие баффы\n"
+        "• <code>лаба</code> (или <code>моя лаба</code> / <code>био</code>) — твоя Био-Лаборатория (прокачка вирусов как в Ирисе)\n"
+        "• <code>заразить</code> (в чате, Reply или <code>заразить @юзер</code>) — заразить собеседника патогеном\n"
+        "• <code>вакцина</code> (или <code>лечиться</code>) — снять горячку за 80 🧬\n"
+        "• <code>+патоген</code>, <code>+разработка</code>, <code>+заразность</code>, <code>+иммунитет</code>, <code>+летальность</code>, <code>+безопасность</code> — быстрая прокачка лабы\n"
+        "• <code>био топ</code> (или <code>топ</code>) — рейтинг лучших вирусологов и игроков\n"
+        "• <code>виселица</code> (или <code>поле чудес</code>) — классическая игра в слова на кнопках\n"
+        "• <code>виселица ии</code> — ваш ГПТ сам загадывает слово по всей памяти вашего чата!\n"
+        "• <code>кнб</code> (или <code>цуефа</code>) — Камень-Ножницы-Бумага (1 на 1 или против бота)"
+    )
+
+def get_chat_commands_text():
+    return (
+        "📜 <b>Команды, доступные прямо в этом чате:</b>\n\n"
+        "🤖 <b>ИИ-Ассистент и Анализ:</b>\n"
+        "• <code>гпт [запрос]</code> — спросить ИИ (понимает текст, фото, PDF/DOCX и голосовые реплаем)\n"
+        "• <code>нарисуй [описание]</code> — нарисовать картинку (FLUX)\n"
+        "• <code>рс</code> (ответом на ГС или кружок) — дословная расшифровка в текст\n"
+        "• <code>рассуди</code> — ИИ разберет ваш спор и вынесет вердикт, кто прав\n"
+        "• <code>анализ</code> — разбор последних 50 сообщений переписки\n"
+        "• <code>5 копеек</code> — бот вставит живую реплику по теме разговора\n"
+        "• <code>сброс</code> — очистить память ИИ в этом чате\n\n"
+        "🧬 <b>Био-войны (Коронаирис) и РПГ:</b>\n"
+        "• <code>лаба</code> (или <code>моя лаба</code>) — открыть свою Био-Лабораторию и прокачку\n"
+        "• <code>заразить</code> — пустить вирус в собеседника и добыть био-ресурсы 🧬\n"
+        "• <code>вакцина</code> — вылечить горячку (80 🧬)\n"
+        "• <code>+патоген</code> | <code>+разработка</code> | <code>+заразность</code> | <code>+иммунитет</code> | <code>+летальность</code> | <code>+безопасность</code> — прокачка навыков\n"
+        "• <code>профиль</code> (или <code>игры</code>) — твой уровень, опыт и редкие баффы\n"
+        "• <code>био топ</code> — таблица лидеров\n\n"
+        "🕹 <b>Мини-игры на кнопках:</b>\n"
+        "• <code>виселица</code> — классическое Поле Чудес\n"
+        "• <code>виселица ии</code> — ГПТ сам загадывает слово по контексту вашего общения!\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (дуэль 1 на 1 или с ботом)"
+    )
+
+# Обновляем функцию списка команд в основном файле bot.py
+main.get_full_commands_text = get_updated_full_commands_text
 
 # =====================================================================
 # 🎨 1. БЕСПЛАТНАЯ РИСОВАЛКА FLUX (АВТОМАТИЧЕСКИ ЗАМЕНЯЕТ ПЛАТНУЮ GEMINI)
@@ -141,13 +223,12 @@ def get_player(user):
             'wins_rps': 0,
             'infections_done': 0,
             'buffs': [],
-            # Характеристики Лаборатории (как в Ирисе)
-            'lab_patogen_lvl': 1,      # Ячейки патогенов
-            'lab_dev_lvl': 1,          # Скорость разработки
-            'lab_infect_lvl': 1,       # Заразность
-            'lab_immune_lvl': 1,       # Иммунитет (защита)
-            'lab_lethal_lvl': 1,       # Летальность (время горячки и доход)
-            'lab_security_lvl': 1,     # Служба безопасности
+            'lab_patogen_lvl': 1,
+            'lab_dev_lvl': 1,
+            'lab_infect_lvl': 1,
+            'lab_immune_lvl': 1,
+            'lab_lethal_lvl': 1,
+            'lab_security_lvl': 1,
             'patogens': 3,
             'last_patogen_ts': now,
             'fever_until': 0,
@@ -174,11 +255,9 @@ def find_player_by_username(uname_clean):
     return None
 
 def sync_lab_patogens(p):
-    """Пересчитывает накопленные патогены со временем."""
     now = time.time()
     max_cells = 2 + p.get('lab_patogen_lvl', 1)
     dev_lvl = p.get('lab_dev_lvl', 1)
-    # Базово 1 патоген каждые 15 минут, с прокачкой Разработки быстрее (до 3 мин)
     interval_sec = max(180, 900 - (dev_lvl - 1) * 70)
 
     cur_p = p.get('patogens', 3)
@@ -210,7 +289,6 @@ def get_level_and_rank(xp):
     return lvl, title
 
 def try_grant_rare_buff(p):
-    """С редким шансом 12% выдает игроку один из сбалансированных баффов."""
     available = [k for k in RARE_BUFFS_INFO.keys() if k not in p.get('buffs', [])]
     if not available:
         return None
@@ -312,7 +390,6 @@ def perform_infection_attempt(attacker_user, target_p):
     if atk_p.get('patogens', 0) <= 0:
         return "🧪 <b>В лаборатории нет готовых патогенов!</b> Подожди синтеза или прокачай <code>+разработка</code> в <code>лаба</code>."
 
-    # Проверка редкого баффа «Катализатор РНК» (15% шанс не потратить патоген)
     saved_patogen = False
     if 'rna_catalyst' in atk_p.get('buffs', []) and random.randint(1, 100) <= 15:
         saved_patogen = True
@@ -324,7 +401,6 @@ def perform_infection_attempt(attacker_user, target_p):
     lethal_lvl = atk_p.get('lab_lethal_lvl', 1)
     sec_lvl = target_p.get('lab_security_lvl', 1)
 
-    # Базовый шанс 55% + 6% за разницу Заразности и Иммунитета
     chance = 55 + (infect_lvl - immune_lvl) * 6
     if 'antigen_shield' in target_p.get('buffs', []):
         chance -= 8
@@ -336,12 +412,10 @@ def perform_infection_attempt(attacker_user, target_p):
     catalyst_note = "\n⚡ <i>Сработал «Катализатор РНК» — патоген сохранен!</i>" if saved_patogen else ""
 
     if roll <= chance:
-        # Успешное заражение!
         fever_mins = 10 + lethal_lvl * 4
         loot_res = 45 + lethal_lvl * 25
         loot_xp = 25 + lethal_lvl * 5
 
-        # Служба безопасности жертвы определяет, узнает ли она имя атакующего
         spotted = (random.randint(1, 100) <= (35 + sec_lvl * 12))
         target_p['fever_until'] = now + fever_mins * 60
         target_p['infected_by'] = atk_p['name'] if spotted else "Неизвестный био-хакер"
@@ -372,15 +446,16 @@ def perform_infection_attempt(attacker_user, target_p):
         )
 
 # =====================================================================
-# 🎡 4. ИГРА «ВИСЕЛИЦА / ПОЛЕ ЧУДЕС» (ОБЫЧНАЯ + ИИ ПО КОНТЕКСТУ ЧАТА!)
+# 🎡 4. ИГРА «ВИСЕЛИЦА / ПОЛЕ ЧУДЕС» (ОБЫЧНАЯ + УМНАЯ ИИ ПО ПАМЯТИ ГПТ!)
 # =====================================================================
 HANGMAN_GAMES = {}
+USED_AI_WORDS = {}
 
 BASE_WORDS = [
     ("КАПИБАРА", "Животный мир"), ("ШАУРМА", "Божественная еда"),
     ("КРИПТОВАЛЮТА", "Финансы и хайп"), ("ТЕЛЕГРАМ", "Мессенджеры"),
     ("ЛАБОРАТОРИЯ", "Наука и вирусы"), ("СИНХРОФАЗОТРОН", "Сложная физика"),
-    ("КИБЕРПАНК", "Будущее и неон"), ("БЕссонница", "Ночной режим"),
+    ("КИБЕРПАНК", "Будущее и неон"), ("БЕССОННИЦА", "Ночной режим"),
     ("ПРОГРАММИСТ", "IT и код"), ("МАРШРУТКА", "Городской транспорт"),
     ("ПЕЛЬМЕНИ", "Кулинарная классика"), ("АДРЕНАЛИН", "Гормоны и экстрим"),
     ("ПАРАШЮТ", "Прыжки с высоты"), ("ИНТУИЦИЯ", "Шестое чувство"),
@@ -402,35 +477,63 @@ HANGMAN_STAGES = [
 RUS_ALPHABET = list("АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
 
 def generate_ai_context_word(chat_id):
-    """Просит Gemini загадать слово специально по истории переписки в этом чате!"""
-    recent = CHAT_LOG.get(int(chat_id), [])[-40:]
-    if not recent:
-        mem = CHAT_MEMORY.get(int(chat_id), [])[-25:]
-        recent = [m.get('content', '') for m in mem if m.get('content')]
+    """
+    Запрашивает слово напрямую у основного ГПТ чата по всей глубокой памяти CHAT_MEMORY
+    и сохраняет факт загадывания в контекст самого ГПТ!
+    """
+    cid = int(chat_id)
+    history = CHAT_MEMORY.get(cid, [])
+    used_list = USED_AI_WORDS.setdefault(cid, [])
+    used_str = ", ".join(used_list[-30:]) if used_list else "пока нет"
 
-    context_str = "\n".join(recent) if recent else "Обычный дружеский чат в Телеграме."
-    prompt = (
-        f"Вот недавние сообщения из этого чата:\n---\n{context_str}\n---\n\n"
-        "Твоя задача — придумать ОДНО русское существительное в именительном падеже единственного числа (от 5 до 11 букв, без дефисов и пробелов), "
-        "которое напрямую или с юмором связано с тем, о чем говорили участники этого чата (их темы, мемы, увлечения или ситуации из диалога).\n"
-        "Также придумай короткую остроумную подсказку (1 предложение), намекающую, почему выбрано это слово.\n"
-        "Ответь СТРОГО в формате двух строк:\n"
-        "СЛОВО: [само слово заглавными буквами]\n"
-        "ПОДСКАЗКА: [текст подсказки]"
-    )
-    reply, err, _, _ = ask_gemini(chat_id, prompt, save_to_memory=False)
+    if len(history) >= 4:
+        prompt = (
+            "[СИСТЕМНЫЙ ЗАПРОС ИГРЫ «ВИСЕЛИЦА»]:\n"
+            "Мы с тобой запускаем раунд игры в Виселицу в этом чате. "
+            "Вспомни ВСЮ нашу с тобой историю общения целиком (от самых старых тем до недавних, наши локальные мемы, "
+            "интересы, обсуждения или просто крутые штуки, которые подходят нашему вайбу).\n"
+            "ВАЖНОЕ ПРАВИЛО: НЕ зацикливайся на одной последней фразе чата! Каждый раз бери кардинально РАЗНЫЕ темы и ассоциации!\n"
+            f"ЗАПРЕЩЕНО использовать эти уже бывшие слова и однокоренные к ним: {used_str}.\n\n"
+            "Загадай ОДНО русское существительное в именительном падеже единственного числа (от 5 до 12 букв, без пробелов и дефисов) "
+            "и напиши к нему интересную подсказку от своего лица.\n"
+            "Ответь СТРОГО в две строки:\n"
+            "СЛОВО: [слово заглавными буквами]\n"
+            "ПОДСКАЗКА: [твоя подсказка]"
+        )
+    else:
+        prompt = (
+            "[СИСТЕМНЫЙ ЗАПРОС ИГРЫ «ВИСЕЛИЦА»]:\n"
+            "В этом чате пока нет длинной истории, поэтому сам выдумай любое необычное, интересное или смешное "
+            "русское существительное в именительном падеже единственного числа (от 5 до 12 букв, без дефисов) для игры в Виселицу.\n"
+            f"НЕ используй эти слова: {used_str}.\n\n"
+            "Ответь СТРОГО в две строки:\n"
+            "СЛОВО: [слово заглавными буквами]\n"
+            "ПОДСКАЗКА: [остроумная подсказка от твоего лица]"
+        )
+
+    reply, err, _, _ = main.ask_ai(cid, prompt, save_to_memory=True, is_autoreply=False)
+
     if reply:
-        w_match = re.search(r'СЛОВО:\s*([А-ЯЁA-Z]+)', reply.upper())
+        w_match = re.search(r'СЛОВО:\s*([А-ЯЁ]+)', reply.upper())
         h_match = re.search(r'ПОДСКАЗКА:\s*(.+)', reply, flags=re.IGNORECASE)
         if w_match:
             word = w_match.group(1).strip().replace('Ё', 'Е')
             word = re.sub(r'[^А-Я]', '', word)
-            hint = h_match.group(1).strip() if h_match else "Загадано ИИ по истории вашего чата!"
-            if 4 <= len(word) <= 14:
-                return word, f"🤖 Контекст чата: {hint}"
+            hint = h_match.group(1).strip() if h_match else "Загадано нашим ГПТ!"
+            if 4 <= len(word) <= 15 and word not in used_list:
+                used_list.append(word)
+                mem = CHAT_MEMORY.get(cid, [])
+                if len(mem) >= 2:
+                    mem[-2]['content'] = "[Игроки запустили Виселицу ИИ и попросили тебя загадать слово]"
+                    mem[-1]['content'] = f"[Я загадал для них в Виселице слово «{word}» с подсказкой: «{hint}»]"
+                    main.save_chat_memory_async(cid, mem)
+                return word, f"🤖 От ГПТ: {hint}"
 
-    w, c = random.choice(BASE_WORDS)
-    return w.upper().replace('Ё', 'Е'), c
+    unused_base = [pair for pair in BASE_WORDS if pair[0].upper().replace('Ё', 'Е') not in used_list] or BASE_WORDS
+    w, c = random.choice(unused_base)
+    clean_w = w.upper().replace('Ё', 'Е')
+    used_list.append(clean_w)
+    return clean_w, c
 
 def build_hangman_view(game):
     word = game['word']
@@ -442,7 +545,7 @@ def build_hangman_view(game):
     wrong_str = ", ".join(wrong_letters) if wrong_letters else "нет"
     stage_str = HANGMAN_STAGES[min(errors, 6)]
 
-    mode_badge = "🧠 Виселица ИИ (По контексту чата)" if game['is_ai'] else "🎡 Поле Чудес / Виселица"
+    mode_badge = "🧠 Виселица ИИ (От ГПТ чата)" if game['is_ai'] else "🎡 Поле Чудес / Виселица"
     oracle_note = f"\n🔮 <i>{game['oracle_note']}</i>" if game.get('oracle_note') else ""
 
     text = (
@@ -468,7 +571,7 @@ def build_hangman_view(game):
     else:
         kb.row(
             InlineKeyboardButton("🔄 Обычное слово", callback_data=f"hm_new_{game['chat_id']}_std"),
-            InlineKeyboardButton("🧠 Слово от ИИ (по чату)", callback_data=f"hm_new_{game['chat_id']}_ai")
+            InlineKeyboardButton("🧠 Слово от ГПТ (по чату)", callback_data=f"hm_new_{game['chat_id']}_ai")
         )
     return text, kb
 
@@ -484,7 +587,6 @@ def start_hangman_game(chat_id, biz_id, user, is_ai=False, msg_id_to_edit=None):
 
     guessed = set()
     oracle_note = ""
-    # Проверка редкого баффа «Глаз Оракула» (20% шанс открыть 1 букву сразу)
     if 'oracle_eye' in p.get('buffs', []) and random.randint(1, 100) <= 20:
         open_ch = random.choice(list(word))
         guessed.add(open_ch)
@@ -523,7 +625,7 @@ RPS_WINS = {('r', 's'), ('s', 'p'), ('p', 'r')}
 
 def send_rps_menu(chat_id, biz_id=None):
     cid = int(chat_id)
-    RPS_GAMES[cid] = {'biz_id': biz_id, 'moves': {}, 'names': {}}
+    RPS_GAMES[cid] = {'biz_id': biz_id, 'moves': {}, 'names': {}, 'users': {}}
     kb = InlineKeyboardMarkup(row_width=3)
     kb.row(
         InlineKeyboardButton("🪨 Камень", callback_data=f"rps_pvp_{cid}_r"),
@@ -543,12 +645,13 @@ def send_rps_menu(chat_id, biz_id=None):
         BOT_GPT_MESSAGES.add(sent.message_id)
 
 # =====================================================================
-# 🎛 6. ОБРАБОТЧИКИ КОМАНД И КНОПОК ДЛЯ ВСЕХ ИГР И БИО-ВОЙН
+# 🎛 6. ОБРАБОТЧИКИ КОМАНД И КНОПОК ДЛЯ ВСЕХ ИГР, КОМАНД И БИО-ВОЙН
 # =====================================================================
 GAME_TRIGGERS = {
     'лаба', 'моя лаба', 'био', 'биовойны', 'заразить', 'вакцина', 'лечиться',
     '+патоген', '+разработка', '+заразность', '+иммунитет', '+летальность', '+безопасность',
-    'виселица', 'виселица ии', 'поле чудес', 'кнб', 'цуефа', 'рпг', 'профиль', 'топ', 'био топ', 'игры'
+    'виселица', 'виселица ии', 'поле чудес', 'кнб', 'цуефа', 'рпг', 'профиль', 'топ', 'био топ', 'игры',
+    'команды', 'помощь', 'хелп', '/help'
 }
 
 def is_game_command(text):
@@ -593,7 +696,16 @@ def handle_all_game_commands(message):
     if not is_game_command(low):
         return
 
-    # Меню всех игр
+    # Вывод списка команд (в бизнес-чате — чат-команды, в ЛС бота владельцу — полный список)
+    if low in ('команды', 'помощь', 'хелп', '/help'):
+        is_owner_private = (not biz_id and (user.username or '').lower() == CREATOR_USERNAME)
+        help_txt = get_updated_full_commands_text() if is_owner_private else get_chat_commands_text()
+        sent = bot.send_message(cid, help_txt, business_connection_id=biz_id)
+        if biz_id and sent:
+            BOT_GPT_MESSAGES.add(sent.message_id)
+        return
+
+    # Меню всех игр и РПГ-профиль
     if low in ('игры', 'рпг', 'профиль'):
         lvl, rank_title = get_level_and_rank(p.get('xp', 0))
         buff_list = [f"• {RARE_BUFFS_INFO[b]['name']} — <i>{RARE_BUFFS_INFO[b]['desc']}</i>" for b in p.get('buffs', []) if b in RARE_BUFFS_INFO]
@@ -609,9 +721,10 @@ def handle_all_game_commands(message):
             f"• <code>лаба</code> (или <code>моя лаба</code>) — твоя Био-Лаборатория (как в Ирисе)\n"
             f"• <code>заразить</code> (в чате или <code>заразить @юзер</code>) — пустить патоген\n"
             f"• <code>виселица</code> — классическое Поле Чудес на кнопках\n"
-            f"• <code>виселица ии</code> — ИИ загадывает слово по контексту вашего чата!\n"
+            f"• <code>виселица ии</code> — ГПТ загадывает слово по контексту вашего чата!\n"
             f"• <code>кнб</code> — Камень-Ножницы-Бумага (1 на 1 или с ботом)\n"
-            f"• <code>био топ</code> — таблица лидеров"
+            f"• <code>био топ</code> — таблица лидеров\n"
+            f"• <code>команды</code> — все команды чата"
         )
         sent = bot.send_message(cid, msg_text, business_connection_id=biz_id)
         if biz_id and sent:
@@ -682,7 +795,6 @@ def handle_all_game_commands(message):
             uname = low.split('@')[-1].split()[0]
             target_p = find_player_by_username(uname)
             if not target_p:
-                # Создаем профиль для известного собеседника, если он есть в known_chats
                 known = CONFIG.get('known_chats', {}).get(uname.lower())
                 if known:
                     fake_u = type('Obj', (), {'id': known['chat_id'], 'username': uname, 'first_name': known.get('name', uname), 'last_name': ''})()
@@ -690,15 +802,12 @@ def handle_all_game_commands(message):
         elif message.reply_to_message and message.reply_to_message.from_user:
             target_p = get_player(message.reply_to_message.from_user)
         elif biz_id:
-            # В бизнес-чате без аргументов заражаем второго участника этого чата!
             if user.id != cid:
-                # Написал владелец — заражаем собеседника чата
                 chat_uname = getattr(message.chat, 'username', '') or ''
                 chat_fname = getattr(message.chat, 'first_name', '') or 'Собеседник'
                 fake_u = type('Obj', (), {'id': cid, 'username': chat_uname, 'first_name': chat_fname, 'last_name': ''})()
                 target_p = get_player(fake_u)
             elif main.CREATOR_ID:
-                # Написал собеседник — заражает владельца!
                 fake_owner = type('Obj', (), {'id': main.CREATOR_ID, 'username': CREATOR_USERNAME, 'first_name': f"@{CREATOR_USERNAME}", 'last_name': ''})()
                 target_p = get_player(fake_owner)
 
@@ -716,7 +825,7 @@ def handle_all_game_commands(message):
     if low in ('виселица', 'поле чудес', 'виселица ии'):
         is_ai = ('ии' in low)
         if is_ai:
-            wait_msg = bot.send_message(cid, "🧠 <i>ИИ читает историю вашего чата и загадывает слово...</i>", business_connection_id=biz_id)
+            wait_msg = bot.send_message(cid, "🧠 <i>ГПТ вспоминает историю вашего чата и загадывает слово...</i>", business_connection_id=biz_id)
             start_hangman_game(cid, biz_id, user, is_ai=True, msg_id_to_edit=wait_msg.message_id)
         else:
             start_hangman_game(cid, biz_id, user, is_ai=False)
@@ -741,7 +850,6 @@ def handle_games_callbacks(call):
     msg_id = call.message.message_id
     biz_id = getattr(call.message, 'business_connection_id', None)
 
-    # Меню бесплатных FLUX моделей рисования в админке
     if data == 'panel_img_models':
         if (user.username or '').lower() != CREATOR_USERNAME:
             return
@@ -755,7 +863,6 @@ def handle_games_callbacks(call):
         bot.answer_callback_query(call.id)
         return
 
-    # Кнопки Лаборатории Ириса
     if data.startswith('biorefresh_'):
         text, kb = build_lab_view(p)
         safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
@@ -800,7 +907,6 @@ def handle_games_callbacks(call):
         bot.answer_callback_query(call.id, f"✅ {label} -> Ур. {p[field]}!")
         return
 
-    # Кнопки Виселицы
     if data.startswith('hm_'):
         parts = data.split('_')
         action = parts[1]
@@ -811,7 +917,7 @@ def handle_games_callbacks(call):
             mode_type = parts[3]
             is_ai = (mode_type == 'ai')
             if is_ai:
-                safe_edit_message("🧠 <i>ИИ читает ваш чат и придумывает новое слово...</i>", cid, msg_id, business_id=biz_id)
+                safe_edit_message("🧠 <i>ГПТ вспоминает ваш чат и придумывает новое слово...</i>", cid, msg_id, business_id=biz_id)
             start_hangman_game(game_cid, biz_id, user, is_ai=is_ai, msg_id_to_edit=msg_id)
             bot.answer_callback_query(call.id)
             return
@@ -863,7 +969,6 @@ def handle_games_callbacks(call):
             bot.answer_callback_query(call.id)
             return
 
-    # Кнопки Камень-Ножницы-Бумага
     if data.startswith('rps_'):
         parts = data.split('_')
         mode = parts[1]
