@@ -27,14 +27,12 @@ save_config = main.save_config
 ask_gemini = main.ask_gemini
 register_creator_id = main.register_creator_id
 
-# --- НАСТРОЙКИ ИГР И ДОСТУПА ПО УМОЛЧАНИЮ ---
 if 'looting_cd_minutes' not in CONFIG:
     CONFIG['looting_cd_minutes'] = 5
 if 'game_round_seconds' not in CONFIG:
     CONFIG['game_round_seconds'] = 60
 if 'game_max_rounds' not in CONFIG:
     CONFIG['game_max_rounds'] = 3
-# Сбрасываем старый дефолт грока на Gemini (auto_gemini = берет текущую модель Gemini!)
 if not CONFIG.get('game_host_model') or CONFIG.get('game_host_model') == 'groq/openai/gpt-oss-120b':
     CONFIG['game_host_model'] = 'auto_gemini'
 if not isinstance(CONFIG.get('allowed_users'), dict):
@@ -46,12 +44,16 @@ BIZ_CONN_OWNER_CACHE = {}
 # 🔒 0. ЗАЩИТА ТГ БИЗНЕС И СИСТЕМА ДОСТУПА К ИИ
 # =====================================================================
 def is_user_authorized_for_ai(user):
-    """Проверяет, есть ли у пользователя доступ к ИИ в ЛС бота и к подключению ТГ Бизнес."""
     if not user:
         return False
     uname = (user.username or '').lower()
     uid_str = str(user.id)
-    if uname == CREATOR_USERNAME or (main.CREATOR_ID and user.id == main.CREATOR_ID):
+    creator_cfg_id = CONFIG.get('creator_id')
+    if uname == CREATOR_USERNAME.lower():
+        return True
+    if main.CREATOR_ID and user.id == int(main.CREATOR_ID):
+        return True
+    if creator_cfg_id and user.id == int(creator_cfg_id):
         return True
     allowed = CONFIG.get('allowed_users', {})
     if (uname and uname in allowed) or (uid_str in allowed):
@@ -59,18 +61,13 @@ def is_user_authorized_for_ai(user):
     return False
 
 def is_business_connection_authorized(biz_id):
-    """
-    Проверяет, кто подключил бота к своему ТГ Бизнес аккаунту.
-    Разрешает работу ТОЛЬКО если аккаунт принадлежит @wrtnoq или тем, кому выдан доступ!
-    """
     if not biz_id:
         return True
     if biz_id in BIZ_CONN_OWNER_CACHE:
         return BIZ_CONN_OWNER_CACHE[biz_id]
-
     try:
         conn = bot.get_business_connection(biz_id)
-        if conn and conn.user:
+        if conn and getattr(conn, 'user', None):
             register_creator_id(conn.user)
             ok = is_user_authorized_for_ai(conn.user)
             BIZ_CONN_OWNER_CACHE[biz_id] = ok
@@ -345,7 +342,6 @@ def sync_lab_patogens(p):
         p['last_patogen_ts'] = now
 
 def get_pending_reactor_viruses(p):
-    """Считает, сколько пассивных вирусов накопилось в Био-Реакторе."""
     now = time.time()
     last_ts = p.get('last_reactor_ts', now)
     elapsed_hours = max(0.0, (now - last_ts) / 3600.0)
@@ -496,15 +492,12 @@ def perform_infection_attempt(attacker_user, target_p):
 
     if atk_p['uid'] == target_p['uid']:
         return "🤪 Ты не можешь заразить сам себя!"
-
     if atk_p.get('fever_until', 0) > now:
         rem_m = int((atk_p['fever_until'] - now) // 60) + 1
         return f"🤒 <b>У тебя сейчас горячка (еще {rem_m} мин.)!</b> Прими <code>вакцина</code> в <code>лаба</code>."
-
     if target_p.get('quarantine_until', 0) > now:
         q_m = int((target_p['quarantine_until'] - now) // 60) + 1
         return f"🛡 <b>Лаборатория {html.escape(target_p['name'])} закрыта куполом Карантина (еще {q_m} мин.)!</b> Вирус не прошел."
-
     if atk_p.get('patogens', 0) <= 0:
         return "🧪 <b>Нет готовых патогенов!</b> Подожди синтеза или прокачай <code>+разработка</code>."
 
@@ -532,7 +525,6 @@ def perform_infection_attempt(attacker_user, target_p):
     catalyst_note = "\n⚡ <i>«Катализатор РНК» сохранил тебе патоген!</i>" if saved_patogen else ""
 
     if roll <= chance:
-        # Проверка критической мутации
         crit_chance = min(65, 8 + mut_lvl * 5)
         is_crit = (random.randint(1, 100) <= crit_chance)
         mult = 2 if is_crit else 1
@@ -571,7 +563,6 @@ def perform_infection_attempt(attacker_user, target_p):
         )
 
 def perform_bio_sabotage(attacker_user, target_p):
-    """Диверсия — кража вирусов из чужой лаборатории (особенно эффективно, если цель в горячке)."""
     atk_p = get_player(attacker_user)
     now = time.time()
 
@@ -581,10 +572,8 @@ def perform_bio_sabotage(attacker_user, target_p):
     cd_rem = int(600 - (now - atk_p.get('last_sabotage_ts', 0)))
     if cd_rem > 0:
         return f"⏳ Подготовка новой диверсии займет еще <b>{cd_rem // 60} мин. {cd_rem % 60} сек.</b>"
-
     if target_p.get('quarantine_until', 0) > now:
         return f"🛡 Лаборатория <b>{html.escape(target_p['name'])}</b> под куполом Карантина — диверсия невозможна!"
-
     if target_p.get('bio_res', 0) < 40:
         return f"🪹 В лаборатории <b>{html.escape(target_p['name'])}</b> почти пусто ({target_p.get('bio_res', 0)} 🧬), красть нечего!"
 
@@ -621,14 +610,12 @@ def perform_bio_sabotage(attacker_user, target_p):
         )
 
 def perform_epidemic_wave(attacker_user):
-    """Эпидемия — распыляет штамм сразу на 3 случайных игроков из базы (требует 2 патогена, кд 20 мин)."""
     atk_p = get_player(attacker_user)
     now = time.time()
 
     cd_rem = int(1200 - (now - atk_p.get('last_epidemic_ts', 0)))
     if cd_rem > 0:
         return f"⏳ Аэрозольная установка перезаряжается! Подожди <b>{cd_rem // 60} мин. {cd_rem % 60} сек.</b>"
-
     if atk_p.get('patogens', 0) < 2:
         return "🧪 Для запуска <b>Эпидемии</b> нужно минимум <b>2 готовых патогена</b>!"
 
@@ -673,13 +660,6 @@ def perform_epidemic_wave(attacker_user):
 # 🗑 3.5 МИНИ-ИГРА: «ХАБАРОВСКИЙ ЛУТИНГ» (ПОВЫШЕННЫЕ ПРИЗЫ!)
 # =====================================================================
 def execute_khabarovsk_looting(user):
-    """
-    Повышенные призы:
-    - ⚪ Обычный шмот (70%): Сгнивший чеснок (+30), Дохлая батарейка АА (+45)
-    - 🔵 Редкий шмот (20%): Замороженный пельмень (+120), Очки Спамтона (+250)
-    - 🟡 Легендарка (5%): Котурны 20 см (+800)
-    - 💥 Фейл (5%): «Наткнулась на дедушку» (-75)
-    """
     p = get_player(user)
     now = time.time()
     cd_mins = float(CONFIG.get('looting_cd_minutes', 5))
@@ -755,6 +735,9 @@ def execute_khabarovsk_looting(user):
         f"🦠 Конвертация в вирусы: <b>{sign_str}</b> (Баланс: <code>{p['bio_res']}</code> 🧬 | +{xp_gain} XP){buff_note}"
     )
     return text, True
+
+# --- КОНЕЦ ЧАСТИ 1 (ВСТАВЛЯЙ ЧАСТЬ 2 С НОВОЙ СТРОКИ БЕЗ ОТСТУПОВ!) ---
+PART_1_READY = True
 # =====================================================================
 # 🎡 4. ИГРА «ВИСЕЛИЦА / ПОЛЕ ЧУДЕС» (ПРИЗ 200-250 🧬 + ВВОД В ЧАТ!)
 # =====================================================================
@@ -774,7 +757,7 @@ BASE_WORDS = [
     ("ХУДИ", "Гардероб"), ("НЕЙРОСЕТЬ", "Искусственный интеллект"),
     ("СТЕТОСКОП", "Медицинский атрибут"), ("АНАТОМИЯ", "Первая пара в меде"),
     ("РЕАНИМАЦИЯ", "Скорая помощь"), ("ДЕФИБРИЛЛЯТОР", "Разряд!"),
-    ("АДРЕНАЛИН", "В кубиках по вене"), ("КАПЕЛЬНИЦА", "Физраствор внутривенно")
+    ("КАПЕЛЬНИЦА", "Физраствор внутривенно")
 ]
 
 HANGMAN_STAGES = [
@@ -1069,17 +1052,11 @@ HOST_SYSTEM_PROMPT_MAFIA = (
 )
 
 def call_isolated_host_ai(game, round_prompt):
-    """
-    Вызывает ОТДЕЛЬНУЮ нейронку-ведущего с обнуленным контекстным окном (хранит только ход текущей игры!).
-    По умолчанию использует твой основной GEMINI со всей ротацией 15 ключей и MODEL_HIERARCHY,
-    НЕ засоряя CHAT_MEMORY основного ГПТ!
-    """
     host_pref = CONFIG.get('game_host_model', 'auto_gemini')
     sys_prompt = HOST_SYSTEM_PROMPT_BUNKER if game['type'] == 'bunker' else HOST_SYSTEM_PROMPT_MAFIA
     host_history = game.setdefault('host_history', [])
     s = get_http_session()
 
-    # Если владелец специально вручную выбрал модель groq/ в игра-модели
     if host_pref.startswith('groq/') and GROQ_API_KEY:
         messages = [{'role': 'system', 'content': sys_prompt}]
         for h in host_history:
@@ -1104,7 +1081,6 @@ def call_isolated_host_ai(game, round_prompt):
         except Exception:
             pass
 
-    # ОСНОВНОЙ РЕЖИМ: GEMINI В ИЗОЛИРОВАННОМ ОКНЕ (с полной ротацией пула ключей и моделей!)
     if host_pref in ('auto_gemini', '') or host_pref.startswith('groq/'):
         base_m = main.ACTIVE_MODEL if not main.ACTIVE_MODEL.startswith('groq/') else (main.MODEL_HIERARCHY[0] if main.MODEL_HIERARCHY else 'gemini-3-flash')
     else:
@@ -1254,7 +1230,7 @@ def check_story_round_ready(game):
     missing = []
     for req_role in game.get('required_roles', ['p1', 'p2']):
         if not msgs.get(req_role):
-            missing.append(game[f'{req_role}_name'])
+            missing.append(game[req_role + '_name'])
     return (len(missing) == 0), missing
 
 def start_story_game(chat_id, biz_id, game_type, starter_user):
@@ -1408,7 +1384,6 @@ def advance_story_game_round(cid):
         game['processing'] = False
         STORY_GAMES.pop(cid, None)
 
-        # ПРИЗ ЗА ПОБЕДУ В БУНКЕРЕ / МАФИИ: 1000 ВИРУСОВ!
         reward_note = "\n\n🎁 <b>Награда за партию:</b> оба участника получают <b>+150 🧬 и +50 XP</b>, а <b>ПОБЕДИТЕЛЬ забирает ГЛАВНЫЙ ПРИЗ +1000 🧬 вирусов!</b>"
         winner_tail = host_reply.split('ПОБЕДИТЕЛЬ:')[-1].lower() if 'ПОБЕДИТЕЛЬ:' in host_reply else host_reply[-150:].lower()
 
@@ -1462,7 +1437,7 @@ def record_story_player_message(message):
 
     user = message.from_user
     uid = user.id
-    is_owner = (uid == main.CREATOR_ID) or ((user.username or '').lower() == CREATOR_USERNAME)
+    is_owner = is_user_authorized_for_ai(user)
 
     if game.get('biz_id'):
         role = 'p1' if is_owner else 'p2'
@@ -1510,57 +1485,52 @@ def is_game_command(text):
     return False
 
 def should_intercept_business_message(message):
-    """
-    1. Блокирует чужие ТГ Бизнес подключения (кто не @wrtnoq и не в списке доступа)!
-    2. Перехватывает все игровые команды и ходы в Бункере/Мафии/Виселице, чтобы не триггерить обычный ГПТ.
-    """
-    biz_id = getattr(message, 'business_connection_id', None)
-    if biz_id and not is_business_connection_authorized(biz_id):
-        # Блокируем работу бота на чужом бизнес-аккаунте!
-        return True
-
-    text = (message.text or '').strip()
-    if not text:
-        return False
-    low = text.lower()
-
-    if low == 'гпт' or low.startswith('гпт ') or low.startswith('нарисуй '):
-        return False
-
-    if is_game_command(low):
-        return True
-
-    cid = int(message.chat.id)
-    if cid in STORY_GAMES and not STORY_GAMES[cid].get('finished'):
-        return True
-
-    if cid in HANGMAN_GAMES and not HANGMAN_GAMES[cid].get('finished'):
-        clean = low.upper().replace('Ё', 'Е')
-        word_len = len(HANGMAN_GAMES[cid]['word'])
-        is_reply_to_hm = bool(message.reply_to_message and message.reply_to_message.message_id == HANGMAN_GAMES[cid].get('msg_id'))
-        if len(clean) == 1 and clean in RUS_ALPHABET:
-            return True
-        if re.match(r'^[А-Я]+$', clean) and (len(clean) == word_len or is_reply_to_hm):
+    try:
+        biz_id = getattr(message, 'business_connection_id', None)
+        if biz_id and not is_business_connection_authorized(biz_id):
             return True
 
+        text = (message.text or '').strip()
+        if not text:
+            return False
+        low = text.lower()
+
+        if low == 'гпт' or low.startswith('гпт ') or low.startswith('нарисуй '):
+            return False
+
+        if is_game_command(low):
+            return True
+
+        cid = int(message.chat.id)
+        if cid in STORY_GAMES and not STORY_GAMES[cid].get('finished'):
+            return True
+
+        if cid in HANGMAN_GAMES and not HANGMAN_GAMES[cid].get('finished'):
+            clean = low.upper().replace('Ё', 'Е')
+            word_len = len(HANGMAN_GAMES[cid]['word'])
+            is_reply_to_hm = bool(message.reply_to_message and message.reply_to_message.message_id == HANGMAN_GAMES[cid].get('msg_id'))
+            if len(clean) == 1 and clean in RUS_ALPHABET:
+                return True
+            if re.match(r'^[А-Я]+$', clean) and (len(clean) == word_len or is_reply_to_hm):
+                return True
+    except Exception as e:
+        print(f"⚠️ Ошибка в should_intercept_business_message: {e}")
     return False
 
 def should_intercept_private_message(message):
-    """
-    В ЛС самого бота:
-    - Для владельца (@wrtnoq) пропускает админ-команды и /panel к bot.py, а игры забирает себе.
-    - Для обычных пользователей (не владельца) перехватывает ВСЕ сообщения в ЛС бота:
-      дает играть, смотреть стату, лутать, а к ИИ (гпт/нарисуй) пускает только тех, кому выдан доступ!
-    """
-    if message.chat.type != 'private' or not message.from_user:
+    try:
+        if message.chat.type != 'private' or not message.from_user:
+            return False
+        uname = (message.from_user.username or '').lower()
+        is_owner = (uname == CREATOR_USERNAME.lower()) or (main.CREATOR_ID and message.from_user.id == int(main.CREATOR_ID))
+        if not is_owner:
+            return True
+        return should_intercept_business_message(message)
+    except Exception as e:
+        print(f"⚠️ Ошибка в should_intercept_private_message: {e}")
         return False
-    is_owner = ((message.from_user.username or '').lower() == CREATOR_USERNAME) or (main.CREATOR_ID and message.from_user.id == main.CREATOR_ID)
-    if not is_owner:
-        return True
-    return should_intercept_business_message(message)
 
 def resolve_target_player(message, low_cmd):
-    """Универсальный поиск цели для команд заразить и диверсия."""
     cid = int(message.chat.id)
     biz_id = getattr(message, 'business_connection_id', None)
     user = message.from_user
@@ -1623,23 +1593,21 @@ def handle_all_game_commands(message):
     cid = int(message.chat.id)
     biz_id = getattr(message, 'business_connection_id', None)
 
-    # Если это чужое бизнес-подключение — молча гасим!
     if biz_id and not is_business_connection_authorized(biz_id):
         return
 
     raw_text = (message.text or '').strip()
     low = raw_text.lower()
     user = message.from_user
-    is_owner = (user.id == main.CREATOR_ID) or ((user.username or '').lower() == CREATOR_USERNAME)
+    uname = (user.username or '').lower()
+    is_owner = (uname == CREATOR_USERNAME.lower()) or (main.CREATOR_ID and user.id == int(main.CREATOR_ID))
     has_ai_access = is_user_authorized_for_ai(user) or bool(biz_id)
     p = get_player(user)
 
-    # 0. Если обычный юзер нажал /start в ЛС бота — показываем ему красивый Игровой Хаб!
     if not biz_id and not is_owner and low in ('/start', 'старт', 'меню', '/panel', 'панель'):
         send_public_user_hub(cid, user)
         return
 
-    # 1. Управление доступом к ИИ и ТГ Бизнес (Только для владельца @wrtnoq)
     if is_owner and low.startswith('доступ '):
         target = low.replace('доступ ', '').strip().replace('@', '').lower()
         if target:
@@ -1663,10 +1631,9 @@ def handle_all_game_commands(message):
         bot.send_message(cid, f"🔑 <b>Доступ к ИИ в ЛС и ТГ Бизнес выдан:</b>\n{al_str}\n\n<i>Выдать: <code>доступ @юзер</code>\nЗабрать: <code>забрать доступ @юзер</code></i>", business_connection_id=biz_id)
         return
 
-    # 2. Если в ЛС бота пользователь с выданным доступом пишет «гпт ...» или «нарисуй ...»
     if not biz_id and not is_owner and (low == 'гпт' or low.startswith('гпт ') or low.startswith('нарисуй ')):
         if not has_ai_access:
-            bot.send_message(cid, f"🔒 <b>Доступ к нейросети в ЛС закрыт.</b>\nЗато тебе доступны все игры и Био-войны! Напиши <code>/start</code>, <code>лаба</code>, <code>/search</code> или <code>виселица</code>.")
+            bot.send_message(cid, "🔒 <b>Доступ к нейросети в ЛС закрыт.</b>\nЗато тебе доступны все игры и Био-войны! Напиши <code>/start</code>, <code>лаба</code>, <code>/search</code> или <code>виселица</code>.")
             return
         if low.startswith('нарисуй '):
             wait_m = bot.send_message(cid, "🎨 Рисую через FLUX...")
@@ -1690,7 +1657,6 @@ def handle_all_game_commands(message):
             safe_edit_message(f"⚠️ Ошибка: {err}", cid, wait_m.message_id)
         return
 
-    # 3. Настройки параметров игр (для владельца)
     if is_owner and low.startswith('кд лут '):
         try:
             mins = max(0.0, float(low.split()[-1]))
@@ -1732,14 +1698,13 @@ def handle_all_game_commands(message):
             kb.add(InlineKeyboardButton(f"{mark}{lbl}", callback_data=f"sethostmodel_{m}"))
         bot.send_message(
             cid,
-            f"🎙 <b>Выбери модель для ИИ-Ведущего (Бункер / Мафия):</b>\n"
-            f"<i>По умолчанию стоит <b>Авто-Gemini</b> — ведет игру на твоем Gemini в отдельном чистом окне!</i>",
+            "🎙 <b>Выбери модель для ИИ-Ведущего (Бункер / Мафия):</b>\n"
+            "<i>По умолчанию стоит <b>Авто-Gemini</b> — ведет игру на твоем Gemini в отдельном чистом окне!</i>",
             business_connection_id=biz_id,
             reply_markup=kb
         )
         return
 
-    # 4. Остановка и запуск Бункера / Мафии
     if low in ('стоп игра', 'игра стоп'):
         g = STORY_GAMES.pop(cid, None)
         if g:
@@ -1764,7 +1729,6 @@ def handle_all_game_commands(message):
         threading.Thread(target=start_story_game, args=(cid, biz_id, 'mafia', user), daemon=True).start()
         return
 
-    # 5. Хабаровский Лутинг (/search, лут, мусорка)
     if low in ('/search', 'лут', 'мусорка', 'лутинг'):
         res_text, _ = execute_khabarovsk_looting(user)
         kb = InlineKeyboardMarkup()
@@ -1772,14 +1736,12 @@ def handle_all_game_commands(message):
         bot.send_message(cid, res_text, business_connection_id=biz_id, reply_markup=kb)
         return
 
-    # 6. Вывод списка команд
     if low in ('команды', 'помощь', 'хелп', '/help'):
         is_owner_private = (not biz_id and is_owner)
         help_txt = get_updated_full_commands_text() if is_owner_private else get_chat_commands_text()
         bot.send_message(cid, help_txt, business_connection_id=biz_id)
         return
 
-    # 7. Игровой профиль и Топ
     if low in ('игры', 'рпг', 'профиль'):
         lvl, rank_title = get_level_and_rank(p.get('xp', 0))
         buff_list = [f"• {RARE_BUFFS_INFO[b]['name']} — <i>{RARE_BUFFS_INFO[b]['desc']}</i>" for b in p.get('buffs', []) if b in RARE_BUFFS_INFO]
@@ -1811,7 +1773,6 @@ def handle_all_game_commands(message):
         bot.send_message(cid, "\n".join(lines), business_connection_id=biz_id)
         return
 
-    # 8. Лаборатория PRO, штамм, реактор, карантин, диверсия, эпидемия
     if low in ('лаба', 'моя лаба', 'био', 'биовойны'):
         text, kb = build_lab_view(p)
         bot.send_message(cid, text, business_connection_id=biz_id, reply_markup=kb)
@@ -1902,7 +1863,6 @@ def handle_all_game_commands(message):
         bot.send_message(cid, res_text, business_connection_id=biz_id)
         return
 
-    # 9. Виселица и КНБ
     if low in ('виселица', 'поле чудес', 'виселица ии'):
         is_ai = ('ии' in low)
         if is_ai and not has_ai_access:
@@ -1919,17 +1879,14 @@ def handle_all_game_commands(message):
         send_rps_menu(cid, biz_id=biz_id)
         return
 
-    # 10. Активный Бункер или Мафия
     if cid in STORY_GAMES and not STORY_GAMES[cid].get('finished'):
         record_story_player_message(message)
         return
 
-    # 11. Активная Виселица (ввод букв и слов прямо в чат)
     if cid in HANGMAN_GAMES and not HANGMAN_GAMES[cid].get('finished'):
         process_hangman_letter_or_word(cid, biz_id, user, raw_text, from_chat_text=True)
         return
 
-    # 12. Если обычный юзер написал что-то неизвестное в ЛС бота — показываем ему хаб
     if not biz_id and not is_owner:
         send_public_user_hub(cid, user)
 
@@ -1942,368 +1899,378 @@ def handle_all_game_commands(message):
     call.data in ('panel_img_models', 'loot_again', 'pub_top', 'pub_help')
 ))
 def handle_games_callbacks(call):
-    register_creator_id(call.from_user)
-    data = call.data
-    user = call.from_user
-    is_owner = (user.id == main.CREATOR_ID) or ((user.username or '').lower() == CREATOR_USERNAME)
-    p = get_player(user)
-    cid = int(call.message.chat.id)
-    msg_id = call.message.message_id
-    biz_id = getattr(call.message, 'business_connection_id', None)
+    try:
+        register_creator_id(call.from_user)
+        data = call.data
+        user = call.from_user
+        uname = (user.username or '').lower()
+        is_owner = (uname == CREATOR_USERNAME.lower()) or (main.CREATOR_ID and user.id == int(main.CREATOR_ID))
+        p = get_player(user)
+        cid = int(call.message.chat.id)
+        msg_id = call.message.message_id
+        biz_id = getattr(call.message, 'business_connection_id', None)
 
-    if biz_id and not is_business_connection_authorized(biz_id):
-        bot.answer_callback_query(call.id, "⛔ Нет доступа для этого бизнес-аккаунта!", show_alert=True)
-        return
-
-    if data == 'pub_top':
-        sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('xp', 0) + x.get('bio_xp', 0)), reverse=True)[:10]
-        lines = ["🏆 <b>Глобальный Топ Био-войн PRO и Игр:</b>\n"]
-        for idx, pl in enumerate(sorted_p, 1):
-            lvl, r_title = get_level_and_rank(pl.get('xp', 0))
-            p_name = html.escape(pl.get('name', 'Игрок'))
-            lines.append(f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>")
-        bot.send_message(cid, "\n".join(lines), business_connection_id=biz_id)
-        bot.answer_callback_query(call.id)
-        return
-
-    if data == 'pub_help':
-        bot.send_message(cid, get_chat_commands_text(), business_connection_id=biz_id)
-        bot.answer_callback_query(call.id)
-        return
-
-    if data.startswith('sethostmodel_'):
-        if not is_owner:
-            return
-        CONFIG['game_host_model'] = data.replace('sethostmodel_', '')
-        save_config()
-        lbl = f"Авто-Gemini ({main.ACTIVE_MODEL})" if CONFIG['game_host_model'] == 'auto_gemini' else CONFIG['game_host_model']
-        safe_edit_message(
-            f"✅ <b>Модель ИИ-Ведущего (для Бункера и Мафии) установлена:</b> <code>{lbl}</code>\n"
-            f"<i>(Ведет игру в отдельном изолированном контекстном окне!)</i>",
-            cid, msg_id, business_id=biz_id
-        )
-        bot.answer_callback_query(call.id, f"Ведущий: {lbl}")
-        return
-
-    if data == 'loot_again':
-        res_text, ok = execute_khabarovsk_looting(user)
-        if not ok:
-            plain_alert = re.sub(r'<[^>]+>', '', res_text)
-            bot.answer_callback_query(call.id, plain_alert[:195], show_alert=True)
-            return
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🗑 Порыться еще раз", callback_data="loot_again"))
-        bot.send_message(cid, res_text, business_connection_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, "🗑 Мусорка проверена!")
-        return
-
-    if data.startswith('sg_'):
-        parts = data.split('_')
-        action = parts[1]
-        game_cid = int(parts[2])
-        game = STORY_GAMES.get(game_cid)
-        if not game or game.get('finished'):
-            bot.answer_callback_query(call.id, "⚠️ Партия уже завершена!", show_alert=True)
+        if biz_id and not is_business_connection_authorized(biz_id):
+            bot.answer_callback_query(call.id, "⛔ Нет доступа для этого бизнес-аккаунта!", show_alert=True)
             return
 
-        role = 'p1' if (is_owner or not game.get('biz_id')) else 'p2'
-        if action == 'role':
-            r_text = game.get(f'{role}_role', 'Нет данных')
-            bot.answer_callback_query(call.id, f"🪪 ТВОЯ СЕКРЕТНАЯ РОЛЬ:\n{r_text}"[:195], show_alert=True)
-            return
-
-        if action == 'loot':
-            l_text = game.get(f'{role}_loot', 'Нет данных')
-            bot.answer_callback_query(call.id, f"🎒 ТВОЙ ЛУТ И УЛИКИ:\n{l_text}"[:195], show_alert=True)
-            return
-
-        if action == 'force':
-            ready, missing = check_story_round_ready(game)
-            if not ready:
-                miss_str = ", ".join(missing)
-                bot.answer_callback_query(call.id, f"⏳ Сначала каждый должен написать хотя бы по 1 сообщению! Ждем: {miss_str}"[:195], show_alert=True)
-                return
-            bot.answer_callback_query(call.id, "🎙 Передаю ответы Ведущему!")
-            threading.Thread(target=advance_story_game_round, args=(game_cid,), daemon=True).start()
-            return
-
-        if action == 'stop':
-            STORY_GAMES.pop(game_cid, None)
-            if game.get('timer'):
-                game['timer'].cancel()
-            safe_edit_message(f"🏳️ Игра «<b>{game['title']}</b>» остановлена игроком {html.escape(p['name'])}.", cid, msg_id, business_id=biz_id)
-            bot.answer_callback_query(call.id, "Игра остановлена")
-            return
-
-    if data == 'panel_img_models':
-        if not is_owner:
-            return
-        cur_m = CONFIG.get('image_model', 'flux')
-        kb = InlineKeyboardMarkup(row_width=1)
-        for m in FREE_IMAGE_MODELS:
-            mark = "✅ " if m == cur_m else ""
-            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
-        kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-        safe_edit_message("🎨 <b>Выбери бесплатную FLUX-модель для рисования:</b>", cid, msg_id, reply_markup=kb)
-        bot.answer_callback_query(call.id)
-        return
-
-    if data.startswith('biorefresh_'):
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, "Лаборатория обновлена")
-        return
-
-    if data.startswith('biocollect_'):
-        owner_uid = data.split('_')[1]
-        if str(user.id) != owner_uid:
-            bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
-            return
-        pending, _, _ = get_pending_reactor_viruses(p)
-        if pending <= 0:
-            bot.answer_callback_query(call.id, "🏭 В реакторе пока 0 вирусов, подожди немного!", show_alert=True)
-            return
-        p['bio_res'] += pending
-        p['last_reactor_ts'] = time.time()
-        save_rpg_firebase()
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, f"🔋 Собрано +{pending} вирусов из Реактора!", show_alert=True)
-        return
-
-    if data.startswith('bioquar_'):
-        owner_uid = data.split('_')[1]
-        if str(user.id) != owner_uid:
-            bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
-            return
-        if p.get('bio_res', 0) < 250:
-            bot.answer_callback_query(call.id, "⚠️ Для Карантина на 2ч нужно 250 вирусов!", show_alert=True)
-            return
-        p['bio_res'] -= 250
-        p['quarantine_until'] = max(time.time(), p.get('quarantine_until', 0)) + 7200
-        save_rpg_firebase()
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, "🛡 Купол Карантина активирован на 2 часа!", show_alert=True)
-        return
-
-    if data.startswith('bioepid_'):
-        owner_uid = data.split('_')[1]
-        if str(user.id) != owner_uid:
-            bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
-            return
-        res_text = perform_epidemic_wave(user)
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.send_message(cid, res_text, business_connection_id=biz_id)
-        bot.answer_callback_query(call.id, "🌪 Волна эпидемии запущена!")
-        return
-
-    if data.startswith('biocure_'):
-        owner_uid = data.split('_')[1]
-        if str(user.id) != owner_uid:
-            bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
-            return
-        if p.get('bio_res', 0) < 80:
-            bot.answer_callback_query(call.id, "⚠️ Нужно 80 вирусов для вакцины!", show_alert=True)
-            return
-        p['bio_res'] -= 80
-        p['fever_until'] = 0
-        p['infected_by'] = ''
-        save_rpg_firebase()
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, "💉 Выздоровление! Горячка снята.")
-        return
-
-    if data.startswith('bioupg_'):
-        parts = data.split('_')
-        owner_uid = parts[1]
-        upg_key = parts[2]
-        if str(user.id) != owner_uid:
-            bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория! Открой свою командой «лаба».", show_alert=True)
-            return
-        cost = get_upgrade_cost(p, upg_key)
-        field, label, _ = UPGRADE_TYPES[upg_key]
-        if p.get('bio_res', 0) < cost:
-            bot.answer_callback_query(call.id, f"⚠️ Не хватает вирусов! Нужно {cost} 🧬.", show_alert=True)
-            return
-        p['bio_res'] -= cost
-        p[field] = p.get(field, 1) + 1
-        p['xp'] = p.get('xp', 0) + 20
-        save_rpg_firebase()
-        text, kb = build_lab_view(p)
-        safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-        bot.answer_callback_query(call.id, f"✅ {label} -> Ур. {p[field]}!")
-        return
-
-    if data.startswith('hm_'):
-        parts = data.split('_')
-        action = parts[1]
-        game_cid = int(parts[2])
-        game = HANGMAN_GAMES.get(game_cid)
-
-        if action == 'new':
-            mode_type = parts[3]
-            is_ai = (mode_type == 'ai')
-            if is_ai and not (is_user_authorized_for_ai(user) or bool(biz_id)):
-                bot.answer_callback_query(call.id, "🔒 Виселица ИИ в ЛС доступна по разрешению владельца!", show_alert=True)
-                return
-            if is_ai:
-                safe_edit_message("🧠 <i>ГПТ вспоминает ваш чат и придумывает новое слово...</i>", cid, msg_id, business_id=biz_id)
-            start_hangman_game(game_cid, biz_id, user, is_ai=is_ai, msg_id_to_edit=msg_id)
+        if data == 'pub_top':
+            sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('xp', 0) + x.get('bio_xp', 0)), reverse=True)[:10]
+            lines = ["🏆 <b>Глобальный Топ Био-войн PRO и Игр:</b>\n"]
+            for idx, pl in enumerate(sorted_p, 1):
+                lvl, r_title = get_level_and_rank(pl.get('xp', 0))
+                p_name = html.escape(pl.get('name', 'Игрок'))
+                lines.append(f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>")
+            bot.send_message(cid, "\n".join(lines), business_connection_id=biz_id)
             bot.answer_callback_query(call.id)
             return
 
-        if not game or game.get('finished'):
-            bot.answer_callback_query(call.id, "Игра уже завершена!")
+        if data == 'pub_help':
+            bot.send_message(cid, get_chat_commands_text(), business_connection_id=biz_id)
+            bot.answer_callback_query(call.id)
             return
 
-        u_name = html.escape(p['name'])
-        if action == 'giveup':
-            game['finished'] = True
-            game['guessed'].update(list(game['word']))
-            game['status'] = f"🏳️ <b>{u_name}</b> сдался! Загаданное слово: <b>{game['word']}</b>"
-            text, kb = build_hangman_view(game)
+        if data.startswith('sethostmodel_'):
+            if not is_owner:
+                return
+            CONFIG['game_host_model'] = data.replace('sethostmodel_', '')
+            save_config()
+            lbl = f"Авто-Gemini ({main.ACTIVE_MODEL})" if CONFIG['game_host_model'] == 'auto_gemini' else CONFIG['game_host_model']
+            safe_edit_message(
+                f"✅ <b>Модель ИИ-Ведущего (для Бункера и Мафии) установлена:</b> <code>{lbl}</code>\n"
+                f"<i>(Ведет игру в отдельном изолированном контекстном окне!)</i>",
+                cid, msg_id, business_id=biz_id
+            )
+            bot.answer_callback_query(call.id, f"Ведущий: {lbl}")
+            return
+
+        if data == 'loot_again':
+            res_text, ok = execute_khabarovsk_looting(user)
+            if not ok:
+                plain_alert = re.sub(r'<[^>]+>', '', res_text)
+                bot.answer_callback_query(call.id, plain_alert[:195], show_alert=True)
+                return
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("🗑 Порыться еще раз", callback_data="loot_again"))
+            bot.send_message(cid, res_text, business_connection_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, "🗑 Мусорка проверена!")
+            return
+
+        if data.startswith('sg_'):
+            parts = data.split('_')
+            action = parts[1]
+            game_cid = int(parts[2])
+            game = STORY_GAMES.get(game_cid)
+            if not game or game.get('finished'):
+                bot.answer_callback_query(call.id, "⚠️ Партия уже завершена!", show_alert=True)
+                return
+
+            role = 'p1' if (is_owner or not game.get('biz_id')) else 'p2'
+            if action == 'role':
+                r_text = game.get(role + '_role', 'Нет данных')
+                bot.answer_callback_query(call.id, f"🪪 ТВОЯ СЕКРЕТНАЯ РОЛЬ:\n{r_text}"[:195], show_alert=True)
+                return
+
+            if action == 'loot':
+                l_text = game.get(role + '_loot', 'Нет данных')
+                bot.answer_callback_query(call.id, f"🎒 ТВОЙ ЛУТ И УЛИКИ:\n{l_text}"[:195], show_alert=True)
+                return
+
+            if action == 'force':
+                ready, missing = check_story_round_ready(game)
+                if not ready:
+                    miss_str = ", ".join(missing)
+                    bot.answer_callback_query(call.id, f"⏳ Сначала каждый должен написать хотя бы по 1 сообщению! Ждем: {miss_str}"[:195], show_alert=True)
+                    return
+                bot.answer_callback_query(call.id, "🎙 Передаю ответы Ведущему!")
+                threading.Thread(target=advance_story_game_round, args=(game_cid,), daemon=True).start()
+                return
+
+            if action == 'stop':
+                STORY_GAMES.pop(game_cid, None)
+                if game.get('timer'):
+                    game['timer'].cancel()
+                safe_edit_message(f"🏳️ Игра «<b>{game['title']}</b>» остановлена игроком {html.escape(p['name'])}.", cid, msg_id, business_id=biz_id)
+                bot.answer_callback_query(call.id, "Игра остановлена")
+                return
+
+        if data == 'panel_img_models':
+            if not is_owner:
+                return
+            cur_m = CONFIG.get('image_model', 'flux')
+            kb = InlineKeyboardMarkup(row_width=1)
+            for m in FREE_IMAGE_MODELS:
+                mark = "✅ " if m == cur_m else ""
+                kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
+            kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
+            safe_edit_message("🎨 <b>Выбери бесплатную FLUX-модель для рисования:</b>", cid, msg_id, reply_markup=kb)
+            bot.answer_callback_query(call.id)
+            return
+
+        if data.startswith('biorefresh_'):
+            text, kb = build_lab_view(p)
             safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
-            bot.answer_callback_query(call.id, "Игра окончена")
+            bot.answer_callback_query(call.id, "Лаборатория обновлена")
             return
 
-        if action == 'let':
-            letter = parts[3]
-            process_hangman_letter_or_word(game_cid, biz_id, user, letter, from_chat_text=False)
-            bot.answer_callback_query(call.id)
-            return
-
-    if data.startswith('rps_'):
-        parts = data.split('_')
-        mode = parts[1]
-        game_cid = int(parts[2])
-
-        if mode == 'botmenu':
-            kb = InlineKeyboardMarkup(row_width=3)
-            kb.row(
-                InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
-                InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
-                InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
-            )
-            safe_edit_message("🤖 <b>Бой против Бота! Выбирай предмет:</b>", cid, msg_id, business_id=biz_id, reply_markup=kb)
-            bot.answer_callback_query(call.id)
-            return
-
-        if mode == 'bot':
-            u_move = parts[3]
-            b_move = random.choice(['r', 's', 'p'])
-            u_name = html.escape(p['name'])
-            if u_move == b_move:
-                bonus = ""
-                if 'trickster_glove' in p.get('buffs', []) and random.randint(1, 100) <= 25:
-                    p['bio_res'] += 40
-                    bonus = "\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 даже в ничью!</i>"
-                res_line = f"🤝 <b>Ничья!</b> Оба выбрали {RPS_NAMES[u_move]}.{bonus}"
-            elif (u_move, b_move) in RPS_WINS:
-                p['bio_res'] += 45
-                p['xp'] += 20
-                p['wins_rps'] = p.get('wins_rps', 0) + 1
-                buff_str = try_grant_rare_buff(p) or ""
-                res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+45 🧬, +20 XP){buff_str}"
-            else:
-                res_line = "🤖 <b>Бот победил в этом раунде!</b>"
-
+        if data.startswith('biocollect_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            pending, _, _ = get_pending_reactor_viruses(p)
+            if pending <= 0:
+                bot.answer_callback_query(call.id, "🏭 В реакторе пока 0 вирусов, подожди немного!", show_alert=True)
+                return
+            p['bio_res'] += pending
+            p['last_reactor_ts'] = time.time()
             save_rpg_firebase()
-            kb = InlineKeyboardMarkup(row_width=3)
-            kb.row(
-                InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
-                InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
-                InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
-            )
-            out = (
-                f"✂️ <b>Камень-Ножницы-Бумага (с Ботом)</b>\n\n"
-                f"👤 <b>{u_name}:</b> {RPS_NAMES[u_move]}\n"
-                f"🤖 <b>Бот:</b> {RPS_NAMES[b_move]}\n\n"
-                f"{res_line}"
-            )
-            safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
-            bot.answer_callback_query(call.id)
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, f"🔋 Собрано +{pending} вирусов из Реактора!", show_alert=True)
             return
 
-        if mode == 'pvp':
-            move = parts[3]
-            room = RPS_GAMES.setdefault(game_cid, {'biz_id': biz_id, 'moves': {}, 'names': {}, 'users': {}})
-            uid = str(user.id)
-            room['moves'][uid] = move
-            room['names'][uid] = p['name']
-            room['users'][uid] = user
+        if data.startswith('bioquar_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            if p.get('bio_res', 0) < 250:
+                bot.answer_callback_query(call.id, "⚠️ Для Карантина на 2ч нужно 250 вирусов!", show_alert=True)
+                return
+            p['bio_res'] -= 250
+            p['quarantine_until'] = max(time.time(), p.get('quarantine_until', 0)) + 7200
+            save_rpg_firebase()
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, "🛡 Купол Карантина активирован на 2 часа!", show_alert=True)
+            return
 
-            if len(room['moves']) < 2:
+        if data.startswith('bioepid_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            res_text = perform_epidemic_wave(user)
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.send_message(cid, res_text, business_connection_id=biz_id)
+            bot.answer_callback_query(call.id, "🌪 Волна эпидемии запущена!")
+            return
+
+        if data.startswith('biocure_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            if p.get('bio_res', 0) < 80:
+                bot.answer_callback_query(call.id, "⚠️ Нужно 80 вирусов для вакцины!", show_alert=True)
+                return
+            p['bio_res'] -= 80
+            p['fever_until'] = 0
+            p['infected_by'] = ''
+            save_rpg_firebase()
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, "💉 Выздоровление! Горячка снята.")
+            return
+
+        if data.startswith('bioupg_'):
+            parts = data.split('_')
+            owner_uid = parts[1]
+            upg_key = parts[2]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория! Открой свою командой «лаба».", show_alert=True)
+                return
+            cost = get_upgrade_cost(p, upg_key)
+            field, label, _ = UPGRADE_TYPES[upg_key]
+            if p.get('bio_res', 0) < cost:
+                bot.answer_callback_query(call.id, f"⚠️ Не хватает вирусов! Нужно {cost} 🧬.", show_alert=True)
+                return
+            p['bio_res'] -= cost
+            p[field] = p.get(field, 1) + 1
+            p['xp'] = p.get('xp', 0) + 20
+            save_rpg_firebase()
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, f"✅ {label} -> Ур. {p[field]}!")
+            return
+
+        if data.startswith('hm_'):
+            parts = data.split('_')
+            action = parts[1]
+            game_cid = int(parts[2])
+            game = HANGMAN_GAMES.get(game_cid)
+
+            if action == 'new':
+                mode_type = parts[3]
+                is_ai = (mode_type == 'ai')
+                if is_ai and not (is_user_authorized_for_ai(user) or bool(biz_id)):
+                    bot.answer_callback_query(call.id, "🔒 Виселица ИИ в ЛС доступна по разрешению владельца!", show_alert=True)
+                    return
+                if is_ai:
+                    safe_edit_message("🧠 <i>ГПТ вспоминает ваш чат и придумывает новое слово...</i>", cid, msg_id, business_id=biz_id)
+                start_hangman_game(game_cid, biz_id, user, is_ai=is_ai, msg_id_to_edit=msg_id)
+                bot.answer_callback_query(call.id)
+                return
+
+            if not game or game.get('finished'):
+                bot.answer_callback_query(call.id, "Игра уже завершена!")
+                return
+
+            u_name = html.escape(p['name'])
+            if action == 'giveup':
+                game['finished'] = True
+                game['guessed'].update(list(game['word']))
+                game['status'] = f"🏳️ <b>{u_name}</b> сдался! Загаданное слово: <b>{game['word']}</b>"
+                text, kb = build_hangman_view(game)
+                safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id, "Игра окончена")
+                return
+
+            if action == 'let':
+                letter = parts[3]
+                process_hangman_letter_or_word(game_cid, biz_id, user, letter, from_chat_text=False)
+                bot.answer_callback_query(call.id)
+                return
+
+        if data.startswith('rps_'):
+            parts = data.split('_')
+            mode = parts[1]
+            game_cid = int(parts[2])
+
+            if mode == 'botmenu':
+                kb = InlineKeyboardMarkup(row_width=3)
+                kb.row(
+                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
+                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
+                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
+                )
+                safe_edit_message("🤖 <b>Бой против Бота! Выбирай предмет:</b>", cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id)
+                return
+
+            if mode == 'bot':
+                u_move = parts[3]
+                b_move = random.choice(['r', 's', 'p'])
                 u_name = html.escape(p['name'])
+                if u_move == b_move:
+                    bonus = ""
+                    if 'trickster_glove' in p.get('buffs', []) and random.randint(1, 100) <= 25:
+                        p['bio_res'] += 40
+                        bonus = "\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 даже в ничью!</i>"
+                    res_line = f"🤝 <b>Ничья!</b> Оба выбрали {RPS_NAMES[u_move]}.{bonus}"
+                elif (u_move, b_move) in RPS_WINS:
+                    p['bio_res'] += 45
+                    p['xp'] += 20
+                    p['wins_rps'] = p.get('wins_rps', 0) + 1
+                    buff_str = try_grant_rare_buff(p) or ""
+                    res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+45 🧬, +20 XP){buff_str}"
+                else:
+                    res_line = "🤖 <b>Бот победил в этом раунде!</b>"
+
+                save_rpg_firebase()
+                kb = InlineKeyboardMarkup(row_width=3)
+                kb.row(
+                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
+                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
+                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
+                )
+                out = (
+                    f"✂️ <b>Камень-Ножницы-Бумага (с Ботом)</b>\n\n"
+                    f"👤 <b>{u_name}:</b> {RPS_NAMES[u_move]}\n"
+                    f"🤖 <b>Бот:</b> {RPS_NAMES[b_move]}\n\n"
+                    f"{res_line}"
+                )
+                safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id)
+                return
+
+            if mode == 'pvp':
+                move = parts[3]
+                room = RPS_GAMES.setdefault(game_cid, {'biz_id': biz_id, 'moves': {}, 'names': {}, 'users': {}})
+                uid = str(user.id)
+                room['moves'][uid] = move
+                room['names'][uid] = p['name']
+                room['users'][uid] = user
+
+                if len(room['moves']) < 2:
+                    u_name = html.escape(p['name'])
+                    kb = InlineKeyboardMarkup(row_width=3)
+                    kb.row(
+                        InlineKeyboardButton("🪨 Камень", callback_data=f"rps_pvp_{game_cid}_r"),
+                        InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_pvp_{game_cid}_s"),
+                        InlineKeyboardButton("📄 Бумага", callback_data=f"rps_pvp_{game_cid}_p")
+                    )
+                    safe_edit_message(
+                        f"🪨✂️📄 <b>Дуэль 1 на 1!</b>\n\n"
+                        f"✅ <b>{u_name}</b> уже сделал(а) свой секретный выбор!\n"
+                        f"⏳ Ожидаем нажатия второго игрока...",
+                        cid, msg_id, business_id=biz_id, reply_markup=kb
+                    )
+                    bot.answer_callback_query(call.id, f"Ты выбрал(а): {RPS_NAMES[move]}. Ждем соперника!")
+                    return
+
+                uids = list(room['moves'].keys())
+                u1, u2 = uids[0], uids[1]
+                m1, m2 = room['moves'][u1], room['moves'][u2]
+                n1, n2 = html.escape(room['names'][u1]), html.escape(room['names'][u2])
+                p1_obj = get_player(room['users'][u1])
+                p2_obj = get_player(room['users'][u2])
+
+                if m1 == m2:
+                    verdict = "🤝 <b>Боевая ничья!</b>"
+                elif (m1, m2) in RPS_WINS:
+                    p1_obj['bio_res'] += 60
+                    p1_obj['xp'] += 25
+                    p1_obj['wins_rps'] = p1_obj.get('wins_rps', 0) + 1
+                    b_str = try_grant_rare_buff(p1_obj) or ""
+                    verdict = f"🏆 <b>Победил(а) {n1}!</b> (+60 🧬, +25 XP){b_str}"
+                else:
+                    p2_obj['bio_res'] += 60
+                    p2_obj['xp'] += 25
+                    p2_obj['wins_rps'] = p2_obj.get('wins_rps', 0) + 1
+                    b_str = try_grant_rare_buff(p2_obj) or ""
+                    verdict = f"🏆 <b>Победил(а) {n2}!</b> (+60 🧬, +25 XP){b_str}"
+
+                save_rpg_firebase()
+                room['moves'].clear()
+
                 kb = InlineKeyboardMarkup(row_width=3)
                 kb.row(
                     InlineKeyboardButton("🪨 Камень", callback_data=f"rps_pvp_{game_cid}_r"),
                     InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_pvp_{game_cid}_s"),
                     InlineKeyboardButton("📄 Бумага", callback_data=f"rps_pvp_{game_cid}_p")
                 )
-                safe_edit_message(
-                    f"🪨✂️📄 <b>Дуэль 1 на 1!</b>\n\n"
-                    f"✅ <b>{u_name}</b> уже сделал(а) свой секретный выбор!\n"
-                    f"⏳ Ожидаем нажатия второго игрока...",
-                    cid, msg_id, business_id=biz_id, reply_markup=kb
+                out = (
+                    f"⚔️ <b>Итог дуэли КНБ:</b>\n\n"
+                    f"👤 <b>{n1}:</b> {RPS_NAMES[m1]}\n"
+                    f"👤 <b>{n2}:</b> {RPS_NAMES[m2]}\n\n"
+                    f"{verdict}\n\n"
+                    f"<i>👇 Жмите на кнопки для реванша!</i>"
                 )
-                bot.answer_callback_query(call.id, f"Ты выбрал(а): {RPS_NAMES[move]}. Ждем соперника!")
-                return
-
-            uids = list(room['moves'].keys())
-            u1, u2 = uids[0], uids[1]
-            m1, m2 = room['moves'][u1], room['moves'][u2]
-            n1, n2 = html.escape(room['names'][u1]), html.escape(room['names'][u2])
-            p1_obj = get_player(room['users'][u1])
-            p2_obj = get_player(room['users'][u2])
-
-            if m1 == m2:
-                verdict = "🤝 <b>Боевая ничья!</b>"
-            elif (m1, m2) in RPS_WINS:
-                p1_obj['bio_res'] += 60
-                p1_obj['xp'] += 25
-                p1_obj['wins_rps'] = p1_obj.get('wins_rps', 0) + 1
-                b_str = try_grant_rare_buff(p1_obj) or ""
-                verdict = f"🏆 <b>Победил(а) {n1}!</b> (+60 🧬, +25 XP){b_str}"
-            else:
-                p2_obj['bio_res'] += 60
-                p2_obj['xp'] += 25
-                p2_obj['wins_rps'] = p2_obj.get('wins_rps', 0) + 1
-                b_str = try_grant_rare_buff(p2_obj) or ""
-                verdict = f"🏆 <b>Победил(а) {n2}!</b> (+60 🧬, +25 XP){b_str}"
-
-            save_rpg_firebase()
-            room['moves'].clear()
-
-            kb = InlineKeyboardMarkup(row_width=3)
-            kb.row(
-                InlineKeyboardButton("🪨 Камень", callback_data=f"rps_pvp_{game_cid}_r"),
-                InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_pvp_{game_cid}_s"),
-                InlineKeyboardButton("📄 Бумага", callback_data=f"rps_pvp_{game_cid}_p")
-            )
-            out = (
-                f"⚔️ <b>Итог дуэли КНБ:</b>\n\n"
-                f"👤 <b>{n1}:</b> {RPS_NAMES[m1]}\n"
-                f"👤 <b>{n2}:</b> {RPS_NAMES[m2]}\n\n"
-                f"{verdict}\n\n"
-                f"<i>👇 Жмите на кнопки для реванша!</i>"
-            )
-            safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
-            bot.answer_callback_query(call.id, "Вскрываемся!")
+                safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id, "Вскрываемся!")
+    except Exception as e:
+        print(f"⚠️ Ошибка в handle_games_callbacks: {e}")
 
 @bot.business_message_handler(func=should_intercept_business_message, content_types=['text', 'photo', 'voice', 'video_note', 'audio', 'document', 'video'])
 def _biz_game_router(message):
-    if message.content_type == 'text':
-        handle_all_game_commands(message)
+    try:
+        if message.content_type == 'text':
+            handle_all_game_commands(message)
+    except Exception as e:
+        print(f"⚠️ Ошибка в _biz_game_router: {e}")
 
 @bot.message_handler(func=should_intercept_private_message, content_types=['text', 'photo', 'voice', 'video_note', 'audio', 'document', 'video'])
 def _priv_game_router(message):
-    if message.content_type == 'text':
-        handle_all_game_commands(message)
+    try:
+        if message.content_type == 'text':
+            handle_all_game_commands(message)
+    except Exception as e:
+        print(f"⚠️ Ошибка в _priv_game_router: {e}")
 
-# Ставим обработчики первыми в очередь
 bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
 bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
 bot.message_handlers.insert(0, bot.message_handlers.pop())
+print("🎮 МОДУЛЬ ИГР (games.py) УСПЕШНО ПОДКЛЮЧЕН!")
