@@ -33,13 +33,14 @@ DEFAULT_MOD_CONFIG = {
     'game_round_seconds': 60,
     'game_max_rounds': 3,
     'game_host_model': 'auto_gemini',
-    'pm_spy_enabled': True,           # Пересылать ли владельцу действия юзеров в ЛС бота
-    'reward_bunker': 1000,            # Приз за победу в Бункере / Мафии
-    'reward_hangman': 200,            # Приз за победу в Виселице
-    'reward_rps': 50,                 # Приз за победу в КНБ
-    'vaccine_cost': 80,               # Цена вакцины
-    'base_patogen_minutes': 15,       # Базовое время синтеза 1 патогена в минутах
-    'base_infect_chance': 55          # Базовый шанс заражения в %
+    'pm_spy_enabled': True,
+    'reward_bunker': 1000,
+    'reward_hangman': 200,
+    'reward_rps': 50,
+    'vaccine_cost': 80,
+    'quarantine_cost': 250,
+    'base_patogen_minutes': 15,
+    'base_infect_chance': 55
 }
 
 for k_def, v_def in DEFAULT_MOD_CONFIG.items():
@@ -54,11 +55,9 @@ for dict_k in ('allowed_users', 'bot_banned_users'):
         CONFIG[dict_k] = {}
 
 BIZ_CONN_OWNER_CACHE = {}
-
-# Логи переписки пользователей с ботом в ЛС и карта реплаев для ответа от имени бота
-BOT_PM_LOGS = {}          # uid_str -> {'name': str, 'username': str, 'log': [str]}
-FORWARDED_PM_MAP = {}     # admin_msg_id -> target_uid_int
-ADMIN_LIVE_CHAT_UID = None  # ID юзера, с которым владелец сейчас ведет прямой диалог от лица бота
+BOT_PM_LOGS = {}
+FORWARDED_PM_MAP = {}
+ADMIN_LIVE_CHAT_UID = None
 
 # =====================================================================
 # 🔒 0. ЗАЩИТА ТГ БИЗНЕС, ПРОВЕРКА ПРАВ И ПЕРЕСЫЛКА ЛС БОТА
@@ -110,7 +109,6 @@ def is_business_connection_authorized(biz_id):
     return True
 
 def log_bot_pm_interaction(user, text, from_bot=False):
-    """Записывает сообщения пользователя в ЛС бота и ответы бота для просмотра владельцем."""
     if not user or is_owner_user(user):
         return
     uid_str = str(user.id)
@@ -130,7 +128,6 @@ def log_bot_pm_interaction(user, text, from_bot=False):
         entry['log'] = entry['log'][-60:]
 
 def notify_owner_about_bot_pm(user, text):
-    """Пересылает владельцу сообщение, которое пользователь написал боту в ЛС."""
     if not user or is_owner_user(user):
         return
     log_bot_pm_interaction(user, text, from_bot=False)
@@ -164,7 +161,6 @@ def notify_owner_about_bot_pm(user, text):
         pass
 
 def send_logged_pm(chat_id, text, business_connection_id=None, reply_markup=None, target_user=None):
-    """Отправляет сообщение и, если это ЛС бота с пользователем, сохраняет ответ бота в лог."""
     sent = bot.send_message(chat_id, text, business_connection_id=business_connection_id, reply_markup=reply_markup)
     if not business_connection_id and target_user and not is_owner_user(target_user):
         log_bot_pm_interaction(target_user, text, from_bot=True)
@@ -194,20 +190,23 @@ def get_updated_full_commands_text():
         "• <code>кд лут 5</code> | <code>кд патоген 15</code> | <code>цена вакцины 80</code>\n"
         "• <code>приз бункер 1000</code> | <code>приз виселица 200</code> | <code>приз кнб 50</code>\n"
         "• <code>время игры 60</code> | <code>раунды игры 3</code> | <code>игра-модели</code>\n\n"
-        "🔹 <b>3. Сюжетные ИИ-Игры, Лутинг, Виселица и КНБ:</b>\n"
+        "🔹 <b>3. Сюжетные ИИ-Игры, Лутинг (24 предмета), Виселица и КНБ:</b>\n"
         "• <code>бункер</code> | <code>мафия</code> | <code>стоп игра</code> — игры с Ведущим Gemini в отдельном окне\n"
         "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — «Хабаровский Лутинг» у Меда\n"
         "• <code>виселица</code> / <code>виселица ии</code> — Поле Чудес (кнопки + буквы/слова в чат)\n"
         "• <code>кнб</code> — Камень-Ножницы-Бумага\n\n"
-        "🔹 <b>4. Био-войны (Классика Ириса + Залп без спама):</b>\n"
-        "• <code>лаба</code> (или <code>био</code>) — твоя Био-Лаборатория (6 классических навыков)\n"
+        "🔹 <b>4. Био-войны PRO (8 модулей + Залп без спама + Эволюция):</b>\n"
+        "• <code>лаба</code> (или <code>био</code>) — твоя Био-Лаборатория PRO (8 модулей прокачки)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — пустить 1 патоген (с уведомлением жертве!)\n"
-        "• <code>заразить все</code> (или <code>заразить все @юзер</code> / <code>заразить фулл</code>) — выпустить ВСЕ патогены разом в одном отчете без спама!\n"
-        "• <code>вакцина</code> — вылечить горячку | <code>штамм [имя]</code> — назвать свой вирус\n"
-        "• <code>игры</code> (или <code>профиль</code>) | <code>био топ</code> — звания, баффы и рейтинг\n\n"
+        "• <code>заразить все</code> (или <code>заразить все @юзер</code>) — выпустить ВСЕ патогены разом в одном отчете!\n"
+        "• <code>диверсия</code> (или <code>диверсия @юзер</code>) — ограбить чужую лабораторию\n"
+        "• <code>эпидемия</code> — массовая атака по 3 случайным игрокам (2 патогена)\n"
+        "• <code>сбор</code> — забрать пассивные вирусы из Био-Реактора\n"
+        "• <code>карантин</code> (щит на 2ч) | <code>вакцина</code> (вылечить горячку) | <code>штамм [имя]</code>\n"
+        "• <code>эволюция</code> — сбросить лабу (от 15 ур. модулей) ради вечного Ген-Престижа (+20% дохода и +3% пробития)!\n"
+        "• <code>игры</code> (или <code>профиль</code>) | <code>био топ</code> — 30 званий, 12 артефактов и рейтинг\n\n"
         "🔹 <b>5. Обычный ГПТ, Автоответчик и Голосовые:</b>\n"
-        "• <code>гпт [текст]</code> | <code>нарисуй [текст]</code> | <code>рс</code> | <code>рассуди</code> | <code>анализ</code> | <code>5 копеек</code>\n"
-        "• <code>модели</code> | <code>авто-модели</code> | <code>фото-модели</code> | <code>обучение</code> | <code>ключи</code>"
+        "• <code>гпт [текст]</code> | <code>нарисуй [текст]</code> | <code>рс</code> | <code>рассуди</code> | <code>анализ</code> | <code>5 копеек</code>"
     )
 
 def get_chat_commands_text():
@@ -217,26 +216,27 @@ def get_chat_commands_text():
         "• <code>бункер</code> — «Бункер на выживание» (скрытые карты, катастрофа по чату, ведет Gemini)\n"
         "• <code>мафия</code> — «Мафия: Допрос» (секретные роли, улики, блеф)\n"
         "• <code>стоп игра</code> — завершить текущую партию\n\n"
-        "🗑 <b>Хабаровский Лутинг и Мини-игры:</b>\n"
-        "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — копаться в мусорке у Меда (до +800 🧬)\n"
+        "🗑 <b>Хабаровский Лутинг (24 предмета) и Мини-игры:</b>\n"
+        "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — копаться в мусорке у Меда (6 тиров редкости до +2000 🧬)\n"
         "• <code>виселица</code> — Поле Чудес (+200 🧬 за победу, пиши буквы или слова прямо в чат!)\n"
         "• <code>виселица ии</code> — ГПТ загадывает слово по контексту вашего чата (+250 🧬)!\n"
         "• <code>кнб</code> — Камень-Ножницы-Бумага\n\n"
-        "🧬 <b>Био-войны (Коронаирис):</b>\n"
-        "• <code>лаба</code> — открыть свою Био-Лабораторию и прокачку\n"
+        "🧬 <b>Био-войны PRO (Коронаирис + Эволюция):</b>\n"
+        "• <code>лаба</code> — открыть свою Био-Лабораторию PRO (8 модулей + Реактор + Эпидемия)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — атаковать 1 патогеном\n"
-        "• <code>заразить все</code> (или <code>заразить все @юзер</code>) — атаковать сразу ВСЕМИ патогенами без спама!\n"
-        "• <code>вакцина</code> — вылечить горячку\n"
-        "• <code>штамм [название]</code> — дать имя своему вирусу\n"
-        "• <code>+патоген</code> | <code>+разработка</code> | <code>+заразность</code> | <code>+иммунитет</code> | <code>+летальность</code> | <code>+безопасность</code>\n"
-        "• <code>профиль</code> (или <code>игры</code>) | <code>био топ</code> — твой ранг, баффы и таблица лидеров\n\n"
+        "• <code>заразить все</code> (или <code>заразить все @юзер</code>) — залп ВСЕМИ патогенами без спама!\n"
+        "• <code>диверсия</code> (или <code>диверсия @юзер</code>) — выкрасть вирусы из чужой лабы\n"
+        "• <code>эпидемия</code> — накрыть вирусом 3 случайных игроков\n"
+        "• <code>сбор</code> — забрать пассивные вирусы из Реактора\n"
+        "• <code>вакцина</code> (лечение) | <code>карантин</code> (щит на 2ч) | <code>штамм [имя]</code>\n"
+        "• <code>эволюция</code> — переход на новый Ген-Престиж (при прокачке модулей от 15 ур.)\n"
+        "• <code>профиль</code> (или <code>игры</code>) | <code>био топ</code> — твой ранг, 12 артефактов и таблица лидеров\n\n"
         "🤖 <b>ИИ-Функции (в бизнес-чате и по доступу):</b>\n"
         "• <code>гпт [запрос]</code> | <code>нарисуй [арт]</code> | <code>рс</code> | <code>рассуди</code> | <code>анализ</code> | <code>5 копеек</code>"
     )
 
 main.get_full_commands_text = get_updated_full_commands_text
 
-# Добавляем кнопки «📩 ЛС Бота и Модерация» и «⚙️ Все параметры» прямо в твой /panel
 _orig_build_panel_view = main.build_panel_view
 
 def _enhanced_build_panel_view():
@@ -306,32 +306,78 @@ def free_generate_image(prompt):
 main.generate_image = free_generate_image
 
 # =====================================================================
-# 🏆 2. БАЗА РПГ, 14 РАНГОВ, БАФФОВ И КЛАССИЧЕСКАЯ ЛАБОРАТОРИЯ ИРИСА
+# 🏆 2. ДОЛГОСРОЧНАЯ РПГ-ПРОГРЕССИЯ (ЭКСПОНЕНЦИАЛЬНЫЙ XP, 30 ЗВАНИЙ, 12 АРТЕФАКТОВ, ПРЕСТИЖ)
 # =====================================================================
 RPG_PLAYERS = {}
 
 RARE_BUFFS_INFO = {
-    'oracle_eye': {
-        'name': '🔮 Глаз Оракула',
-        'desc': '25% шанс сразу открыть 1 букву на старте Виселицы'
-    },
-    'trickster_glove': {
-        'name': '🧤 Ловкость Шулера',
-        'desc': '25% шанс получить +40 вирусов даже при ничьей в КНБ'
-    },
-    'antigen_shield': {
-        'name': '🧬 Антиген-Щит',
-        'desc': 'Дает +10% к защите от заражения в Био-войнах'
-    },
-    'rna_catalyst': {
-        'name': '⚡ Катализатор РНК',
-        'desc': '20% шанс не потратить патоген при атаке «заразить»'
-    },
-    'stalker_flashlight': {
-        'name': '🔦 Фонарь Сталкера',
-        'desc': 'Дает +25% больше вирусов при «Хабаровском Лутинге»'
-    }
+    'oracle_eye': {'name': '🔮 Глаз Оракула', 'desc': '25% шанс сразу открыть 1 букву на старте Виселицы'},
+    'trickster_glove': {'name': '🧤 Ловкость Шулера', 'desc': '25% шанс получить +40 вирусов даже при ничьей в КНБ'},
+    'antigen_shield': {'name': '🧬 Антиген-Щит', 'desc': '+10% к защите от заражения и диверсий'},
+    'rna_catalyst': {'name': '⚡ Катализатор РНК', 'desc': '20% шанс не потратить патоген при атаке'},
+    'stalker_flashlight': {'name': '🔦 Фонарь Сталкера', 'desc': '+25% больше вирусов при Хабаровском Лутинге'},
+    'plague_mask': {'name': '🎭 Маска Чумного Доктора', 'desc': 'Снижает длительность твоей горячки на 25%'},
+    'golden_scalpel': {'name': '🔪 Золотой Скальпель', 'desc': '+15% к краже вирусов при успешной диверсии'},
+    'cryo_flask': {'name': '❄️ Крио-Колба', 'desc': '+2 дополнительные ячейки хранения патогенов в лабе'},
+    'dark_diary': {'name': '📓 Тетрадь Старосты', 'desc': '+20% больше опыта XP во всех играх'},
+    'spamton_pipis': {'name': '🔵 Синий [[PIPIS]]', 'desc': '10% шанс удвоить находку на мусорке у Меда'},
+    'neuro_implant': {'name': '🧠 Нейро-Имплант', 'desc': '+150 бонусных вирусов за участие в Бункере/Мафии'},
+    'red_diploma': {'name': '📕 Красный Диплом Меда', 'desc': 'Снижает цену вакцины и карантина на 30%'}
 }
+
+RANKS_TABLE = [
+    (1, "🧪 Мытье пробирок"),
+    (2, "🧻 Первокурсник без халата"),
+    (3, "🗑 Искатель у Меда"),
+    (5, "🩺 Дежурный по моргу"),
+    (7, "🔬 Лаборант штаммов"),
+    (10, "💉 Фельдшер скорой"),
+    (13, "🦠 Переносчик заразы"),
+    (16, "🧬 Охотник за геномом"),
+    (20, "☣️ Полевой Эпидемиолог"),
+    (24, "🥷 Диверсант Био-Лабы"),
+    (28, "🏥 Заведующий Изолятором"),
+    (33, "⚡ Инженер Мутаций"),
+    (38, "🧪 Магистр Патогенов"),
+    (44, "🩸 Хирург Черного Рынка"),
+    (50, "🌍 Архитектор Пандемии"),
+    (57, "💀 Всадник Чумы"),
+    (65, "👑 Крёстный Отец Вируса"),
+    (73, "🐉 Повелитель Штаммов"),
+    (82, "🌑 Тень Хабаровского Меда"),
+    (92, "🔥 Апостол Карантина"),
+    (105, "🌌 Божество Биохазарда"),
+    (120, "🪐 Галактический Мутаген"),
+    (140, "⏳ Хранитель Генофонда"),
+    (165, "👁 Архимандрит Ириса"),
+    (200, "🔱 Абсолютный Пациент Ноль")
+]
+
+def xp_required_for_level(lvl):
+    """Экспоненциальная кривая опыта: 10 лвл = 5к XP, 30 лвл = 43к XP, 50 лвл = 115к XP, 100 лвл = 380к XP."""
+    if lvl <= 1:
+        return 0
+    return int(120 * ((lvl - 1) ** 1.75))
+
+def get_level_and_rank(xp):
+    xp = max(0, int(xp))
+    lvl = 1
+    while lvl < 300 and xp >= xp_required_for_level(lvl + 1):
+        lvl += 1
+    title = RANKS_TABLE[0][1]
+    for r_lvl, r_name in RANKS_TABLE:
+        if lvl >= r_lvl:
+            title = r_name
+    return lvl, title
+
+def get_xp_progress_str(xp):
+    lvl, _ = get_level_and_rank(xp)
+    cur_floor = xp_required_for_level(lvl)
+    nxt_ceil = xp_required_for_level(lvl + 1)
+    need = max(1, nxt_ceil - cur_floor)
+    have = max(0, int(xp) - cur_floor)
+    pct = min(100, int((have / need) * 100))
+    return f"{int(xp)} / {nxt_ceil} XP ({pct}%)"
 
 def load_rpg_firebase():
     if not FIREBASE_URL:
@@ -340,7 +386,7 @@ def load_rpg_firebase():
         r = get_http_session().get(f'{FIREBASE_URL}/rpg_data.json', timeout=8)
         if r.status_code == 200 and isinstance(r.json(), dict):
             RPG_PLAYERS.update(r.json())
-            print(f"🧬 Данные Био-войн загружены ({len(RPG_PLAYERS)} игроков).")
+            print(f"🧬 Данные Био-войн PRO загружены ({len(RPG_PLAYERS)} игроков).")
     except Exception as e:
         print(f"⚠️ Ошибка загрузки РПГ из Firebase: {e}")
 
@@ -368,6 +414,7 @@ def get_player(user):
             'username': uname,
             'name': fname,
             'strain_name': f"Штамм-{fname[:10]}",
+            'prestige': 0,
             'xp': 0,
             'bio_res': 200,
             'bio_xp': 0,
@@ -377,6 +424,7 @@ def get_player(user):
             'wins_mafia': 0,
             'loot_count': 0,
             'infections_done': 0,
+            'sabotages_done': 0,
             'buffs': [],
             'lab_patogen_lvl': 1,
             'lab_dev_lvl': 1,
@@ -384,10 +432,16 @@ def get_player(user):
             'lab_immune_lvl': 1,
             'lab_lethal_lvl': 1,
             'lab_security_lvl': 1,
+            'lab_mutation_lvl': 1,
+            'lab_reactor_lvl': 1,
             'patogens': 3,
             'last_patogen_ts': now,
+            'last_reactor_ts': now,
             'last_loot_ts': 0,
+            'last_sabotage_ts': 0,
+            'last_epidemic_ts': 0,
             'fever_until': 0,
+            'quarantine_until': 0,
             'infected_by': ''
         }
         save_rpg_firebase()
@@ -400,9 +454,23 @@ def get_player(user):
             p['buffs'] = []
         if not p.get('strain_name'):
             p['strain_name'] = f"Штамм-{fname[:10]}"
+        for new_k in ('lab_mutation_lvl', 'lab_reactor_lvl'):
+            if new_k not in p:
+                p[new_k] = 1
+        for zero_k in ('prestige', 'sabotages_done', 'last_sabotage_ts', 'last_epidemic_ts', 'quarantine_until'):
+            if zero_k not in p:
+                p[zero_k] = 0
+        if 'last_reactor_ts' not in p:
+            p['last_reactor_ts'] = now
 
     sync_lab_patogens(RPG_PLAYERS[uid])
     return RPG_PLAYERS[uid]
+
+def add_player_xp(p, base_xp):
+    mult = 1.2 if 'dark_diary' in p.get('buffs', []) else 1.0
+    gain = max(1, int(base_xp * mult))
+    p['xp'] = p.get('xp', 0) + gain
+    return gain
 
 def find_player_by_username_or_id(query_str):
     q = str(query_str).lower().replace('@', '').strip()
@@ -415,12 +483,16 @@ def find_player_by_username_or_id(query_str):
             return p
     return None
 
+def get_max_patogen_cells(p):
+    bonus = 2 if 'cryo_flask' in p.get('buffs', []) else 0
+    return 2 + p.get('lab_patogen_lvl', 1) + bonus + p.get('prestige', 0)
+
 def sync_lab_patogens(p):
     now = time.time()
-    max_cells = 2 + p.get('lab_patogen_lvl', 1)
+    max_cells = get_max_patogen_cells(p)
     dev_lvl = p.get('lab_dev_lvl', 1)
     base_sec = max(60, float(CONFIG.get('base_patogen_minutes', 15)) * 60)
-    interval_sec = max(120, int(base_sec - (dev_lvl - 1) * 65))
+    interval_sec = max(120, int(base_sec - (dev_lvl - 1) * 55))
 
     cur_p = p.get('patogens', 3)
     last_ts = p.get('last_patogen_ts', now)
@@ -434,98 +506,108 @@ def sync_lab_patogens(p):
     else:
         p['last_patogen_ts'] = now
 
-def get_level_and_rank(xp):
-    lvl = int((xp // 100) + 1)
-    ranks = [
-        (1, "🧪 Санитар пробирки"),
-        (3, "🗑 Искатель у Меда"),
-        (5, "🔬 Лаборант штаммов"),
-        (8, "🦠 Переносчик заразы"),
-        (12, "🧬 Охотник за геномом"),
-        (16, "☣️ Полевой Эпидемиолог"),
-        (22, "🏥 Главврач Изолятора"),
-        (28, "⚡ Инженер Мутаций"),
-        (35, "🧪 Владыка Патогенов"),
-        (45, "🌍 Архитектор Пандемии"),
-        (55, "💀 Всадник Чумы"),
-        (65, "👑 Крёстный Отец Вируса"),
-        (80, "🌌 Божество Биохазарда"),
-        (100, "🔱 Абсолютный Пациент Ноль")
-    ]
-    title = ranks[0][1]
-    for r_lvl, r_name in ranks:
-        if lvl >= r_lvl:
-            title = r_name
-    return lvl, title
+def get_pending_reactor_viruses(p):
+    now = time.time()
+    last_ts = p.get('last_reactor_ts', now)
+    elapsed_hours = max(0.0, (now - last_ts) / 3600.0)
+    r_lvl = p.get('lab_reactor_lvl', 1)
+    prestige_mult = 1.0 + p.get('prestige', 0) * 0.20
+    rate_per_hour = int(25 * r_lvl * prestige_mult)
+    max_cap = int(350 * r_lvl * prestige_mult)
+    accumulated = int(min(max_cap, elapsed_hours * rate_per_hour))
+    return accumulated, rate_per_hour, max_cap
 
 def try_grant_rare_buff(p):
     available = [k for k in RARE_BUFFS_INFO.keys() if k not in p.get('buffs', [])]
     if not available:
         return None
-    if random.randint(1, 100) <= 14:
+    if random.randint(1, 100) <= 10:
         chosen = random.choice(available)
         p.setdefault('buffs', []).append(chosen)
         b_info = RARE_BUFFS_INFO[chosen]
-        return f"\n🎁 <b>РЕДКИЙ БАФФ ПОЛУЧЕН:</b> {b_info['name']} (<i>{b_info['desc']}</i>)!"
+        return f"\n🎁 <b>РЕДКИЙ АРТЕФАКТ ПОЛУЧЕН:</b> {b_info['name']} (<i>{b_info['desc']}</i>)!"
     return None
 
 # =====================================================================
-# 🦠 3. БИО-ВОЙНЫ (КЛАССИЧЕСКИЕ 6 НАВЫКОВ ИРИСА + УВЕДОМЛЕНИЯ + ЗАЛП ВСЕХ ПАТОГЕНОВ)
+# 🦠 3. БИО-ВОЙНЫ PRO: 8 МОДУЛЕЙ, РЕАКТОР, КАРАНТИН, ДИВЕРСИИ, ЭПИДЕМИИ, ЗАЛП И ЭВОЛЮЦИЯ
 # =====================================================================
 UPGRADE_TYPES = {
     'patogen': ('lab_patogen_lvl', '🧪 Патоген (ячейки)', 60),
     'dev': ('lab_dev_lvl', '⏱ Разработка (скорость)', 75),
     'infect': ('lab_infect_lvl', '🦠 Заразность (атака)', 80),
     'immune': ('lab_immune_lvl', '🛡 Иммунитет (защита)', 80),
-    'lethal': ('lab_lethal_lvl', '☠️ Летальность (доход/горячка)', 90),
-    'security': ('lab_security_lvl', '🕵️ Служба безопасности', 70)
+    'lethal': ('lab_lethal_lvl', '☠️ Летальность (доход)', 90),
+    'security': ('lab_security_lvl', '🕵️ Безопасность (анти-вор)', 70),
+    'mutation': ('lab_mutation_lvl', '🧬 Мутация (шанс x2 крита)', 110),
+    'reactor': ('lab_reactor_lvl', '🏭 Био-Реактор (пассив 🧬)', 120)
 }
 
 def get_upgrade_cost(p, upg_key):
     field, _, base_cost = UPGRADE_TYPES[upg_key]
     lvl = p.get(field, 1)
-    return int(base_cost * (1.35 ** (lvl - 1)))
+    return int(base_cost * (1.38 ** (lvl - 1)))
+
+def get_vaccine_and_quar_costs(p):
+    disc = 0.70 if 'red_diploma' in p.get('buffs', []) else 1.0
+    v_cost = max(20, int(CONFIG.get('vaccine_cost', 80) * disc))
+    q_cost = max(50, int(CONFIG.get('quarantine_cost', 250) * disc))
+    return v_cost, q_cost
 
 def build_lab_view(p):
     sync_lab_patogens(p)
     now = time.time()
     lvl, rank_title = get_level_and_rank(p.get('xp', 0))
-    max_cells = 2 + p.get('lab_patogen_lvl', 1)
+    xp_prog = get_xp_progress_str(p.get('xp', 0))
+    max_cells = get_max_patogen_cells(p)
     dev_lvl = p.get('lab_dev_lvl', 1)
     base_sec = max(60, float(CONFIG.get('base_patogen_minutes', 15)) * 60)
-    interval_min = max(2, round((base_sec - (dev_lvl - 1) * 65) / 60, 1))
-    vac_cost = int(CONFIG.get('vaccine_cost', 80))
+    interval_min = max(2, round((base_sec - (dev_lvl - 1) * 55) / 60, 1))
+    mut_chance = min(65, 8 + p.get('lab_mutation_lvl', 1) * 4)
+    react_pending, react_rate, react_cap = get_pending_reactor_viruses(p)
+    vac_cost, quar_cost = get_vaccine_and_quar_costs(p)
+    prestige = p.get('prestige', 0)
+    prestige_str = f" | ☣️ <b>Престиж: Рим {prestige} (+{prestige * 20}%)</b>" if prestige > 0 else ""
 
     fever_rem = int(p.get('fever_until', 0) - now)
+    quar_rem = int(p.get('quarantine_until', 0) - now)
+    status_parts = []
     if fever_rem > 0:
         mins = (fever_rem // 60) + 1
-        by_who = p.get('infected_by') or 'неизвестного вируса'
-        status_line = f"🤒 <b>ГОРЯЧКА (Заражен от {html.escape(by_who)})!</b> Осталось: <b>{mins} мин.</b>"
+        by_who = p.get('infected_by') or 'неизвестного штамма'
+        status_parts.append(f"🤒 <b>ГОРЯЧКА от {html.escape(by_who)} ({mins} мин.)</b>")
     else:
-        status_line = "🟢 <b>Здоров (Лаборатория работает штатно)</b>"
+        status_parts.append("🟢 <b>Здоров</b>")
+    if quar_rem > 0:
+        q_mins = (quar_rem // 60) + 1
+        status_parts.append(f"🛡 <b>Купол карантина ({q_mins} мин.)</b>")
+    status_line = " | ".join(status_parts)
 
     buff_names = [RARE_BUFFS_INFO[b]['name'] for b in p.get('buffs', []) if b in RARE_BUFFS_INFO]
-    buff_str = ", ".join(buff_names) if buff_names else "нет (выпадают в играх)"
+    buff_str = f"{len(buff_names)}/12 ({', '.join(buff_names[:5])}{'...' if len(buff_names) > 5 else ''})" if buff_names else "0/12 (выпадают в играх)"
     strain_safe = html.escape(p.get('strain_name', 'Штамм-Х'))
     name_safe = html.escape(p.get('name', 'Игрок'))
 
     text = (
-        f"🧬 <b>Био-Лаборатория: {name_safe}</b>\n"
-        f"🎖 <b>Звание:</b> {rank_title} (Ур. {lvl} | ✨ {p.get('xp', 0)} XP)\n"
-        f"☣️ <b>Штамм:</b> «<b>{strain_safe}</b>» (сменить: <code>штамм Имя</code>)\n"
+        f"🧬 <b>Био-Лаборатория PRO: {name_safe}</b>\n"
+        f"🎖 <b>Звание:</b> {rank_title} (Ур. {lvl}{prestige_str})\n"
+        f"📊 <b>Прогресс уровня:</b> <code>{xp_prog}</code>\n"
+        f"☣️ <b>Личный штамм:</b> «<b>{strain_safe}</b>» (сменить: <code>штамм Имя</code>)\n"
         f"🩺 <b>Статус:</b> {status_line}\n\n"
         f"🔋 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> 🧬 | <b>Био-опыт:</b> <code>{p.get('bio_xp', 0)}</code> ☣️\n"
-        f"🧪 <b>Готовых патогенов:</b> <b>{p.get('patogens', 0)} / {max_cells}</b> (новый каждые ~{interval_min} мин)\n"
-        f"☠️ <b>Успешных заражений:</b> {p.get('infections_done', 0)}\n\n"
-        f"🔬 <b>Характеристики лаборатории:</b>\n"
-        f"• 🧪 <b>Патоген (ячейки):</b> Ур. {p.get('lab_patogen_lvl', 1)} (след: {get_upgrade_cost(p, 'patogen')} 🧬)\n"
-        f"• ⏱ <b>Разработка:</b> Ур. {p.get('lab_dev_lvl', 1)} (след: {get_upgrade_cost(p, 'dev')} 🧬)\n"
-        f"• 🦠 <b>Заразность:</b> Ур. {p.get('lab_infect_lvl', 1)} (след: {get_upgrade_cost(p, 'infect')} 🧬)\n"
-        f"• 🛡 <b>Иммунитет:</b> Ур. {p.get('lab_immune_lvl', 1)} (след: {get_upgrade_cost(p, 'immune')} 🧬)\n"
-        f"• ☠️ <b>Летальность:</b> Ур. {p.get('lab_lethal_lvl', 1)} (след: {get_upgrade_cost(p, 'lethal')} 🧬)\n"
-        f"• 🕵️ <b>Безопасность:</b> Ур. {p.get('lab_security_lvl', 1)} (след: {get_upgrade_cost(p, 'security')} 🧬)\n\n"
-        f"🔮 <b>Редкие баффы:</b> {buff_str}\n"
-        f"<i>💡 Атака: <code>заразить @юзер</code> или залп без спама: <code>заразить все @юзер</code></i>"
+        f"🧪 <b>Патогены:</b> <b>{p.get('patogens', 0)} / {max_cells}</b> (1 шт. за ~{interval_min} мин)\n"
+        f"🏭 <b>Био-Реактор:</b> накоплено <b>{react_pending}/{react_cap} 🧬</b> (+{react_rate} 🧬/час)\n"
+        f"☠️ <b>Заражений:</b> {p.get('infections_done', 0)} | 🥷 <b>Диверсий:</b> {p.get('sabotages_done', 0)}\n\n"
+        f"🔬 <b>Модули Лаборатории:</b>\n"
+        f"• 🧪 <b>Патоген:</b> Ур. {p.get('lab_patogen_lvl', 1)} ({get_upgrade_cost(p, 'patogen')} 🧬)\n"
+        f"• ⏱ <b>Разработка:</b> Ур. {p.get('lab_dev_lvl', 1)} ({get_upgrade_cost(p, 'dev')} 🧬)\n"
+        f"• 🦠 <b>Заразность:</b> Ур. {p.get('lab_infect_lvl', 1)} ({get_upgrade_cost(p, 'infect')} 🧬)\n"
+        f"• 🛡 <b>Иммунитет:</b> Ур. {p.get('lab_immune_lvl', 1)} ({get_upgrade_cost(p, 'immune')} 🧬)\n"
+        f"• ☠️ <b>Летальность:</b> Ур. {p.get('lab_lethal_lvl', 1)} ({get_upgrade_cost(p, 'lethal')} 🧬)\n"
+        f"• 🕵️ <b>Безопасность:</b> Ур. {p.get('lab_security_lvl', 1)} ({get_upgrade_cost(p, 'security')} 🧬)\n"
+        f"• 🧬 <b>Мутация (крит {mut_chance}%):</b> Ур. {p.get('lab_mutation_lvl', 1)} ({get_upgrade_cost(p, 'mutation')} 🧬)\n"
+        f"• 🏭 <b>Био-Реактор:</b> Ур. {p.get('lab_reactor_lvl', 1)} ({get_upgrade_cost(p, 'reactor')} 🧬)\n\n"
+        f"🔮 <b>Артефакты:</b> {buff_str}\n"
+        f"<i>💡 Залп без спама: <code>заразить все @юзер</code> | Престиж (от 15 ур. модулей): <code>эволюция</code></i>"
     )
 
     uid = p['uid']
@@ -542,41 +624,43 @@ def build_lab_view(p):
         InlineKeyboardButton(f"⬆️ +Летальность ({get_upgrade_cost(p, 'lethal')}🧬)", callback_data=f"bioupg_{uid}_lethal"),
         InlineKeyboardButton(f"⬆️ +Безопасность ({get_upgrade_cost(p, 'security')}🧬)", callback_data=f"bioupg_{uid}_security")
     )
+    kb.add(
+        InlineKeyboardButton(f"⬆️ +Мутация ({get_upgrade_cost(p, 'mutation')}🧬)", callback_data=f"bioupg_{uid}_mutation"),
+        InlineKeyboardButton(f"⬆️ +Реактор ({get_upgrade_cost(p, 'reactor')}🧬)", callback_data=f"bioupg_{uid}_reactor")
+    )
+    kb.add(
+        InlineKeyboardButton(f"🔋 Собрать реактор (+{react_pending}🧬)", callback_data=f"biocollect_{uid}"),
+        InlineKeyboardButton(f"🛡 Карантин 2ч ({quar_cost}🧬)", callback_data=f"bioquar_{uid}")
+    )
     if fever_rem > 0:
         kb.add(InlineKeyboardButton(f"💉 Купить вакцину ({vac_cost} 🧬)", callback_data=f"biocure_{uid}"))
     kb.add(
-        InlineKeyboardButton("🗑 Лутать мусорку", callback_data="loot_again"),
-        InlineKeyboardButton("🔄 Обновить лабу", callback_data=f"biorefresh_{uid}")
+        InlineKeyboardButton("☣️ Запустить Эпидемию", callback_data=f"bioepid_{uid}"),
+        InlineKeyboardButton("🗑 Лутать мусорку", callback_data="loot_again")
     )
+    kb.add(InlineKeyboardButton("🔄 Обновить лабораторию", callback_data=f"biorefresh_{uid}"))
     return text, kb
 
 def send_victim_infection_notification(target_p, notify_html, source_chat_id):
-    """
-    Отправляет уведомление жертве о том, что её заразили!
-    Сначала пробует отправить в ЛС бота, а если жертва не запускала бота в ЛС —
-    ищет бизнес-чат с ней в known_chats и шлет туда!
-    """
+    """Отправляет уведомление жертве в ЛС бота (или в бизнес-чат, если она не запускала бота в ЛС)."""
     try:
         target_uid = int(target_p['uid'])
     except Exception:
         return
 
-    # Если заражение произошло прямо в личном чате с самой жертвой — она уже видит сообщение в этом чате
     if int(source_chat_id) == target_uid:
         return
 
-    vac_cost = int(CONFIG.get('vaccine_cost', 80))
+    vac_cost, _ = get_vaccine_and_quar_costs(target_p)
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(f"💉 Принять вакцину ({vac_cost} 🧬)", callback_data=f"biocure_{target_uid}"))
 
-    # 1. Пробуем отправить в ЛС самого бота
     try:
         bot.send_message(target_uid, notify_html, reply_markup=kb)
         return
     except Exception:
         pass
 
-    # 2. Если ЛС бота закрыто, ищем бизнес-чат с этим человеком в known_chats
     uname = (target_p.get('username') or '').lower()
     known = CONFIG.get('known_chats', {}).get(uname)
     if not known:
@@ -592,48 +676,47 @@ def send_victim_infection_notification(target_p, notify_html, source_chat_id):
             pass
 
 def perform_infection_attempt(attacker_user, target_p, use_all=False, source_chat_id=0):
-    """
-    Выполняет био-атаку (одиночную или залпом ВСЕМИ патогенами сразу без спама в чате)
-    и отправляет уведомление жертве!
-    """
     atk_p = get_player(attacker_user)
     now = time.time()
 
     if atk_p['uid'] == target_p['uid']:
         return "🤪 Ты не можешь заразить сам себя!"
-
     if atk_p.get('fever_until', 0) > now:
         rem_m = int((atk_p['fever_until'] - now) // 60) + 1
-        return (
-            f"🤒 <b>У тебя сейчас горячка (еще {rem_m} мин.)!</b>\n"
-            f"Ты не можешь заражать других, пока не выздоровеешь или не примешь <code>вакцина</code> в <code>лаба</code>."
-        )
+        return f"🤒 <b>У тебя сейчас горячка (еще {rem_m} мин.)!</b> Прими <code>вакцина</code> в <code>лаба</code>."
+    if target_p.get('quarantine_until', 0) > now:
+        q_m = int((target_p['quarantine_until'] - now) // 60) + 1
+        return f"🛡 <b>Лаборатория {html.escape(target_p['name'])} закрыта куполом Карантина (еще {q_m} мин.)!</b> Вирус не прошел."
 
     avail = int(atk_p.get('patogens', 0))
     if avail <= 0:
-        return "🧪 <b>В лаборатории нет готовых патогенов!</b> Подожди синтеза или прокачай <code>+разработка</code> в <code>лаба</code>."
+        return "🧪 <b>Нет готовых патогенов!</b> Подожди синтеза или прокачай <code>+разработка</code>."
 
     shots = avail if use_all else 1
     infect_lvl = atk_p.get('lab_infect_lvl', 1)
     immune_lvl = target_p.get('lab_immune_lvl', 1)
     lethal_lvl = atk_p.get('lab_lethal_lvl', 1)
     sec_lvl = target_p.get('lab_security_lvl', 1)
+    mut_lvl = atk_p.get('lab_mutation_lvl', 1)
+    prestige = atk_p.get('prestige', 0)
+    prestige_mult = 1.0 + prestige * 0.20
 
     base_ch = int(CONFIG.get('base_infect_chance', 55))
-    chance = base_ch + (infect_lvl - immune_lvl) * 6
+    chance = base_ch + (infect_lvl - immune_lvl) * 6 + prestige * 3
     if 'antigen_shield' in target_p.get('buffs', []):
         chance -= 10
     chance = max(15, min(92, chance))
+    crit_chance = min(65, 8 + mut_lvl * 4)
 
     atk_name = html.escape(atk_p['name'])
     def_name = html.escape(target_p['name'])
     strain_name = html.escape(atk_p.get('strain_name', 'Штамм-Х'))
 
     hits = 0
-    misses = 0
+    crits = 0
     saved_count = 0
     total_loot_res = 0
-    total_loot_xp = 0
+    total_base_xp = 0
     total_fever_mins = 0
     spotted_any = False
 
@@ -645,63 +728,69 @@ def perform_infection_attempt(attacker_user, target_p, use_all=False, source_cha
 
         if random.randint(1, 100) <= chance:
             hits += 1
-            f_mins = (10 + lethal_lvl * 4) if hits == 1 else (5 + lethal_lvl * 2)
-            l_res = 50 + lethal_lvl * 28
-            l_xp = 25 + lethal_lvl * 6
+            is_crit = (random.randint(1, 100) <= crit_chance)
+            if is_crit:
+                crits += 1
+            mult = 2.0 if is_crit else 1.0
+            f_mins = (10 + lethal_lvl * 3) if hits == 1 else (4 + lethal_lvl)
+            if 'plague_mask' in target_p.get('buffs', []):
+                f_mins = max(2, int(f_mins * 0.75))
+            l_res = int((55 + lethal_lvl * 28) * mult * prestige_mult)
+            # Контролируемый опыт XP (чтобы не летели до 200 уровня за день!)
+            l_xp = int((22 + min(30, lethal_lvl * 2)) * (1.5 if is_crit else 1.0))
             total_fever_mins += f_mins
             total_loot_res += l_res
-            total_loot_xp += l_xp
+            total_base_xp += l_xp
             if random.randint(1, 100) <= (35 + sec_lvl * 12):
                 spotted_any = True
         else:
-            misses += 1
-            total_loot_xp += 5
+            total_base_xp += 4
 
-    atk_p['xp'] = atk_p.get('xp', 0) + total_loot_xp
+    real_xp = add_player_xp(atk_p, total_base_xp)
 
     if hits > 0:
         base_until = max(now, target_p.get('fever_until', 0))
         target_p['fever_until'] = base_until + total_fever_mins * 60
-        who_label = f"{atk_p['name']} (штамм «{atk_p.get('strain_name', 'Х')}»)" if spotted_any else f"Неизвестный био-хакер (штамм «{atk_p.get('strain_name', 'Х')}»)"
+        who_label = f"{atk_p['name']} (штамм «{atk_p.get('strain_name', 'Х')}»)" if spotted_any else f"Неизвестный (штамм «{atk_p.get('strain_name', 'Х')}»)"
         target_p['infected_by'] = who_label
 
         atk_p['bio_res'] = atk_p.get('bio_res', 0) + total_loot_res
-        atk_p['bio_xp'] = atk_p.get('bio_xp', 0) + total_loot_xp
+        atk_p['bio_xp'] = atk_p.get('bio_xp', 0) + real_xp
         atk_p['infections_done'] = atk_p.get('infections_done', 0) + hits
 
         buff_msg = try_grant_rare_buff(atk_p) or ""
         save_rpg_firebase()
 
-        # Уведомление жертве в ЛС!
-        attacker_public_str = f"<b>{atk_name}</b>" if spotted_any else "<b>Неизвестный био-хакер</b> (служба безопасности не смогла перехватить след)"
+        attacker_public_str = f"<b>{atk_name}</b>" if spotted_any else "<b>Неизвестный био-хакер</b>"
         victim_alert = (
             f"☣️ <b>ВНИМАНИЕ! БИО-УГРОЗА!</b>\n\n"
             f"🦠 Тебя заразили вирусом «<b>{strain_name}</b>»!\n"
             f"🕵️ Источник атаки: {attacker_public_str}\n"
-            f"🎯 Успешных попаданий патогена: <b>{hits} шт.</b>\n"
+            f"🎯 Пробитий иммунитета: <b>{hits} шт.</b>\n"
             f"🤒 У тебя началась горячка на <b>+{total_fever_mins} мин.</b>!\n\n"
             f"<i>💡 Нажми кнопку ниже или напиши <code>вакцина</code>, чтобы вылечиться!</i>"
         )
         send_victim_infection_notification(target_p, victim_alert, source_chat_id)
 
+        crit_banner = f"\n🧬 <b>КРИТИЧЕСКАЯ МУТАЦИЯ ({crits}x — ДВОЙНОЙ УЛОВ)!</b>" if crits > 0 else ""
         cat_note = f"\n⚡ <i>«Катализатор РНК» сохранил патогенов: {saved_count} шт.!</i>" if saved_count > 0 else ""
-        sec_note = "🕵️ Служба безопасности жертвы засекла твой след!" if spotted_any else "🥷 Атака прошла скрытно для службы безопасности!"
+        sec_note = "🕵️ Служба безопасности жертвы засекла твой след!" if spotted_any else "🥷 Атака прошла полностью скрытно!"
 
         if shots == 1:
             return (
-                f"☣️ <b>БИО-АТАКА УСПЕШНА!</b> (Шанс: {chance}%)\n\n"
+                f"☣️ <b>БИО-АТАКА УСПЕШНА!</b> (Шанс: {chance}%){crit_banner}\n\n"
                 f"🦠 <b>{atk_name}</b> поразил(а) штаммом «<b>{strain_name}</b>» игрока <b>{def_name}</b>!\n"
                 f"🤒 Горячка у жертвы: <b>+{total_fever_mins} мин.</b> (Уведомление отправлено!)\n"
-                f"🧬 Добыто вирусов: <b>+{total_loot_res} 🧬</b> и <b>+{total_loot_xp} XP</b>\n"
+                f"🧬 Добыто вирусов: <b>+{total_loot_res} 🧬</b> и <b>+{real_xp} XP</b>\n"
                 f"{sec_note}{cat_note}{buff_msg}"
             )
         else:
             return (
-                f"☣️ <b>МАССИРОВАННЫЙ ЗАЛП ПАТОГЕНОВ ({shots} шт.)!</b>\n"
-                f"🎯 <b>Пробитий иммунитета:</b> {hits} из {shots} (Шанс каждого: {chance}%)\n\n"
+                f"☣️ <b>МАССИРОВАННЫЙ ЗАЛП ПАТОГЕНОВ ({shots} шт.)!</b>{crit_banner}\n"
+                f"🎯 <b>Пробитий иммунитета:</b> {hits} из {shots} (Шанс: {chance}%)\n\n"
                 f"🦠 <b>{atk_name}</b> накрыл(а) штаммом «<b>{strain_name}</b>» игрока <b>{def_name}</b>!\n"
                 f"🤒 Суммарная горячка жертвы: <b>+{total_fever_mins} мин.</b> (Уведомление отправлено!)\n"
-                f"🧬 Итого добыто: <b>+{total_loot_res} 🧬 вирусов</b> и <b>+{total_loot_xp} XP</b>\n"
+                f"🧬 Итого добыто: <b>+{total_loot_res} 🧬 вирусов</b> и <b>+{real_xp} XP</b>\n"
                 f"{sec_note}{cat_note}{buff_msg}"
             )
     else:
@@ -710,8 +799,7 @@ def perform_infection_attempt(attacker_user, target_p, use_all=False, source_cha
         if shots == 1:
             return (
                 f"🛡 <b>ИММУНИТЕТ ВЫСТОЯЛ!</b> (Шанс был: {chance}%)\n\n"
-                f"Организм <b>{def_name}</b> уничтожил штамм «<b>{strain_name}</b>» от <b>{atk_name}</b>!\n"
-                f"💡 Прокачай <code>+заразность</code> в своей <code>лаба</code>.{cat_note}"
+                f"Антитела <b>{def_name}</b> нейтрализовали штамм «<b>{strain_name}</b>» от <b>{atk_name}</b>!{cat_note}"
             )
         else:
             return (
@@ -719,9 +807,185 @@ def perform_infection_attempt(attacker_user, target_p, use_all=False, source_cha
                 f"Организм <b>{def_name}</b> выдержал все {shots} атак штамма «<b>{strain_name}</b>» (Шанс был: {chance}%)!{cat_note}"
             )
 
+def perform_bio_sabotage(attacker_user, target_p, source_chat_id=0):
+    atk_p = get_player(attacker_user)
+    now = time.time()
+
+    if atk_p['uid'] == target_p['uid']:
+        return "🤪 Ограбить собственную лабу нельзя!"
+    cd_rem = int(600 - (now - atk_p.get('last_sabotage_ts', 0)))
+    if cd_rem > 0:
+        return f"⏳ Подготовка новой диверсии займет еще <b>{cd_rem // 60} мин. {cd_rem % 60} сек.</b>"
+    if target_p.get('quarantine_until', 0) > now:
+        return f"🛡 Лаборатория <b>{html.escape(target_p['name'])}</b> под куполом Карантина — диверсия невозможна!"
+    if target_p.get('bio_res', 0) < 40:
+        return f"🪹 В лаборатории <b>{html.escape(target_p['name'])}</b> почти пусто ({target_p.get('bio_res', 0)} 🧬), красть нечего!"
+
+    atk_p['last_sabotage_ts'] = now
+    target_in_fever = (target_p.get('fever_until', 0) > now)
+    atk_lvl = atk_p.get('lab_infect_lvl', 1) + atk_p.get('lab_mutation_lvl', 1)
+    def_sec = target_p.get('lab_security_lvl', 1) * 2
+
+    chance = (75 if target_in_fever else 45) + (atk_lvl - def_sec) * 4
+    if 'antigen_shield' in target_p.get('buffs', []):
+        chance -= 10
+    chance = max(15, min(88, chance))
+
+    if random.randint(1, 100) <= chance:
+        steal_pct = random.uniform(0.18, 0.28) if target_in_fever else random.uniform(0.10, 0.16)
+        if 'golden_scalpel' in atk_p.get('buffs', []):
+            steal_pct += 0.05
+        stolen = max(25, min(800, int(target_p['bio_res'] * steal_pct)))
+        target_p['bio_res'] = max(0, target_p['bio_res'] - stolen)
+        atk_p['bio_res'] = atk_p.get('bio_res', 0) + stolen
+        xp_g = add_player_xp(atk_p, 30)
+        atk_p['sabotages_done'] = atk_p.get('sabotages_done', 0) + 1
+        save_rpg_firebase()
+
+        send_victim_infection_notification(
+            target_p,
+            f"🥷 <b>ВЗЛОМ ЛАБОРАТОРИИ!</b>\nДиверсанты проникли в твое хранилище и украли <b>-{stolen} 🧬 вирусов</b>!\n<i>Прокачай «🕵️ Безопасность» или включи Карантин!</i>",
+            source_chat_id
+        )
+        fever_bonus_txt = " (Цель ослаблена горячкой!)" if target_in_fever else ""
+        return (
+            f"🥷 <b>ДИВЕРСИЯ УДАЛАСЬ!</b>{fever_bonus_txt}\n\n"
+            f"Ты взломал(а) био-хранилище <b>{html.escape(target_p['name'])}</b> и вынес(ла) <b>+{stolen} 🧬 вирусов</b> (+{xp_g} XP)!"
+        )
+    else:
+        fine = min(atk_p.get('bio_res', 0), 50)
+        atk_p['bio_res'] -= fine
+        save_rpg_firebase()
+        return (
+            f"🚨 <b>ДИВЕРСИЯ ПРОВАЛЕНА!</b>\n"
+            f"Охрана лаборатории <b>{html.escape(target_p['name'])}</b> скрутила твоих агентов! Потеряно <b>-{fine} 🧬</b> на откуп."
+        )
+
+def perform_epidemic_wave(attacker_user, source_chat_id=0):
+    atk_p = get_player(attacker_user)
+    now = time.time()
+
+    cd_rem = int(1200 - (now - atk_p.get('last_epidemic_ts', 0)))
+    if cd_rem > 0:
+        return f"⏳ Аэрозольная установка перезаряжается! Подожди <b>{cd_rem // 60} мин. {cd_rem % 60} сек.</b>"
+    if atk_p.get('patogens', 0) < 2:
+        return "🧪 Для запуска <b>Эпидемии</b> нужно минимум <b>2 готовых патогена</b>!"
+
+    candidates = [p for uid, p in RPG_PLAYERS.items() if uid != atk_p['uid'] and p.get('quarantine_until', 0) <= now]
+    if not candidates:
+        return "⚠️ В базе пока нет доступных целей для массовой эпидемии!"
+
+    atk_p['patogens'] -= 2
+    atk_p['last_epidemic_ts'] = now
+    targets = random.sample(candidates, min(3, len(candidates)))
+    strain_name = html.escape(atk_p.get('strain_name', 'Штамм-Х'))
+    prestige_mult = 1.0 + atk_p.get('prestige', 0) * 0.20
+
+    total_loot = 0
+    total_base_xp = 0
+    results_lines = []
+    for t_p in targets:
+        chance = max(20, min(85, 50 + (atk_p.get('lab_infect_lvl', 1) - t_p.get('lab_immune_lvl', 1)) * 6))
+        t_name = html.escape(t_p.get('name', 'Игрок'))
+        if random.randint(1, 100) <= chance:
+            loot = int((60 + atk_p.get('lab_lethal_lvl', 1) * 25) * prestige_mult)
+            t_p['fever_until'] = max(now, t_p.get('fever_until', 0)) + 15 * 60
+            t_p['infected_by'] = f"Эпидемия «{atk_p.get('strain_name', 'Х')}» от {atk_p['name']}"
+            total_loot += loot
+            total_base_xp += 22
+            atk_p['infections_done'] = atk_p.get('infections_done', 0) + 1
+            results_lines.append(f"• ☣️ <b>{t_name}</b> — ЗАРАЖЕН (+{loot} 🧬)")
+            send_victim_infection_notification(
+                t_p,
+                f"🌪 <b>ВОЛНА ЭПИДЕМИИ!</b>\nТебя накрыло аэрозольным штаммом «<b>{strain_name}</b>»! Горячка +15 мин.",
+                source_chat_id
+            )
+        else:
+            results_lines.append(f"• 🛡 <b>{t_name}</b> — иммунитет отбил волну")
+
+    real_xp = add_player_xp(atk_p, total_base_xp)
+    atk_p['bio_res'] += total_loot
+    atk_p['bio_xp'] += real_xp
+    save_rpg_firebase()
+
+    return (
+        f"🌪 <b>АЭРОЗОЛЬНАЯ ЭПИДЕМИЯ ШТАММА «{strain_name}»!</b>\n\n" +
+        "\n".join(results_lines) +
+        f"\n\n🧬 Итоговый улов волны: <b>+{total_loot} 🧬</b> и <b>+{real_xp} XP</b>!"
+    )
+
+def perform_lab_evolution(user):
+    """Система долгосрочного престижа: требует все 8 модулей лабы >= 15 уровня."""
+    p = get_player(user)
+    req_lvl = 15 + p.get('prestige', 0) * 5
+    mod_keys = [info[0] for info in UPGRADE_TYPES.values()]
+    min_mod = min(p.get(k, 1) for k in mod_keys)
+
+    if min_mod < req_lvl:
+        return (
+            f"🧬 <b>До Эволюции Штамма (Престиж #{p.get('prestige', 0) + 1}) еще рано!</b>\n"
+            f"Требуется прокачать <b>все 8 модулей лаборатории минимум до {req_lvl} уровня</b> (сейчас минимальный модуль: Ур. {min_mod}).\n\n"
+            f"💡 <i>Что дает Эволюция: сбрасывает уровни модулей лабы до 1, но НАВСЕГДА дает <b>+20% к доходу вирусов</b>, <b>+1 ячейку патогенов</b> и <b>+3% к пробитию иммунитета</b>!</i>"
+        )
+
+    for k in mod_keys:
+        p[k] = 1
+    p['prestige'] = p.get('prestige', 0) + 1
+    add_player_xp(p, 500)
+    buff_note = try_grant_rare_buff(p) or ""
+    save_rpg_firebase()
+    return (
+        f"🌌 <b>ЭВОЛЮЦИЯ СОВЕРШИЛАСЬ! ПРЕСТИЖ УРОВНЯ {p['prestige']}!</b>\n\n"
+        f"Твой штамм перешел на новую ступень генома!\n"
+        f"• Вечный бонус к добыче вирусов: <b>+{p['prestige'] * 20}%</b>\n"
+        f"• Вечный бонус к пробитию иммунитета: <b>+{p['prestige'] * 3}%</b>\n"
+        f"• Максимум ячеек патогенов увеличен на <b>+{p['prestige']}</b>!{buff_note}"
+    )
+
 # =====================================================================
-# 🗑 3.5 МИНИ-ИГРА: «ХАБАРОВСКИЙ ЛУТИНГ» (ПОВЫШЕННЫЕ ПРИЗЫ!)
+# 🗑 3.5 «ХАБАРОВСКИЙ ЛУТИНГ» РАСШИРЕННЫЙ (24 ПРЕДМЕТА, 6 ТИРОВ РЕДКОСТИ!)
 # =====================================================================
+LOOT_POOLS = {
+    'common': [
+        ("Сгнивший чеснок 🧄", 30, "Воняет на весь квартал, но для штамма сойдет."),
+        ("Дохлая батарейка АА 🔋", 45, "Если пожевать, дает бодрящий привкус окиси цинка."),
+        ("Дырявый бахил 👟", 25, "Классика крыльца у первого корпуса Меда."),
+        ("Огрызок шаурмы с остановки 🌯", 40, "Внутри уже зародилась новая белковая цивилизация."),
+        ("Пустой блистер от глицина 💊", 35, "Кто-то пытался выучить латынь за одну ночь."),
+        ("Мокрая зачетка первокурсника 📘", 50, "Пахнет слезами и отчислением.")
+    ],
+    'uncommon': [
+        ("Просроченный гематоген 🍫", 75, "Жевать невозможно, но железа в нем как в рельсе."),
+        ("Сломанный пинцет ✂️", 85, "Из анатомички утащили еще в 2014 году."),
+        ("Помятая банка энергоса ⚡", 95, "На дне плещется чистый таурин с тараканом."),
+        ("Конспект по патанатомии 📓", 110, "Почерк такой, что прочитавший сразу получает иммунитет.")
+    ],
+    'rare': [
+        ("Замороженный пельмень 🥟", 150, "Пролежал в хабаровских льдах с прошлой зимней сессии!"),
+        ("Очки Спамтона 🕶", 260, "ТЕПЕРЬ ТЫ НАСТОЯЩИЙ [[Крупная Шишка]] У МЕДА!"),
+        ("Спиртовка с чистым этанолом 🔥", 210, "Главное не перепутать с физраствором."),
+        ("Забытый стетоскоп 🩺", 190, "Слышит даже то, как урчит живот на третьей паре.")
+    ],
+    'epic': [
+        ("Пробирка с неизвестным штаммом 🧪", 380, "Светится неоново-зеленым в темноте!"),
+        ("Халат старосты с заначкой 🥼", 450, "В кармане нашлась пятихатка и пропуск в буфет без очереди!"),
+        ("Банка формалина с сюрпризом 🫙", 420, "То, что плавает внутри, явно моргнуло тебе.")
+    ],
+    'legendary': [
+        ("Котурны 20 см 👢✨", 850, "АБСОЛЮТНЫЙ ДЖЕКПОТ! В таких даже по хабаровскому гололеду как по подиуму!"),
+        ("Золотая клизма Главврача 🏆", 950, "Реликвия древних времен, инкрустированная стразами!"),
+        ("Подписанный автомат по Фарме 🎓", 1100, "Говорят, его не видел ни один живой студент!")
+    ],
+    'mythic': [
+        ("Секретный штамм «Коронаирис-Омега» ☣️👑", 2000, "МИФИЧЕСКАЯ НАХОДКА (1%)! Вся био-лаборатория гудит от мощности!")
+    ],
+    'fail': [
+        ("«Наткнулась на дедушку» 👴💀", -75, "Дед выскочил из-за баков и огрел клюкой! Минус вирусы за испуг."),
+        ("Злой вахтер с метлой 🧹🤬", -60, "Погнал тебя от мусорки до самой автобусной остановки!"),
+        ("Стая хабаровских голубей 🐦💥", -90, "Отобрали булку и склевали половину твоих пробирок!")
+    ]
+}
+
 def execute_khabarovsk_looting(user):
     p = get_player(user)
     now = time.time()
@@ -745,50 +1009,48 @@ def execute_khabarovsk_looting(user):
     roll = random.randint(1, 100)
     u_name = html.escape(p['name'])
 
-    if roll <= 35:
+    if roll <= 50:
         rarity = "⚪ Обычный шмот"
-        item_name = "Сгнивший чеснок 🧄"
-        delta = 30
-        flavor = "Воняет на весь квартал, но для штамма сойдет."
+        item_name, delta, flavor = random.choice(LOOT_POOLS['common'])
     elif roll <= 70:
-        rarity = "⚪ Обычный шмот"
-        item_name = "Дохлая батарейка АА 🔋"
-        delta = 45
-        flavor = "Если пожевать, дает бодрящий привкус окиси цинка."
-    elif roll <= 80:
+        rarity = "🟢 Необычный шмот"
+        item_name, delta, flavor = random.choice(LOOT_POOLS['uncommon'])
+    elif roll <= 84:
         rarity = "🔵 Редкий шмот"
-        item_name = "Замороженный пельмень 🥟"
-        delta = 120
-        flavor = "Пролежал во льдах с прошлой зимней сессии!"
+        item_name, delta, flavor = random.choice(LOOT_POOLS['rare'])
     elif roll <= 90:
-        rarity = "🔵 Редкий шмот"
-        item_name = "Очки Спамтона 🕶"
-        delta = 250
-        flavor = "ТЕПЕРЬ ТЫ НАСТОЯЩИЙ [[Крупная Шишка]] У МЕДА!"
-    elif roll <= 95:
-        rarity = "🟡 ЛЕГЕНДАРКА (5%)"
-        item_name = "Котурны 20 см 👢✨"
-        delta = 800
-        flavor = "АБСОЛЮТНЫЙ ДЖЕКПОТ! В таких даже по гололеду как по подиуму!"
+        rarity = "🟣 Эпический шмот"
+        item_name, delta, flavor = random.choice(LOOT_POOLS['epic'])
+    elif roll <= 94:
+        rarity = "🟡 ЛЕГЕНДАРКА (4%)"
+        item_name, delta, flavor = random.choice(LOOT_POOLS['legendary'])
+    elif roll == 95:
+        rarity = "🔴 МИФИЧЕСКИЙ ДРОП (1%)"
+        item_name, delta, flavor = random.choice(LOOT_POOLS['mythic'])
     else:
         rarity = "💥 ФЕЙЛ (5%)"
-        item_name = "«Наткнулась на дедушку» 👴💀"
-        delta = -75
-        flavor = "Дед выскочил из-за баков и огрел клюкой! Минус вирусы за испуг."
+        item_name, delta, flavor = random.choice(LOOT_POOLS['fail'])
 
-    stalker_bonus = ""
-    if delta > 0 and 'stalker_flashlight' in p.get('buffs', []):
-        extra = int(delta * 0.25)
-        delta += extra
-        stalker_bonus = f" (🔦 +{extra} от Фонаря Сталкера)"
+    bonus_notes = []
+    if delta > 0:
+        prestige_mult = 1.0 + p.get('prestige', 0) * 0.20
+        delta = int(delta * prestige_mult)
+        if 'stalker_flashlight' in p.get('buffs', []):
+            extra = int(delta * 0.25)
+            delta += extra
+            bonus_notes.append(f"🔦+{extra}")
+        if 'spamton_pipis' in p.get('buffs', []) and random.randint(1, 100) <= 10:
+            delta *= 2
+            bonus_notes.append("🔵x2 PIPIS!")
 
     p['bio_res'] = max(0, p.get('bio_res', 0) + delta)
-    xp_gain = 35 if delta >= 800 else (18 if delta >= 100 else (8 if delta > 0 else 3))
-    p['xp'] = p.get('xp', 0) + xp_gain
+    base_xp = 35 if delta >= 800 else (18 if delta >= 150 else (10 if delta > 0 else 4))
+    xp_gain = add_player_xp(p, base_xp)
     buff_note = try_grant_rare_buff(p) or ""
     save_rpg_firebase()
 
-    sign_str = f"+{delta} 🧬{stalker_bonus}" if delta > 0 else f"{delta} 🧬"
+    b_str = f" ({', '.join(bonus_notes)})" if bonus_notes else ""
+    sign_str = f"+{delta} 🧬{b_str}" if delta > 0 else f"{delta} 🧬"
     text = (
         f"🗑 <b>Хабаровский Лутинг (Мусорка у Меда)</b>\n"
         f"🕵️ Искатель: <b>{u_name}</b> копается в баках...\n\n"
@@ -802,7 +1064,7 @@ def execute_khabarovsk_looting(user):
 # --- КОНЕЦ ЧАСТИ 1 (ВСТАВЛЯЙ ЧАСТЬ 2 С НОВОЙ СТРОКИ БЕЗ ОТСТУПОВ!) ---
 PART_1_READY = True
 # =====================================================================
-# 🎡 4. ИГРА «ВИСЕЛИЦА / ПОЛЕ ЧУДЕС» (КНОПКИ + ВВОД БУКВ И СЛОВ В ЧАТ!)
+# 🎡 4. ИГРА «ВИСЕЛИЦА / ПОЛЕ ЧУДЕС» (БОЛЬШОЙ СЛОВАРЬ + УМНЫЙ ГПТ ЧАТА)
 # =====================================================================
 HANGMAN_GAMES = {}
 USED_AI_WORDS = {}
@@ -820,7 +1082,18 @@ BASE_WORDS = [
     ("ХУДИ", "Гардероб"), ("НЕЙРОСЕТЬ", "Искусственный интеллект"),
     ("СТЕТОСКОП", "Медицинский атрибут"), ("АНАТОМИЯ", "Первая пара в меде"),
     ("РЕАНИМАЦИЯ", "Скорая помощь"), ("ДЕФИБРИЛЛЯТОР", "Разряд!"),
-    ("КАПЕЛЬНИЦА", "Физраствор внутривенно")
+    ("КАПЕЛЬНИЦА", "Физраствор внутривенно"), ("ФАРМАКОЛОГИЯ", "Наука о препаратах"),
+    ("МИКРОСКОП", "Оптика лаборанта"), ("АНТИБИОТИК", "Оружие против бактерий"),
+    ("ЭПИДЕМИЯ", "Массовое заражение"), ("СЫВОРОТКА", "Концентрат антител"),
+    ("СКАЛЬПЕЛЬ", "Инструмент хирурга"), ("КАРДИОГРАММА", "Ритм сердца на бумаге"),
+    ("НАРКОЗ", "Выключение сознания"), ("РЕНТГЕН", "Сквозное просвечивание"),
+    ("ИММУНИТЕТ", "Защитный барьер организма"), ("ПАТОГЕН", "Возбудитель болезни"),
+    ("МУТАЦИЯ", "Изменение генома"), ("ВАКЦИНАЦИЯ", "Профилактический укол"),
+    ("СТИПЕНДИЯ", "Слезы радости студента"), ("ОБЩЕЖИТИЕ", "Школа выживания"),
+    ("АВТОМАТ", "Мечта на зачете"), ("КУРСОВАЯ", "Пишется в последнюю ночь"),
+    ("ШПАРГАЛКА", "Секретный архив в рукаве"), ("ДЕКАНАТ", "Обитель бюрократии"),
+    ("ГАллюцинация", "Обман восприятия"), ("СИМПТОМ", "Признак диагноза"),
+    ("АНАМНЕЗ", "История болезни со слов пациента"), ("ПРОБИРКА", "Стеклянная тара для опытов")
 ]
 
 HANGMAN_STAGES = [
@@ -839,7 +1112,7 @@ def generate_ai_context_word(chat_id):
     cid = int(chat_id)
     history = CHAT_MEMORY.get(cid, [])
     used_list = USED_AI_WORDS.setdefault(cid, [])
-    used_str = ", ".join(used_list[-30:]) if used_list else "пока нет"
+    used_str = ", ".join(used_list[-35:]) if used_list else "пока нет"
 
     if len(history) >= 4:
         prompt = (
@@ -948,7 +1221,7 @@ def start_hangman_game(chat_id, biz_id, user, is_ai=False, msg_id_to_edit=None):
     if 'oracle_eye' in p.get('buffs', []) and random.randint(1, 100) <= 25:
         open_ch = random.choice(list(word))
         guessed.add(open_ch)
-        oracle_note = f"Сработал твой бафф «Глаз Оракула» — открыта буква «{open_ch}»!"
+        oracle_note = f"Сработал твой артефакт «Глаз Оракула» — открыта буква «{open_ch}»!"
 
     game = {
         'chat_id': chat_id,
@@ -982,6 +1255,7 @@ def process_hangman_letter_or_word(cid, biz_id, user, raw_guess, from_chat_text=
     u_name = html.escape(p['name'])
     clean = raw_guess.strip().upper().replace('Ё', 'Е')
     base_rew = int(CONFIG.get('reward_hangman', 200))
+    prestige_mult = 1.0 + p.get('prestige', 0) * 0.20
 
     if len(clean) == 1 and clean in RUS_ALPHABET:
         letter = clean
@@ -992,10 +1266,9 @@ def process_hangman_letter_or_word(cid, biz_id, user, raw_guess, from_chat_text=
             if letter in game['word']:
                 if all(ch in game['guessed'] for ch in game['word']):
                     game['finished'] = True
-                    rew_res = (base_rew + 50) if game['is_ai'] else base_rew
-                    rew_xp = 50 if game['is_ai'] else 35
+                    rew_res = int(((base_rew + 50) if game['is_ai'] else base_rew) * prestige_mult)
+                    rew_xp = add_player_xp(p, 45 if game['is_ai'] else 30)
                     p['bio_res'] += rew_res
-                    p['xp'] += rew_xp
                     p['wins_hangman'] = p.get('wins_hangman', 0) + 1
                     buff_str = try_grant_rare_buff(p) or ""
                     save_rpg_firebase()
@@ -1015,10 +1288,9 @@ def process_hangman_letter_or_word(cid, biz_id, user, raw_guess, from_chat_text=
         if clean == game['word']:
             game['guessed'].update(list(game['word']))
             game['finished'] = True
-            rew_res = (base_rew + 50) if game['is_ai'] else base_rew
-            rew_xp = 60 if game['is_ai'] else 40
+            rew_res = int(((base_rew + 50) if game['is_ai'] else base_rew) * prestige_mult)
+            rew_xp = add_player_xp(p, 55 if game['is_ai'] else 35)
             p['bio_res'] += rew_res
-            p['xp'] += rew_xp
             p['wins_hangman'] = p.get('wins_hangman', 0) + 1
             buff_str = try_grant_rare_buff(p) or ""
             save_rpg_firebase()
@@ -1449,18 +1721,19 @@ def advance_story_game_round(cid):
         STORY_GAMES.pop(cid, None)
 
         win_prize = int(CONFIG.get('reward_bunker', 1000))
-        reward_note = f"\n\n🎁 <b>Награда за партию:</b> оба участника получают <b>+150 🧬 и +50 XP</b>, а <b>ПОБЕДИТЕЛЬ забирает ГЛАВНЫЙ ПРИЗ +{win_prize} 🧬 вирусов!</b>"
+        reward_note = f"\n\n🎁 <b>Награда за партию:</b> оба участника получают <b>+150 🧬 и +45 XP</b>, а <b>ПОБЕДИТЕЛЬ забирает ГЛАВНЫЙ ПРИЗ +{win_prize} 🧬 вирусов!</b>"
         winner_tail = host_reply.split('ПОБЕДИТЕЛЬ:')[-1].lower() if 'ПОБЕДИТЕЛЬ:' in host_reply else host_reply[-150:].lower()
 
         for uid_key in ('p1_id', 'p2_id'):
             uid_val = str(game.get(uid_key) or '')
             if uid_val in RPG_PLAYERS:
                 pl = RPG_PLAYERS[uid_val]
-                pl['bio_res'] = pl.get('bio_res', 0) + 150
-                pl['xp'] = pl.get('xp', 0) + 50
+                neuro_bonus = 150 if 'neuro_implant' in pl.get('buffs', []) else 0
+                pl['bio_res'] = pl.get('bio_res', 0) + 150 + neuro_bonus
+                add_player_xp(pl, 45)
                 if pl['name'].lower() in winner_tail or (pl.get('username') and pl['username'].lower() in winner_tail):
-                    pl['bio_res'] += win_prize
-                    pl['xp'] += 100
+                    pl['bio_res'] += int(win_prize * (1.0 + pl.get('prestige', 0) * 0.20))
+                    add_player_xp(pl, 90)
                     win_field = 'wins_bunker' if game['type'] == 'bunker' else 'wins_mafia'
                     pl[win_field] = pl.get(win_field, 0) + 1
                     try_grant_rare_buff(pl)
@@ -1528,7 +1801,6 @@ def record_story_player_message(message):
 # 👑 6.5 МОДЕРАЦИЯ, ПРОСМОТР ЛС БОТА И ОТВЕТЫ ОТ ИМЕНИ БОТА + НАСТРОЙКИ
 # =====================================================================
 def build_mod_hub_view():
-    """Главное меню просмотра ЛС бота, управления игроками и живого чата от имени бота."""
     spy_pm = CONFIG.get('pm_spy_enabled', True)
     live_str = f"🟢 АКТИВЕН (пишем id:{ADMIN_LIVE_CHAT_UID})" if ADMIN_LIVE_CHAT_UID else "⚪ Выкл"
 
@@ -1548,7 +1820,6 @@ def build_mod_hub_view():
     if ADMIN_LIVE_CHAT_UID:
         kb.add(InlineKeyboardButton("🛑 Выйти из режима ответа от бота", callback_data="mod_stop_live"))
 
-    # Собираем список юзеров (сначала те, кто писал в ЛС бота, затем остальные из базы)
     shown_uids = set()
     for uid_str, info in list(BOT_PM_LOGS.items())[-12:]:
         shown_uids.add(uid_str)
@@ -1572,7 +1843,6 @@ def build_mod_hub_view():
     return "\n".join(lines), kb
 
 def build_user_pm_history_view(uid_str):
-    """Показывает историю переписки конкретного юзера с ботом в ЛС."""
     info = BOT_PM_LOGS.get(uid_str)
     p = RPG_PLAYERS.get(uid_str, {})
     name = html.escape((info or p).get('name', f'id:{uid_str}'))
@@ -1588,7 +1858,7 @@ def build_user_pm_history_view(uid_str):
         f"{log_block}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💡 <b>Как ответить ему от имени бота:</b>\n"
-        f"• Нажми кнопку <b>«🗣 Включить живой чат от бота»</b> ниже и просто пиши сообщения!\n"
+        f"• Нажми кнопку <b>«🗣 Живой чат от бота»</b> ниже и просто пиши сообщения!\n"
         f"• Или напиши: <code>написать {u_tag} Привет!</code>"
     )
     kb = InlineKeyboardMarkup(row_width=2)
@@ -1603,7 +1873,6 @@ def build_user_pm_history_view(uid_str):
     return text, kb
 
 def build_user_moderation_card(uid_str):
-    """Инспекция и редактирование любого параметра конкретного игрока."""
     p = RPG_PLAYERS.get(uid_str)
     if not p:
         return "⚠️ Профиль игрока не найден.", InlineKeyboardMarkup()
@@ -1617,11 +1886,11 @@ def build_user_moderation_card(uid_str):
 
     text = (
         f"🛠 <b>Модерация игрока: {html.escape(p.get('name', 'Игрок'))} ({u_tag})</b>\n"
-        f"🆔 ID: <code>{uid_str}</code>\n"
+        f"🆔 ID: <code>{uid_str}</code> | ☣️ Престиж: <b>{p.get('prestige', 0)}</b>\n"
         f"🎖 <b>Уровень:</b> {lvl} ({rank_title}) | ✨ <b>XP:</b> <code>{p.get('xp', 0)}</code>\n"
         f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🧪 <b>Патогены:</b> <code>{p.get('patogens', 0)}</code>\n"
         f"☣️ <b>Штамм:</b> «{html.escape(p.get('strain_name', 'Х'))}» | 🤒 <b>Горячка:</b> {fever_rem} мин.\n"
-        f"🔬 <b>Лаба (Пат/Разр/Зар/Имм/Лет/Без):</b> {p.get('lab_patogen_lvl',1)} / {p.get('lab_dev_lvl',1)} / {p.get('lab_infect_lvl',1)} / {p.get('lab_immune_lvl',1)} / {p.get('lab_lethal_lvl',1)} / {p.get('lab_security_lvl',1)}\n"
+        f"🔬 <b>Лаба (8 мод.):</b> {p.get('lab_patogen_lvl',1)}/{p.get('lab_dev_lvl',1)}/{p.get('lab_infect_lvl',1)}/{p.get('lab_immune_lvl',1)}/{p.get('lab_lethal_lvl',1)}/{p.get('lab_security_lvl',1)}/{p.get('lab_mutation_lvl',1)}/{p.get('lab_reactor_lvl',1)}\n"
         f"🔑 <b>VIP-доступ к ИИ:</b> {'🟢 ДА' if has_vip else '⚪ НЕТ'} | 🚫 <b>Бан в боте:</b> {'🔴 ЗАБАНЕН' if is_banned else '🟢 Нет'}"
     )
 
@@ -1631,7 +1900,7 @@ def build_user_moderation_card(uid_str):
         InlineKeyboardButton("➖ -1000 🧬", callback_data=f"mod_act_{uid_str}_sub1000")
     )
     kb.add(
-        InlineKeyboardButton("✨ +500 XP", callback_data=f"mod_act_{uid_str}_addxp"),
+        InlineKeyboardButton("✨ +1000 XP", callback_data=f"mod_act_{uid_str}_addxp"),
         InlineKeyboardButton("🧪 +5 Патогенов", callback_data=f"mod_act_{uid_str}_addpat")
     )
     kb.add(
@@ -1650,7 +1919,6 @@ def build_user_moderation_card(uid_str):
     return text, kb
 
 def build_all_settings_view():
-    """Меню тонкой настройки вообще всех параметров бота и игр кнопками."""
     text = (
         "⚙️ <b>Тонкая настройка ВСЕХ параметров бота и игр:</b>\n\n"
         f"🗑 <b>КД Хабаровского Лутинга:</b> <code>{CONFIG.get('looting_cd_minutes', 5)}</code> мин.\n"
@@ -1698,8 +1966,9 @@ def build_all_settings_view():
 # =====================================================================
 GAME_TRIGGERS = {
     'лаба', 'моя лаба', 'био', 'биовойны', 'заразить', 'заразить все', 'заразить фулл', 'вакцина', 'лечиться',
+    'карантин', 'сбор', 'реактор', 'диверсия', 'эпидемия', 'эволюция', 'престиж',
     'доступы', 'лс бота', 'чаты бота', 'модерация', '/mod', 'настройки', 'параметры',
-    '+патоген', '+разработка', '+заразность', '+иммунитет', '+летальность', '+безопасность',
+    '+патоген', '+разработка', '+заразность', '+иммунитет', '+летальность', '+безопасность', '+мутация', '+реактор',
     'виселица', 'виселица ии', 'поле чудес', 'кнб', 'цуефа', 'рпг', 'профиль', 'топ', 'био топ', 'игры',
     'команды', 'помощь', 'хелп', '/help',
     '/search', 'лут', 'мусорка', 'лутинг',
@@ -1708,7 +1977,7 @@ GAME_TRIGGERS = {
 }
 
 GAME_PREFIXES = (
-    'заразить ', 'штамм ', 'виселица ', 'кд лут ', 'кд патоген ', 'цена вакцины ',
+    'заразить ', 'диверсия ', 'штамм ', 'виселица ', 'кд лут ', 'кд патоген ', 'цена вакцины ',
     'приз бункер ', 'приз виселица ', 'приз кнб ', 'шанс заражения ',
     'время игры ', 'раунды игры ', 'доступ ', 'забрать доступ ',
     'написать ', 'диалог ', 'выдать ', 'забрать ', 'опыт ', 'патогены ',
@@ -1766,11 +2035,9 @@ def should_intercept_private_message(message):
         if not is_owner_user(message.from_user):
             return True
 
-        # Если владелец отвечает реплаем на пересланное сообщение из ЛС бота
         if message.reply_to_message and message.reply_to_message.message_id in FORWARDED_PM_MAP:
             return True
 
-        # Если у владельца включен режим живого чата от имени бота
         if ADMIN_LIVE_CHAT_UID is not None:
             return True
 
@@ -1809,6 +2076,7 @@ def resolve_target_player(message, low_cmd):
 def send_public_user_hub(cid, user):
     p = get_player(user)
     lvl, rank_title = get_level_and_rank(p.get('xp', 0))
+    xp_prog = get_xp_progress_str(p.get('xp', 0))
     has_ai = is_user_authorized_for_ai(user)
     ai_badge = "🟢 Выдан VIP-доступ к ИИ" if has_ai else "🔒 Только игры и Био-войны (ИИ по доступу владельца)"
 
@@ -1828,7 +2096,7 @@ def send_public_user_hub(cid, user):
 
     text = (
         f"👋 <b>Привет, {html.escape(p['name'])}! Добро пожаловать в Игровой и Био-Хаб!</b>\n\n"
-        f"🎖 <b>Твое звание:</b> {rank_title} (Ур. {lvl} | ✨ {p.get('xp', 0)} XP)\n"
+        f"🎖 <b>Твое звание:</b> {rank_title} (Ур. {lvl} | <code>{xp_prog}</code>)\n"
         f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🧪 <b>Патогены:</b> {p.get('patogens', 0)}\n"
         f"🔑 <b>Статус ИИ:</b> {ai_badge}\n\n"
         f"👇 <b>Выбирай действие на кнопках или пиши команды (<code>лаба</code>, <code>/search</code>, <code>виселица</code>, <code>кнб</code>, <code>профиль</code>):</b>"
@@ -1851,16 +2119,14 @@ def handle_all_game_commands(message):
     user = message.from_user
     is_owner = is_owner_user(user)
 
-    # Проверка бана в боте для обычных пользователей в ЛС
     if not biz_id and not is_owner and is_user_banned_in_bot(user):
         bot.send_message(cid, "🚫 Доступ к боту для твоего аккаунта ограничен администратором.")
         return
 
-    # Если пишет обычный пользователь в ЛС бота — логируем и пересылаем владельцу!
     if not biz_id and not is_owner:
         notify_owner_about_bot_pm(user, raw_text)
 
-    # --- РЕЖИМ ОТВЕТА ВЛАДЕЛЬЦА ОТ ИМЕНИ БОТА (ЧЕРЕЗ REPLY ИЛИ LIVE-ЧАТ) ---
+    # --- РЕЖИМ ОТВЕТА ВЛАДЕЛЬЦА ОТ ИМЕНИ БОТА ---
     if not biz_id and is_owner:
         if low in ('стоп', '/stop', 'выйти') and ADMIN_LIVE_CHAT_UID is not None:
             old_t = ADMIN_LIVE_CHAT_UID
@@ -1868,7 +2134,6 @@ def handle_all_game_commands(message):
             bot.send_message(cid, f"🛑 Режим живого общения от имени бота (с <code>{old_t}</code>) завершен.")
             return
 
-        # Reply на уведомление 📩 [ЛС Бота]
         if message.reply_to_message and message.reply_to_message.message_id in FORWARDED_PM_MAP:
             target_uid = FORWARDED_PM_MAP[message.reply_to_message.message_id]
             try:
@@ -1881,7 +2146,6 @@ def handle_all_game_commands(message):
                 bot.reply_to(message, f"⚠️ Не удалось отправить: {e}")
             return
 
-        # Активный режим живого диалога от имени бота
         if ADMIN_LIVE_CHAT_UID is not None and not is_game_command(low) and not low.startswith('/'):
             target_uid = ADMIN_LIVE_CHAT_UID
             try:
@@ -1889,7 +2153,7 @@ def handle_all_game_commands(message):
                 if str(target_uid) in BOT_PM_LOGS:
                     t_str = time.strftime('%H:%M')
                     BOT_PM_LOGS[str(target_uid)]['log'].append(f"[{t_str}] 🗣 [Ты от лица Бота]: {raw_text}")
-                bot.send_message(cid, f"📤 <i>Доставлено от лица бота (для выхода напиши <code>стоп</code>)</i>")
+                bot.send_message(cid, "📤 <i>Доставлено от лица бота (для выхода напиши <code>стоп</code>)</i>")
             except Exception as e:
                 bot.send_message(cid, f"⚠️ Ошибка отправки: {e}")
             return
@@ -1897,12 +2161,11 @@ def handle_all_game_commands(message):
     has_ai_access = is_user_authorized_for_ai(user) or bool(biz_id)
     p = get_player(user)
 
-    # 0. Меню для обычных пользователей в ЛС бота
     if not biz_id and not is_owner and low in ('/start', 'старт', 'меню', '/panel', 'панель'):
         send_public_user_hub(cid, user)
         return
 
-    # --- КОМАНДЫ МОДЕРАЦИИ И БОГ-МОДА (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА) ---
+    # --- КОМАНДЫ МОДЕРАЦИИ И БОГ-МОДА ---
     if is_owner:
         if low in ('лс бота', 'чаты бота', 'модерация', '/mod'):
             m_text, m_kb = build_mod_hub_view()
@@ -1930,7 +2193,7 @@ def handle_all_game_commands(message):
                 BOT_PM_LOGS.setdefault(str(t_p['uid']), {'uid': str(t_p['uid']), 'name': t_p['name'], 'username': t_p.get('username',''), 'log': []})['log'].append(f"[{t_str}] 🗣 [Ты от лица Бота]: {msg_to_send}")
                 bot.send_message(cid, f"✅ Сообщение отправлено от лица бота игроку <b>{html.escape(t_p['name'])}</b>!", business_connection_id=biz_id)
             except Exception as e:
-                bot.send_message(cid, f"⚠️ Ошибка отправки (возможно, юзер не запускал бота в ЛС): {e}", business_connection_id=biz_id)
+                bot.send_message(cid, f"⚠️ Ошибка отправки: {e}", business_connection_id=biz_id)
             return
 
         if low.startswith('диалог '):
@@ -1979,7 +2242,7 @@ def handle_all_game_commands(message):
                     val = int(parts[2])
                 except Exception:
                     val = 0
-                if t_p and val > 0:
+                if t_p and val >= 0:
                     if low.startswith('выдать '):
                         t_p['bio_res'] = t_p.get('bio_res', 0) + val
                         res_msg = f"✅ Выдано <b>+{val} 🧬</b> игроку <b>{html.escape(t_p['name'])}</b> (Баланс: {t_p['bio_res']} 🧬)."
@@ -1987,8 +2250,9 @@ def handle_all_game_commands(message):
                         t_p['bio_res'] = max(0, t_p.get('bio_res', 0) - val)
                         res_msg = f"✅ Списано <b>-{val} 🧬</b> у игрока <b>{html.escape(t_p['name'])}</b> (Баланс: {t_p['bio_res']} 🧬)."
                     elif low.startswith('опыт '):
-                        t_p['xp'] = max(0, t_p.get('xp', 0) + val)
-                        res_msg = f"✅ Начислено <b>+{val} XP</b> игроку <b>{html.escape(t_p['name'])}</b> (Всего: {t_p['xp']} XP)."
+                        t_p['xp'] = val
+                        lvl_n, _ = get_level_and_rank(val)
+                        res_msg = f"✅ Опыт игрока <b>{html.escape(t_p['name'])}</b> установлен на: <b>{val} XP (Ур. {lvl_n})</b>."
                     else:
                         t_p['patogens'] = val
                         res_msg = f"✅ Патогены игрока <b>{html.escape(t_p['name'])}</b> установлены на: <b>{val} шт.</b>"
@@ -2048,7 +2312,6 @@ def handle_all_game_commands(message):
             bot.send_message(cid, f"🔑 <b>Доступ к ИИ в ЛС и ТГ Бизнес выдан:</b>\n{al_str}", business_connection_id=biz_id)
             return
 
-        # Быстрые команды изменения любых параметров
         param_cmds = {
             'кд лут ': ('looting_cd_minutes', float, "🗑 КД Хабаровского Лутинга"),
             'кд патоген ': ('base_patogen_minutes', float, "🧪 Время синтеза патогена (мин)"),
@@ -2083,7 +2346,7 @@ def handle_all_game_commands(message):
             bot.send_message(cid, "🎙 <b>Выбери модель для ИИ-Ведущего (Бункер / Мафия):</b>", business_connection_id=biz_id, reply_markup=kb)
             return
 
-    # 2. Обработка «гпт ...» и «нарисуй ...» для пользователей в ЛС бота
+    # 2. Обработка «гпт ...» и «нарисуй ...» в ЛС бота
     if not biz_id and not is_owner and (low == 'гпт' or low.startswith('гпт ') or low.startswith('нарисуй ')):
         if not has_ai_access:
             send_logged_pm(cid, "🔒 <b>Доступ к нейросети в ЛС закрыт.</b>\nЗато тебе доступны все игры и Био-войны! Напиши <code>/start</code>, <code>лаба</code>, <code>/search</code> или <code>виселица</code>.", target_user=user)
@@ -2155,39 +2418,48 @@ def handle_all_game_commands(message):
     # 6. Игровой профиль и Топ
     if low in ('игры', 'рпг', 'профиль'):
         lvl, rank_title = get_level_and_rank(p.get('xp', 0))
+        xp_prog = get_xp_progress_str(p.get('xp', 0))
         buff_list = [f"• {RARE_BUFFS_INFO[b]['name']} — <i>{RARE_BUFFS_INFO[b]['desc']}</i>" for b in p.get('buffs', []) if b in RARE_BUFFS_INFO]
-        buff_block = "\n".join(buff_list) if buff_list else "<i>Пока нет редких баффов (выпадают за победы с шансом 14%)</i>"
+        buff_block = "\n".join(buff_list) if buff_list else "<i>Пока нет артефактов (всего 12 в игре, выпадают с шансом 10%)</i>"
         u_name = html.escape(p['name'])
         strain_safe = html.escape(p.get('strain_name', 'Штамм-Х'))
+        prestige_txt = f" | ☣️ Престиж: <b>{p.get('prestige', 0)}</b>" if p.get('prestige', 0) > 0 else ""
         msg_text = (
             f"🎮 <b>Игровой профиль: {u_name}</b>\n"
-            f"🎖 <b>Звание:</b> {rank_title} (Ур. {lvl} | ✨ {p.get('xp', 0)} XP)\n"
+            f"🎖 <b>Звание:</b> {rank_title} (Ур. {lvl}{prestige_txt})\n"
+            f"📊 <b>Опыт:</b> <code>{xp_prog}</code>\n"
             f"☣️ <b>Личный штамм:</b> «{strain_safe}»\n"
-            f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🦠 <b>Заражений:</b> {p.get('infections_done', 0)}\n"
+            f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🦠 <b>Заражений:</b> {p.get('infections_done', 0)} | 🥷 <b>Диверсий:</b> {p.get('sabotages_done', 0)}\n"
             f"🗑 <b>Лутов:</b> {p.get('loot_count', 0)} | ☢️ <b>Бункер:</b> {p.get('wins_bunker', 0)} | 🕵️ <b>Мафия:</b> {p.get('wins_mafia', 0)}\n"
             f"🎡 <b>Виселица:</b> {p.get('wins_hangman', 0)} | ✂️ <b>КНБ:</b> {p.get('wins_rps', 0)}\n\n"
-            f"🔮 <b>Твои редкие артефакты/баффы:</b>\n{buff_block}\n\n"
+            f"🔮 <b>Коллекция артефактов ({len(p.get('buffs', []))}/12):</b>\n{buff_block}\n\n"
             f"🕹 <b>Команды:</b> <code>лаба</code> | <code>/search</code> | <code>бункер</code> | <code>мафия</code> | <code>виселица</code> | <code>кнб</code> | <code>био топ</code>"
         )
         send_logged_pm(cid, msg_text, business_connection_id=biz_id, target_user=user)
         return
 
     if low in ('топ', 'био топ'):
-        sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('xp', 0) + x.get('bio_xp', 0)), reverse=True)[:10]
-        lines = ["🏆 <b>Глобальный Топ Био-войн и Игр:</b>\n"]
+        sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('prestige', 0) * 1000000 + x.get('xp', 0)), reverse=True)[:10]
+        lines = ["🏆 <b>Глобальный Топ Био-войн PRO и Игр:</b>\n"]
         for idx, pl in enumerate(sorted_p, 1):
             lvl, r_title = get_level_and_rank(pl.get('xp', 0))
+            pr_b = f" [Пр.{pl.get('prestige')}]" if pl.get('prestige', 0) > 0 else ""
             p_name = html.escape(pl.get('name', 'Игрок'))
             lines.append(
-                f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>"
+                f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}{pr_b}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>"
             )
         send_logged_pm(cid, "\n".join(lines), business_connection_id=biz_id, target_user=user)
         return
 
-    # 7. Лаборатория, прокачка, вакцина и заражение (одиночное + ВСЕМИ патогенами)
+    # 7. Лаборатория PRO, эволюция, реактор, карантин, диверсия, эпидемия, заражение
     if low in ('лаба', 'моя лаба', 'био', 'биовойны'):
         text, kb = build_lab_view(p)
         send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
+        return
+
+    if low in ('эволюция', 'престиж'):
+        res_text = perform_lab_evolution(user)
+        send_logged_pm(cid, res_text, business_connection_id=biz_id, target_user=user)
         return
 
     if low.startswith('штамм '):
@@ -2198,9 +2470,32 @@ def handle_all_game_commands(message):
             send_logged_pm(cid, f"☣️ Твоему вирусу присвоено новое кодовое имя: «<b>{html.escape(new_strain)}</b>»!", business_connection_id=biz_id, target_user=user)
         return
 
+    if low in ('сбор', 'реактор'):
+        pending, _, _ = get_pending_reactor_viruses(p)
+        if pending <= 0:
+            send_logged_pm(cid, "🏭 В Био-Реакторе пока пусто! Подожди немного или прокачай <code>+реактор</code>.", business_connection_id=biz_id, target_user=user)
+            return
+        p['bio_res'] += pending
+        p['last_reactor_ts'] = time.time()
+        save_rpg_firebase()
+        send_logged_pm(cid, f"🔋 <b>Био-Реактор разгружен!</b> Собрано: <b>+{pending} 🧬 вирусов</b> (Баланс: <code>{p['bio_res']}</code> 🧬).", business_connection_id=biz_id, target_user=user)
+        return
+
+    if low == 'карантин':
+        _, quar_cost = get_vaccine_and_quar_costs(p)
+        if p.get('bio_res', 0) < quar_cost:
+            send_logged_pm(cid, f"⚠️ Купол Карантина на 2 часа стоит <b>{quar_cost} 🧬</b>!", business_connection_id=biz_id, target_user=user)
+            return
+        p['bio_res'] -= quar_cost
+        p['quarantine_until'] = max(time.time(), p.get('quarantine_until', 0)) + 7200
+        save_rpg_firebase()
+        send_logged_pm(cid, "🛡 <b>Активирован Купол Карантина на 2 часа!</b> Твоя лаборатория полностью неуязвима для заражений и диверсий!", business_connection_id=biz_id, target_user=user)
+        return
+
     cmd_map = {
         '+патоген': 'patogen', '+разработка': 'dev', '+заразность': 'infect',
-        '+иммунитет': 'immune', '+летальность': 'lethal', '+безопасность': 'security'
+        '+иммунитет': 'immune', '+летальность': 'lethal', '+безопасность': 'security',
+        '+мутация': 'mutation', '+реактор': 'reactor'
     }
     if low in cmd_map:
         upg_key = cmd_map[low]
@@ -2211,13 +2506,13 @@ def handle_all_game_commands(message):
             return
         p['bio_res'] -= cost
         p[field] = p.get(field, 1) + 1
-        p['xp'] = p.get('xp', 0) + 20
+        add_player_xp(p, 15)
         save_rpg_firebase()
         send_logged_pm(cid, f"✅ Улучшено: <b>{label}</b> ➔ Уровень {p[field]}!", business_connection_id=biz_id, target_user=user)
         return
 
     if low in ('вакцина', 'лечиться'):
-        vac_cost = int(CONFIG.get('vaccine_cost', 80))
+        vac_cost, _ = get_vaccine_and_quar_costs(p)
         if p.get('fever_until', 0) <= time.time():
             send_logged_pm(cid, "🟢 Ты полностью здоров, вакцина не требуется!", business_connection_id=biz_id, target_user=user)
             return
@@ -2229,6 +2524,20 @@ def handle_all_game_commands(message):
         p['infected_by'] = ''
         save_rpg_firebase()
         send_logged_pm(cid, "💉 <b>Вакцина введена!</b> Горячка снята, ты снова в строю!", business_connection_id=biz_id, target_user=user)
+        return
+
+    if low == 'эпидемия':
+        res_text = perform_epidemic_wave(user, source_chat_id=cid)
+        send_logged_pm(cid, res_text, business_connection_id=biz_id, target_user=user)
+        return
+
+    if low == 'диверсия' or low.startswith('диверсия '):
+        target_p = resolve_target_player(message, low)
+        if not target_p:
+            send_logged_pm(cid, "⚠️ Укажи цель диверсии: напиши <code>диверсия</code> в чате с человеком, реплаем или <code>диверсия @юзер</code>.", business_connection_id=biz_id, target_user=user)
+            return
+        res_text = perform_bio_sabotage(user, target_p, source_chat_id=cid)
+        send_logged_pm(cid, res_text, business_connection_id=biz_id, target_user=user)
         return
 
     if low == 'заразить' or low.startswith('заразить '):
@@ -2278,10 +2587,11 @@ def handle_all_game_commands(message):
 
 @bot.callback_query_handler(func=lambda call: call.data and (
     call.data.startswith('bioupg_') or call.data.startswith('biocure_') or
-    call.data.startswith('biorefresh_') or call.data.startswith('hm_') or
-    call.data.startswith('rps_') or call.data.startswith('sg_') or
-    call.data.startswith('sethostmodel_') or call.data.startswith('mod_') or
-    call.data.startswith('cfg_') or
+    call.data.startswith('biorefresh_') or call.data.startswith('biocollect_') or
+    call.data.startswith('bioquar_') or call.data.startswith('bioepid_') or
+    call.data.startswith('hm_') or call.data.startswith('rps_') or
+    call.data.startswith('sg_') or call.data.startswith('sethostmodel_') or
+    call.data.startswith('mod_') or call.data.startswith('cfg_') or
     call.data in ('panel_img_models', 'loot_again', 'pub_top', 'pub_help')
 ))
 def handle_games_callbacks(call):
@@ -2300,7 +2610,6 @@ def handle_games_callbacks(call):
             bot.answer_callback_query(call.id, "⛔ Нет доступа для этого бизнес-аккаунта!", show_alert=True)
             return
 
-        # --- КНОПКИ МОДЕРАЦИИ, ПРОСМОТРА ЛС БОТА И НАСТРОЕК ПАРАМЕТРОВ ---
         if data.startswith('mod_') or data.startswith('cfg_'):
             if not is_owner:
                 bot.answer_callback_query(call.id, "⛔ Только для владельца бота!", show_alert=True)
@@ -2392,7 +2701,7 @@ def handle_games_callbacks(call):
                 elif act == 'sub1000':
                     t_p['bio_res'] = max(0, t_p.get('bio_res', 0) - 1000)
                 elif act == 'addxp':
-                    t_p['xp'] = t_p.get('xp', 0) + 500
+                    t_p['xp'] = t_p.get('xp', 0) + 1000
                 elif act == 'addpat':
                     t_p['patogens'] = t_p.get('patogens', 0) + 5
                 elif act == 'cure':
@@ -2481,12 +2790,13 @@ def handle_games_callbacks(call):
                 return
 
         if data == 'pub_top':
-            sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('xp', 0) + x.get('bio_xp', 0)), reverse=True)[:10]
-            lines = ["🏆 <b>Глобальный Топ Био-войн и Игр:</b>\n"]
+            sorted_p = sorted(RPG_PLAYERS.values(), key=lambda x: (x.get('prestige', 0) * 1000000 + x.get('xp', 0)), reverse=True)[:10]
+            lines = ["🏆 <b>Глобальный Топ Био-войн PRO и Игр:</b>\n"]
             for idx, pl in enumerate(sorted_p, 1):
                 lvl, r_title = get_level_and_rank(pl.get('xp', 0))
+                pr_b = f" [Пр.{pl.get('prestige')}]" if pl.get('prestige', 0) > 0 else ""
                 p_name = html.escape(pl.get('name', 'Игрок'))
-                lines.append(f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>")
+                lines.append(f"{idx}. <b>{p_name}</b> ({r_title}, Ур. {lvl}{pr_b}) — 🦠 {pl.get('infections_done', 0)} | 🧬 <code>{pl.get('bio_res', 0)}</code>")
             send_logged_pm(cid, "\n".join(lines), business_connection_id=biz_id, target_user=user)
             bot.answer_callback_query(call.id)
             return
@@ -2579,12 +2889,58 @@ def handle_games_callbacks(call):
             bot.answer_callback_query(call.id, "Лаборатория обновлена")
             return
 
+        if data.startswith('biocollect_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            pending, _, _ = get_pending_reactor_viruses(p)
+            if pending <= 0:
+                bot.answer_callback_query(call.id, "🏭 В реакторе пока 0 вирусов, подожди немного!", show_alert=True)
+                return
+            p['bio_res'] += pending
+            p['last_reactor_ts'] = time.time()
+            save_rpg_firebase()
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, f"🔋 Собрано +{pending} вирусов из Реактора!", show_alert=True)
+            return
+
+        if data.startswith('bioquar_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            _, quar_cost = get_vaccine_and_quar_costs(p)
+            if p.get('bio_res', 0) < quar_cost:
+                bot.answer_callback_query(call.id, f"⚠️ Для Карантина на 2ч нужно {quar_cost} вирусов!", show_alert=True)
+                return
+            p['bio_res'] -= quar_cost
+            p['quarantine_until'] = max(time.time(), p.get('quarantine_until', 0)) + 7200
+            save_rpg_firebase()
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            bot.answer_callback_query(call.id, "🛡 Купол Карантина активирован на 2 часа!", show_alert=True)
+            return
+
+        if data.startswith('bioepid_'):
+            owner_uid = data.split('_')[1]
+            if str(user.id) != owner_uid:
+                bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
+                return
+            res_text = perform_epidemic_wave(user, source_chat_id=cid)
+            text, kb = build_lab_view(p)
+            safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
+            send_logged_pm(cid, res_text, business_connection_id=biz_id, target_user=user)
+            bot.answer_callback_query(call.id, "🌪 Волна эпидемии запущена!")
+            return
+
         if data.startswith('biocure_'):
             owner_uid = data.split('_')[1]
             if str(user.id) != owner_uid:
                 bot.answer_callback_query(call.id, "⛔ Это чужая лаборатория!", show_alert=True)
                 return
-            vac_cost = int(CONFIG.get('vaccine_cost', 80))
+            vac_cost, _ = get_vaccine_and_quar_costs(p)
             if p.get('bio_res', 0) < vac_cost:
                 bot.answer_callback_query(call.id, f"⚠️ Нужно {vac_cost} вирусов для вакцины!", show_alert=True)
                 return
@@ -2611,7 +2967,7 @@ def handle_games_callbacks(call):
                 return
             p['bio_res'] -= cost
             p[field] = p.get(field, 1) + 1
-            p['xp'] = p.get('xp', 0) + 20
+            add_player_xp(p, 15)
             save_rpg_firebase()
             text, kb = build_lab_view(p)
             safe_edit_message(text, cid, msg_id, business_id=biz_id, reply_markup=kb)
@@ -2684,11 +3040,12 @@ def handle_games_callbacks(call):
                         bonus = "\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 даже в ничью!</i>"
                     res_line = f"🤝 <b>Ничья!</b> Оба выбрали {RPS_NAMES[u_move]}.{bonus}"
                 elif (u_move, b_move) in RPS_WINS:
-                    p['bio_res'] += rps_rew
-                    p['xp'] += 20
+                    rew = int(rps_rew * (1.0 + p.get('prestige', 0) * 0.20))
+                    p['bio_res'] += rew
+                    xp_g = add_player_xp(p, 18)
                     p['wins_rps'] = p.get('wins_rps', 0) + 1
                     buff_str = try_grant_rare_buff(p) or ""
-                    res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+{rps_rew} 🧬, +20 XP){buff_str}"
+                    res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+{rew} 🧬, +{xp_g} XP){buff_str}"
                 else:
                     res_line = "🤖 <b>Бот победил в этом раунде!</b>"
 
@@ -2744,17 +3101,19 @@ def handle_games_callbacks(call):
                 if m1 == m2:
                     verdict = "🤝 <b>Боевая ничья!</b>"
                 elif (m1, m2) in RPS_WINS:
-                    p1_obj['bio_res'] += rps_rew + 15
-                    p1_obj['xp'] += 25
+                    rew = int((rps_rew + 15) * (1.0 + p1_obj.get('prestige', 0) * 0.20))
+                    p1_obj['bio_res'] += rew
+                    xp_g = add_player_xp(p1_obj, 22)
                     p1_obj['wins_rps'] = p1_obj.get('wins_rps', 0) + 1
                     b_str = try_grant_rare_buff(p1_obj) or ""
-                    verdict = f"🏆 <b>Победил(а) {n1}!</b> (+{rps_rew + 15} 🧬, +25 XP){b_str}"
+                    verdict = f"🏆 <b>Победил(а) {n1}!</b> (+{rew} 🧬, +{xp_g} XP){b_str}"
                 else:
-                    p2_obj['bio_res'] += rps_rew + 15
-                    p2_obj['xp'] += 25
+                    rew = int((rps_rew + 15) * (1.0 + p2_obj.get('prestige', 0) * 0.20))
+                    p2_obj['bio_res'] += rew
+                    xp_g = add_player_xp(p2_obj, 22)
                     p2_obj['wins_rps'] = p2_obj.get('wins_rps', 0) + 1
                     b_str = try_grant_rare_buff(p2_obj) or ""
-                    verdict = f"🏆 <b>Победил(а) {n2}!</b> (+{rps_rew + 15} 🧬, +25 XP){b_str}"
+                    verdict = f"🏆 <b>Победил(а) {n2}!</b> (+{rew} 🧬, +{xp_g} XP){b_str}"
 
                 save_rpg_firebase()
                 room['moves'].clear()
@@ -2796,4 +3155,4 @@ def _priv_game_router(message):
 bot.callback_query_handlers.insert(0, bot.callback_query_handlers.pop())
 bot.business_message_handlers.insert(0, bot.business_message_handlers.pop())
 bot.message_handlers.insert(0, bot.message_handlers.pop())
-print("🎮 МОДУЛЬ ИГР И МОДЕРАЦИИ (games.py) УСПЕШНО ПОДКЛЮЧЕН!")
+print("🎮 МОДУЛЬ ИГР, БИО-ЛАБЫ PRO И МОДЕРАЦИИ (games.py) УСПЕШНО ПОДКЛЮЧЕН!")
