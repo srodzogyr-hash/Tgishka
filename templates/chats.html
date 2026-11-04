@@ -308,11 +308,6 @@
       line-height: 1.45;
       position: relative;
       word-break: break-word;
-      animation: msgPop 0.15s ease-out;
-    }
-    @keyframes msgPop {
-      0% { opacity: 0; transform: scale(0.96); }
-      100% { opacity: 1; transform: scale(1); }
     }
 
     .msg-incoming {
@@ -498,23 +493,32 @@
     const appLayoutEl = document.getElementById('appLayout');
     const searchChatsEl = document.getElementById('searchChats');
 
+    let cachedChatsHash = '';
+    let currentChatUid = null;
+    let lastMsgCount = 0;
+    let lastMsgIdOrText = '';
+
     // Load Chat List from API
     async function fetchChatsList() {
       try {
         const res = await fetch('/api/chats');
         if (!res.ok) return;
         chatsData = await res.json();
-        renderChatsList(chatsData);
+        
+        // Quick hash check: only re-render if data or search changed
+        const currentHash = JSON.stringify(chatsData) + '_' + searchChatsEl.value;
+        if (currentHash !== cachedChatsHash) {
+          cachedChatsHash = currentHash;
+          renderChatsList(chatsData);
+        }
       } catch (err) {
         console.error("Ошибка загрузки списка чатов:", err);
       }
     }
 
-    // Render Chat List
+    // Render Chat List without wiping DOM (Zero Flicker)
     function renderChatsList(chats) {
       const filter = searchChatsEl.value.toLowerCase().trim();
-      chatsListEl.innerHTML = '';
-
       const filtered = chats.filter(c => {
         const name = (c.name || '').toLowerCase();
         const uname = (c.username || '').toLowerCase();
@@ -526,65 +530,121 @@
         return;
       }
 
-      filtered.forEach(c => {
-        const item = document.createElement('div');
-        item.className = `chat-item ${c.uid === activeUid ? 'active' : ''}`;
-        item.onclick = () => selectChat(c.uid);
+      // If placeholder was present, remove it
+      if (chatsListEl.children.length === 1 && !chatsListEl.children[0].classList.contains('chat-item')) {
+        chatsListEl.innerHTML = '';
+      }
 
-        const unreadBadge = c.unread > 0 ? `<div class="chat-badge">${c.unread}</div>` : '';
+      filtered.forEach((c) => {
+        let item = chatsListEl.querySelector(`.chat-item[data-uid="${c.uid}"]`);
         const unameLabel = c.username ? `@${c.username}` : `ID: ${c.uid}`;
+        const unreadBadge = c.unread > 0 ? `<div class="chat-badge">${c.unread}</div>` : '';
 
-        item.innerHTML = `
-          <img class="chat-avatar" src="/api/avatar/${c.uid}" alt="" onerror="this.src='/api/avatar/${c.uid}'">
-          <div class="chat-info">
-            <div class="chat-row-top">
-              <span class="chat-name">${escapeHtml(c.name || unameLabel)}</span>
-              <span class="chat-time">${c.last_time || ''}</span>
+        if (!item) {
+          item = document.createElement('div');
+          item.className = `chat-item ${c.uid === activeUid ? 'active' : ''}`;
+          item.dataset.uid = c.uid;
+          item.onclick = () => selectChat(c.uid);
+          item.innerHTML = `
+            <img class="chat-avatar" src="/api/avatar/${c.uid}" alt="" loading="lazy">
+            <div class="chat-info">
+              <div class="chat-row-top">
+                <span class="chat-name">${escapeHtml(c.name || unameLabel)}</span>
+                <span class="chat-time">${c.last_time || ''}</span>
+              </div>
+              <div class="chat-row-bottom">
+                <span class="chat-preview">${escapeHtml(c.last_message || '...')}</span>
+                <div class="badge-slot">${unreadBadge}</div>
+              </div>
             </div>
-            <div class="chat-row-bottom">
-              <span class="chat-preview">${escapeHtml(c.last_message || '...')}</span>
-              ${unreadBadge}
-            </div>
-          </div>
-        `;
-        chatsListEl.appendChild(item);
+          `;
+          chatsListEl.appendChild(item);
+        } else {
+          // Update text in place without re-creating nodes
+          item.className = `chat-item ${c.uid === activeUid ? 'active' : ''}`;
+          const nameEl = item.querySelector('.chat-name');
+          const timeEl = item.querySelector('.chat-time');
+          const prevEl = item.querySelector('.chat-preview');
+          const badgeSlot = item.querySelector('.badge-slot');
+
+          if (nameEl && nameEl.textContent !== (c.name || unameLabel)) nameEl.textContent = (c.name || unameLabel);
+          if (timeEl && timeEl.textContent !== (c.last_time || '')) timeEl.textContent = (c.last_time || '');
+          if (prevEl && prevEl.textContent !== (c.last_message || '...')) prevEl.textContent = (c.last_message || '...');
+          if (badgeSlot && badgeSlot.innerHTML !== unreadBadge) badgeSlot.innerHTML = unreadBadge;
+        }
+      });
+
+      // Remove deleted chats
+      const validUids = new Set(filtered.map(c => String(c.uid)));
+      chatsListEl.querySelectorAll('.chat-item').forEach(el => {
+        if (!validUids.has(el.dataset.uid)) el.remove();
       });
     }
 
     // Select Active Chat
     async function selectChat(uid) {
-      activeUid = uid;
+      if (activeUid !== uid) {
+        activeUid = uid;
+        lastMsgCount = 0;
+        lastMsgIdOrText = '';
+        messagesAreaEl.innerHTML = '';
+      }
       appLayoutEl.classList.add('mobile-chat-open');
       emptyStateEl.style.display = 'none';
       activeChatAreaEl.style.display = 'flex';
 
       // Update active highlight in list
-      document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.chat-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.uid === String(uid));
+      });
 
-      await loadChatHistory(uid);
+      await loadChatHistory(uid, true);
       messageInputEl.focus();
     }
 
-    // Load Chat History
-    async function loadChatHistory(uid) {
+    // Load Chat History (Incremental append - Zero Flicker)
+    async function loadChatHistory(uid, forceFullRender = false) {
       try {
         const res = await fetch(`/api/chats/${uid}`);
         if (!res.ok) return;
         const data = await res.json();
+        const messages = data.messages || [];
 
-        // Update Header
-        document.getElementById('activeName').textContent = data.name || `User ${uid}`;
-        document.getElementById('activeUsername').textContent = data.username ? `@${data.username}` : `ID: ${uid}`;
-        document.getElementById('activeAvatar').src = `/api/avatar/${uid}`;
-        const tgLink = data.username ? `https://t.me/${data.username}` : `tg://user?id=${uid}`;
-        document.getElementById('activeTgLink').href = tgLink;
+        const isNewChat = (currentChatUid !== uid) || forceFullRender;
+        if (isNewChat) {
+          currentChatUid = uid;
+          lastMsgCount = 0;
+          lastMsgIdOrText = '';
+          messagesAreaEl.innerHTML = '';
 
-        // Render Messages
-        const wasScrolledToBottom = messagesAreaEl.scrollHeight - messagesAreaEl.scrollTop <= messagesAreaEl.clientHeight + 100;
-        
-        messagesAreaEl.innerHTML = '';
-        if (data.messages && data.messages.length > 0) {
-          data.messages.forEach(m => {
+          // Update Header
+          document.getElementById('activeName').textContent = data.name || `User ${uid}`;
+          document.getElementById('activeUsername').textContent = data.username ? `@${data.username}` : `ID: ${uid}`;
+          document.getElementById('activeAvatar').src = `/api/avatar/${uid}`;
+          const tgLink = data.username ? `https://t.me/${data.username}` : `tg://user?id=${uid}`;
+          document.getElementById('activeTgLink').href = tgLink;
+        }
+
+        const latestMsgText = messages.length > 0 ? messages[messages.length - 1].text : '';
+        // If message count & content haven't changed, DO NOTHING! (Prevents any jitter)
+        if (!isNewChat && messages.length === lastMsgCount && latestMsgText === lastMsgIdOrText) {
+          return;
+        }
+
+        const wasScrolledToBottom = isNewChat || (messagesAreaEl.scrollHeight - messagesAreaEl.scrollTop <= messagesAreaEl.clientHeight + 80);
+
+        if (messages.length === 0) {
+          messagesAreaEl.innerHTML = `<div style="text-align:center; color:var(--text-muted); font-size:13px; margin:auto;">Диалог пуст. Напишите сообщение ниже, чтобы начать!</div>`;
+        } else {
+          // If empty message placeholder was shown, clear it
+          if (messagesAreaEl.children.length === 1 && !messagesAreaEl.children[0].classList.contains('msg-bubble')) {
+            messagesAreaEl.innerHTML = '';
+          }
+
+          // Only append new messages
+          const startIndex = isNewChat ? 0 : lastMsgCount;
+          for (let i = startIndex; i < messages.length; i++) {
+            const m = messages[i];
             const isOut = (m.sender === 'bot');
             const bubble = document.createElement('div');
             bubble.className = `msg-bubble ${isOut ? 'msg-outgoing' : 'msg-incoming'}`;
@@ -597,14 +657,14 @@
               </div>
             `;
             messagesAreaEl.appendChild(bubble);
-          });
-        } else {
-          messagesAreaEl.innerHTML = `<div style="text-align:center; color:var(--text-muted); font-size:13px; margin:auto;">Диалог пуст. Напишите сообщение ниже, чтобы начать!</div>`;
+          }
         }
 
-        if (wasScrolledToBottom || !messagesAreaEl.dataset.scrolledOnce) {
+        lastMsgCount = messages.length;
+        lastMsgIdOrText = latestMsgText;
+
+        if (wasScrolledToBottom) {
           messagesAreaEl.scrollTop = messagesAreaEl.scrollHeight;
-          messagesAreaEl.dataset.scrolledOnce = "true";
         }
       } catch (err) {
         console.error("Ошибка загрузки истории:", err);
@@ -627,7 +687,7 @@
         });
         const resData = await res.json();
         if (resData.ok) {
-          await loadChatHistory(activeUid);
+          await loadChatHistory(activeUid, false);
           await fetchChatsList();
         } else {
           alert("Ошибка отправки: " + (resData.error || "Неизвестно"));
@@ -643,7 +703,7 @@
       if (!confirm("Очистить историю сообщений с этим пользователем?")) return;
       try {
         await fetch(`/api/chats/${activeUid}/clear`, { method: 'POST' });
-        await loadChatHistory(activeUid);
+        await loadChatHistory(activeUid, true);
         await fetchChatsList();
       } catch (err) {
         alert("Ошибка: " + err);
