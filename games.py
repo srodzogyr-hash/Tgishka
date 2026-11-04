@@ -905,11 +905,6 @@ def perform_epidemic_wave(attacker_user, source_chat_id=0):
             total_base_xp += 22
             atk_p['infections_done'] = atk_p.get('infections_done', 0) + 1
             results_lines.append(f"• ☣️ <b>{t_name}</b> — ЗАРАЖЕН (+{loot} 🧬)")
-            send_victim_infection_notification(
-                t_p,
-                f"🌪 <b>ВОЛНА ЭПИДЕМИИ!</b>\nТебя накрыло аэрозольным штаммом «<b>{strain_name}</b>»! Горячка +15 мин.",
-                source_chat_id
-            )
         else:
             results_lines.append(f"• 🛡 <b>{t_name}</b> — иммунитет отбил волну")
 
