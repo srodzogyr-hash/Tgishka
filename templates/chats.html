@@ -4,6 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>TGishka // Панель чатов с пользователями</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#17212b">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root {
       --bg-primary: #0e1621;
@@ -93,6 +100,23 @@
       justify-content: center;
     }
     .btn-icon:hover { color: var(--text-main); background: rgba(255,255,255,0.06); }
+
+    .btn-install {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 5px 11px;
+      border-radius: 14px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 4px;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .btn-install:active { transform: scale(0.95); }
+    .btn-install:hover { background: var(--accent-hover); }
 
     .search-box {
       padding: 10px 14px;
@@ -403,7 +427,10 @@
           <span>💬 TGishka ЧАТЫ</span>
           <span class="brand-badge" id="onlineBadge">Live</span>
         </div>
-        <button class="btn-icon" id="btnRefreshList" title="Обновить список">🔄</button>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button class="btn-install" id="btnInstallPwa" title="Установить приложение">📲 Установить</button>
+          <button class="btn-icon" id="btnRefreshList" title="Обновить список">🔄</button>
+        </div>
       </div>
 
       <div class="search-box">
@@ -662,6 +689,47 @@
 
     // Initial load
     fetchChatsList();
+
+    // PWA Service Worker Registration
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').then(() => {
+          console.log('TGishka Service Worker Registered');
+        }).catch(err => console.error('SW Error:', err));
+      });
+    }
+
+    // PWA Install Prompt Handler
+    let deferredInstallPrompt = null;
+    const btnInstall = document.getElementById('btnInstallPwa');
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredInstallPrompt = e;
+      if (btnInstall) {
+        btnInstall.style.display = 'flex';
+      }
+    });
+
+    if (btnInstall) {
+      btnInstall.addEventListener('click', async () => {
+        if (deferredInstallPrompt) {
+          deferredInstallPrompt.prompt();
+          const { outcome } = await deferredInstallPrompt.userChoice;
+          if (outcome === 'accepted') {
+            btnInstall.style.display = 'none';
+          }
+          deferredInstallPrompt = null;
+        } else {
+          alert('Чтобы установить приложение: нажмите на три точки в браузере (⋮) и выберите «Установить приложение» или «Добавить на главный экран»!');
+        }
+      });
+    }
+
+    window.addEventListener('appinstalled', () => {
+      if (btnInstall) btnInstall.style.display = 'none';
+      console.log('TGishka PWA успешно установлено!');
+    });
   </script>
 </body>
 </html>

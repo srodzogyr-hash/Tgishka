@@ -24,6 +24,16 @@ def chats_page():
 def healthz():
     return "ok", 200
 
+@app.route('/manifest.json')
+def manifest():
+    return app.send_static_file('manifest.json')
+
+@app.route('/sw.js')
+def service_worker():
+    response = app.send_static_file('sw.js')
+    response.headers['Service-Worker-Allowed'] = '/'
+    return response
+
 # --- REST API ДЛЯ ПАНЕЛИ ЧАТОВ ---
 @app.route('/api/chats', methods=['GET'])
 def api_get_chats():
