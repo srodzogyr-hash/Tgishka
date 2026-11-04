@@ -127,6 +127,16 @@ def log_bot_pm_interaction(user, text, from_bot=False):
     if len(entry['log']) > 60:
         entry['log'] = entry['log'][-60:]
 
+    # Синхронизация с Web-панелью чатов (chat_manager)
+    try:
+        import chat_manager
+        if from_bot:
+            chat_manager.handle_outgoing_pm(uid_str, clean_t)
+        else:
+            chat_manager.handle_incoming_pm(user, clean_t)
+    except Exception:
+        pass
+
 def notify_owner_about_bot_pm(user, text):
     if not user or is_owner_user(user):
         return
@@ -3149,6 +3159,9 @@ def _priv_game_router(message):
     try:
         if message.content_type == 'text':
             handle_all_game_commands(message)
+        else:
+            media_lbl = message.caption or f"[{message.content_type.capitalize()}]"
+            notify_owner_about_bot_pm(message.from_user, media_lbl)
     except Exception as e:
         print(f"⚠️ Ошибка в _priv_game_router: {e}")
 

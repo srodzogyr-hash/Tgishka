@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+chats_data.json
+.env

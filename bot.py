@@ -109,6 +109,12 @@ MAX_CACHE_SIZE = 500
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 
+try:
+    import chat_manager
+    chat_manager.set_bot_instance(bot)
+except Exception:
+    pass
+
 thread_local = threading.local()
 
 def get_http_session():
