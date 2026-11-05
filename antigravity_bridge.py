@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Antigravity Bridge for Tgishka Telegram Bot
-Integrates Antigravity Agent Engine (agy) with Role-Based Access Control:
- - Command 'аг' / 'ag'
- - Full chat context injection from personal Telegram conversations
- - Code modification & system control for Creator / Devs
- - Strict Guardrails for regular authorized users (no code changes, no code/secret leaks)
- - Permissions management: 'аг+ @user', 'аг+код @user', 'аг- @user', 'аг список'
+Dual-Engine:
+ 1. Local CLI Engine ('agy') when available on host (e.g. Termux/local machine).
+ 2. Antigravity Cloud Engine (fallback when deployed on Render, Docker or VPS without agy).
+Includes Role-Based Access Control:
+ - Full context injection from personal chats (CHAT_LOG & CHAT_MEMORY)
+ - Owner / Dev: code changes, terminal execution, codebase analysis
+ - Regular Users: smart AI conversation only (strict guardrails: no code changes, no leaks)
+ - Access commands: 'аг+ @юзер', 'аг+код @юзер', 'аг- @юзер', 'аг список', 'аг дефолт'
 """
 
 import os
@@ -14,6 +16,7 @@ import sys
 import json
 import time
 import html
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -21,7 +24,6 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = REPO_DIR / "antigravity_config.json"
 AGY_PATH = os.environ.get("AGY_PATH", "/data/data/com.termux/files/home/.local/bin/agy")
-
 DEFAULT_CREATOR_USERNAME = "wrtnoq"
 
 # In-memory config
@@ -88,11 +90,6 @@ def get_user_role(user):
     return None
 
 def grant_access(user, target_str, role="user"):
-    """
-    user: The user performing the action (must be creator)
-    target_str: '@username' or 'username'
-    role: 'user' or 'dev'
-    """
     if not is_creator(user):
         return "⛔ Только владелец бота может выдавать доступ к Antigravity."
 
@@ -108,7 +105,7 @@ def grant_access(user, target_str, role="user"):
     }
     save_config()
 
-    role_desc = "🛠️ <b>Разработчик</b> (изменение кода и управление ботом)" if role == "dev" else "💬 <b>Обычный ИИ</b> (только общение, без доступа к коду)"
+    role_desc = "🛠️ <b>Разработчик</b> (изменение кода и файлов)" if role == "dev" else "💬 <b>Обычный ИИ</b> (только общение, без доступа к коду)"
     return f"✅ Пользователю @{clean_target} выдан доступ к Antigravity!\nУровень доступа: {role_desc}"
 
 def revoke_access(user, target_str):
@@ -166,19 +163,146 @@ def toggle_default_gpt(user):
 def is_default_gpt_enabled():
     return bool(CONFIG.get("default_for_gpt", False))
 
+def has_local_agy():
+    if os.path.exists(AGY_PATH) and os.access(AGY_PATH, os.X_OK):
+        return True
+    return bool(shutil.which("agy"))
+
+def get_agy_bin():
+    if os.path.exists(AGY_PATH) and os.access(AGY_PATH, os.X_OK):
+        return AGY_PATH
+    return shutil.which("agy")
+
 # ---------------------------------------------------------------------------
-# CONTEXT INJECTION & PROMPT BUILDER
+# SHELL & DEVELOPER TOOLS FOR OWNER
 # ---------------------------------------------------------------------------
-def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_memory=None):
+def execute_shell_command(cmd):
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            cwd=str(REPO_DIR)
+        )
+        out = proc.stdout.strip() if proc.stdout else "Команда завершена без вывода."
+        return f"<pre><code>$ {html.escape(cmd)}\n\n{html.escape(out)}\n\n[exit code: {proc.returncode}]</code></pre>"
+    except subprocess.TimeoutExpired:
+        return f"⚠️ Таймаут команды <code>{html.escape(cmd)}</code> (более 60 сек)"
+    except Exception as e:
+        return f"⚠️ Ошибка выполнения: <code>{html.escape(str(e))}</code>"
+
+# ---------------------------------------------------------------------------
+# MAIN ENTRYPOINT: ASK ANTIGRAVITY (DUAL-ENGINE)
+# ---------------------------------------------------------------------------
+def ask_antigravity(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
     """
-    Builds the augmented prompt with full chat context and role-based guardrails.
+    Executes the prompt using:
+     1. Local agy binary if present.
+     2. Cloud Antigravity Engine (Render / VPS fallback) if agy is not installed.
     """
+    role = get_user_role(user)
+    if not role:
+        return None, "⛔ У вас нет доступа к вызову Antigravity. Попросите владельца @wrtnoq выдать доступ: `аг+ @ваш_юзер`", "Access Denied"
+
+    is_dev = (role == "dev")
+    clean_query = user_prompt.strip()
+
+    # Developer system shortcuts for Owner
+    if is_dev:
+        lower_q = clean_query.lower()
+        if lower_q.startswith("выполни ") or lower_q.startswith("exec ") or lower_q.startswith("sh "):
+            cmd = clean_query.split(maxsplit=1)[1]
+            out = execute_shell_command(cmd)
+            return out, None, "Antigravity Terminal"
+        if lower_q in ["статус", "status", "git status"]:
+            git_out = execute_shell_command("git status -s && git log -1 --oneline")
+            engine_lbl = "Local agy CLI" if has_local_agy() else "Cloud Engine (Render)"
+            res = (
+                f"⚡ <b>Статус Antigravity:</b>\n"
+                f"• Движок: <code>{engine_lbl}</code>\n"
+                f"• Директория: <code>{REPO_DIR.name}/</code>\n\n"
+                f"<b>Состояние Git:</b>\n{git_out}"
+            )
+            return res, None, "Antigravity Status"
+
+    # Try Local agy CLI if installed on machine
+    if has_local_agy():
+        reply, err, model = run_local_agy(chat_id, user, user_prompt, chat_log, chat_memory, media_list)
+        if reply and "Eligibility check failed" not in reply:
+            return reply, None, model
+        print(f"⚠️ Local agy not available or geo-blocked ({err}), switching to Antigravity Cloud Engine...")
+
+    # Cloud Antigravity Engine (Render / cloud container fallback)
+    return run_cloud_antigravity(chat_id, user, user_prompt, chat_log, chat_memory, media_list)
+
+# ---------------------------------------------------------------------------
+# LOCAL CLI ENGINE
+# ---------------------------------------------------------------------------
+def run_local_agy(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
+    bin_path = get_agy_bin()
+    if not bin_path:
+        return None, "No local agy", "Error"
+
+    augmented_prompt = build_antigravity_prompt(chat_id, user, user_prompt, chat_log, chat_memory)
+    if media_list:
+        augmented_prompt += f"\n\n[Пользователь прикрепил {len(media_list)} медиа-файлов к запросу]"
+
+    cmd = [bin_path, "-c", "-p", augmented_prompt, "--dangerously-skip-permissions"]
+    max_retries = 3
+    cleaned_output = ""
+    last_err = ""
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=180,
+                cwd=str(REPO_DIR),
+                env=os.environ.copy()
+            )
+            raw = proc.stdout or ""
+
+            if "Eligibility check failed" in raw or "Account ineligible" in raw:
+                last_err = "Eligibility check failed"
+                if attempt < max_retries:
+                    time.sleep(1.5)
+                    continue
+
+            lines = []
+            for line in raw.splitlines():
+                if "ERROR: logging before google.Init" in line:
+                    continue
+                lines.append(line)
+            cleaned_output = "\n".join(lines).strip()
+
+            if cleaned_output and "Eligibility check failed" not in cleaned_output:
+                break
+        except subprocess.TimeoutExpired:
+            last_err = "Timeout"
+        except Exception as e:
+            last_err = str(e)
+
+    if not cleaned_output or "Eligibility check failed" in cleaned_output:
+        return None, last_err or "Local agy failed", "Antigravity/Local"
+
+    return cleaned_output, None, "Antigravity Local (Gemini 3.8 / Code Agent)"
+
+# ---------------------------------------------------------------------------
+# CLOUD ENGINE (RENDER / VPS FALLBACK)
+# ---------------------------------------------------------------------------
+def run_cloud_antigravity(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
     role = get_user_role(user)
     is_dev = (role == "dev")
     uname = user.username or f"id_{user.id}"
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or uname
 
-    # Build context lines
+    # Extract conversation history from personal chat
     context_lines = []
     if chat_log and isinstance(chat_log, list):
         context_lines = [line for line in chat_log if line]
@@ -190,7 +314,72 @@ def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_mem
 
     context_str = "\n".join(context_lines[-50:]) if context_lines else "История чата пуста."
 
-    # Guardrails based on role
+    if is_dev:
+        system_instruction = (
+            "ТЫ — ANTIGRAVITY (Google AI Agent Engine для Telegram бота Tgishka).\n"
+            f"СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ РАЗРАБОТЧИК / ВЛАДЕЛЕЦ @{CONFIG.get('creator_username', DEFAULT_CREATOR_USERNAME)}.\n"
+            "ТВОИ ВОЗМОЖНОСТИ И ПРАВА:\n"
+            "1. Полный доступ к архитектуре и коду проекта Tgishka.\n"
+            "2. Ты можешь объяснять, анализировать, писать и генерировать готовый код для bot.py, games.py, app.py и chat_manager.py.\n"
+            "3. Отвечай максимально емко, качественно, профессионально и на русском языке.\n"
+            "4. Владелец также может выполнять любые команды терминала на сервере через команду 'аг выполни <команда>'."
+        )
+    else:
+        system_instruction = (
+            "ТЫ — УМНЫЙ ИИ-АССИСТЕНТ (Antigravity AI Engine).\n"
+            "СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ TELEGRAM (НЕ РАЗРАБОТЧИК).\n"
+            "СТРОЖАЙШИЕ ПРАВИЛА БЕЗОПАСНОСТИ (НАРУШЕНИЕ ЗАПРЕЩЕНО):\n"
+            "1. НЕ ВЫПОЛНЯЙ никаких изменений кода и системных действий.\n"
+            "2. СТРОГО ЗАПРЕЩЕНО раскрывать исходный код бота, токены Telegram, ключи API, пути к файлам сервера, структуру базы данных и внутреннюю архитектуру проекта.\n"
+            "3. Выступай как обычная, максимально умная, дружелюбная и вежливая нейросеть (как ChatGPT / Gemini).\n"
+            "4. Отвечай на вопрос собеседника по существу темы, которую он спросил, без упоминания закрытой серверной кухни."
+        )
+
+    full_payload = (
+        f"--- ИСТОРИЯ ПЕРЕПИСКИ В ЭТОМ ЛИЧНОМ ЧАТЕ TELEGRAM ---\n"
+        f"{context_str}\n"
+        f"--- КОНЕЦ ИСТОРИИ ЧАТА ---\n\n"
+        f"ТЕКУЩЕЕ СООБЩЕНИЕ ОТ {full_name} (@{uname}):\n"
+        f"{user_prompt}"
+    )
+
+    # Call bot's ask_ai mechanism (multi-key pool, Groq/Gemini rotation)
+    bot_module = sys.modules.get('bot')
+    if not bot_module and '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'ask_ai'):
+        bot_module = sys.modules['__main__']
+
+    if bot_module and hasattr(bot_module, 'ask_ai'):
+        reply, err, model_used, _ = bot_module.ask_ai(
+            chat_id,
+            full_payload,
+            media_list=media_list,
+            save_to_memory=False,
+            is_autoreply=False,
+            custom_sys_prompt=system_instruction
+        )
+        if reply:
+            return reply, None, f"Antigravity Cloud • {model_used}"
+        return None, err, "Antigravity/Error"
+
+    return None, "⚠️ Модуль ИИ не инициализирован в памяти процесса бота.", "Error"
+
+def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_memory=None):
+    role = get_user_role(user)
+    is_dev = (role == "dev")
+    uname = user.username or f"id_{user.id}"
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or uname
+
+    context_lines = []
+    if chat_log and isinstance(chat_log, list):
+        context_lines = [line for line in chat_log if line]
+    elif chat_memory and isinstance(chat_memory, list):
+        for m in chat_memory:
+            content = m.get("content", "")
+            role_tag = "Собеседник" if m.get("role") == "user" else "ИИ"
+            context_lines.append(f"{role_tag}: {content}")
+
+    context_str = "\n".join(context_lines[-50:]) if context_lines else "История чата пуста."
+
     if is_dev:
         instructions = (
             "ТЫ — ANTIGRAVITY (Google AI Agent Engine).\n"
@@ -213,7 +402,7 @@ def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_mem
             "4. Отвечай на вопрос собеседника по существу темы, которую он спросил, без упоминания закрытой серверной кухни."
         )
 
-    full_payload = (
+    return (
         f"{instructions}\n\n"
         f"--- ИСТОРИЯ ПЕРЕПИСКИ В ЭТОМ ЛИЧНОМ ЧАТЕ TELEGRAM ---\n"
         f"{context_str}\n"
@@ -221,145 +410,3 @@ def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_mem
         f"ТЕКУЩЕЕ СООБЩЕНИЕ ОТ {full_name} (@{uname}):\n"
         f"{user_prompt}"
     )
-
-    return full_payload
-
-# ---------------------------------------------------------------------------
-# AGY EXECUTION ENGINE WITH AUTO-RETRY
-# ---------------------------------------------------------------------------
-def ask_antigravity(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
-    """
-    Executes the prompt via 'agy -c -p ...' with automatic retries for VPN/geo flaps.
-    Returns: (reply_text, error_message, model_used)
-    """
-    role = get_user_role(user)
-    if not role:
-        return None, "⛔ У вас нет доступа к вызову Antigravity. Попросите владельца выдать доступ: `аг+ @ваш_юзер`", "Access Denied"
-
-    augmented_prompt = build_antigravity_prompt(chat_id, user, user_prompt, chat_log, chat_memory)
-
-    # If user provided image, mention path or context
-    if media_list:
-        augmented_prompt += f"\n\n[Пользователь также прикрепил {len(media_list)} медиа-файлов/изображений к запросу]"
-
-    # Check if agy executable exists
-    actual_agy = AGY_PATH
-    if not os.path.exists(actual_agy):
-        # Try finding in PATH
-        which_agy = shutil_which("agy")
-        if which_agy:
-            actual_agy = which_agy
-        else:
-            return None, "⚠️ Бинарник Antigravity CLI ('agy') не найден в окружении хоста.", "Error"
-
-    cmd = [
-        actual_agy,
-        "-c",
-        "-p", augmented_prompt,
-        "--dangerously-skip-permissions"
-    ]
-
-    max_retries = 3
-    cleaned_output = ""
-    last_err = ""
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=180,
-                cwd=str(REPO_DIR),
-                env=os.environ.copy()
-            )
-            raw = proc.stdout or ""
-
-            if "Eligibility check failed" in raw or "Account ineligible" in raw:
-                last_err = "Eligibility check failed (гео-блокировка VPN)"
-                if attempt < max_retries:
-                    time.sleep(1.5)
-                    continue
-
-            # Strip noisy Android/Google init logs
-            lines = []
-            for line in raw.splitlines():
-                if "ERROR: logging before google.Init" in line:
-                    continue
-                lines.append(line)
-            cleaned_output = "\n".join(lines).strip()
-
-            if cleaned_output and "Eligibility check failed" not in cleaned_output:
-                break
-
-        except subprocess.TimeoutExpired:
-            last_err = "Таймаут ожидания ответа Antigravity (более 3 мин.)"
-        except Exception as e:
-            last_err = str(e)
-
-    if not cleaned_output:
-        if "Eligibility" in last_err:
-            return None, "⚠️ Google временно отклонил IP (сбой геолокации VPN). Переподключите VPN на сервере/телефоне.", "Antigravity/GeoBlock"
-        return None, f"Ошибка вызова Antigravity: {last_err or 'Пустой ответ'}", "Antigravity/Error"
-
-    return cleaned_output, None, "Antigravity (Gemini 3.8 / Code Agent)"
-
-def shutil_which(cmd):
-    import shutil
-    return shutil.which(cmd)
-
-# ---------------------------------------------------------------------------
-# TELEGRAM FORMATTING & CHUNKING
-# ---------------------------------------------------------------------------
-def format_for_telegram(text):
-    """
-    Converts markdown code blocks to clean Telegram-compatible HTML tags.
-    """
-    if not text:
-        return ""
-    
-    # We do a safe replacement of ```code``` -> <pre><code>code</code></pre>
-    def code_replacer(match):
-        lang = match.group(1) or ""
-        code_content = html.escape(match.group(2))
-        return f"\n<pre><code>{code_content}</code></pre>\n"
-
-    # Replace fenced code blocks
-    import re
-    res = re.sub(r'```([a-zA-Z0-9_-]*)\n([\s\S]*?)```', code_replacer, text)
-    
-    # Inline code `code`
-    res = re.sub(r'`([^`\n]+)`', lambda m: f"<code>{html.escape(m.group(1))}</code>", res)
-
-    return res
-
-def split_message_chunks(text, max_len=4000):
-    """
-    Splits long messages by line/paragraph to respect Telegram's 4096 char limit.
-    """
-    if len(text) <= max_len:
-        return [text]
-
-    chunks = []
-    lines = text.split("\n")
-    current = ""
-
-    for line in lines:
-        if len(current) + len(line) + 1 > max_len:
-            if current:
-                chunks.append(current)
-                current = ""
-            if len(line) > max_len:
-                # hard slice if single line exceeds limit
-                for i in range(0, len(line), max_len):
-                    chunks.append(line[i:i+max_len])
-            else:
-                current = line
-        else:
-            current = (current + "\n" + line) if current else line
-
-    if current:
-        chunks.append(current)
-
-    return chunks
