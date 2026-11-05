@@ -537,7 +537,7 @@ def handle_antigravity_execution(message, prompt_text, media_list=None, business
 
         thought = (res_dict.get("thought") or "").strip()
         code_action = (res_dict.get("code_action") or "").strip()
-        reply_body = (res_dict.get("text") or "").strip()
+        reply_body = (res_dict.get("text") or res_dict.get("response") or "").strip()
         model_used = res_dict.get("model") or "Gemini 3.8 Flash (High) [Antigravity Thinking]"
 
         full_output = ""

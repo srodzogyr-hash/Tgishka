@@ -604,7 +604,7 @@ def run_queue_antigravity(chat_id, user, user_prompt, task_id, firebase_url=None
 
     # Poll Firebase queue for worker response
     start_time = time.time()
-    timeout = 35
+    timeout = 75
 
     while time.time() - start_time < timeout:
         # Check local cancellation
@@ -632,9 +632,11 @@ def run_queue_antigravity(chat_id, user, user_prompt, task_id, firebase_url=None
             except Exception:
                 pass
 
+            resp_text = res_data.get("response") or res_data.get("text") or ""
             return {
                 "status": "completed",
-                "text": res_data.get("response", ""),
+                "text": resp_text,
+                "response": resp_text,
                 "thought": res_data.get("thought", ""),
                 "code_action": res_data.get("code_action", ""),
                 "model": res_data.get("model", "Gemini 3.8 Flash (High) [Antigravity Thinking]")

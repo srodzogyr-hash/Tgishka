@@ -83,26 +83,55 @@ def execute_via_agentapi(full_prompt, task_url, timeout=90):
                 curr = json.loads(urllib.request.urlopen(task_url, timeout=2).read().decode("utf-8") or "{}")
                 if curr.get("status") == "cancelled":
                     print(f"🛑 [AgentAPI] Task cancelled by user!")
-                    return {"status": "cancelled", "response": "Прервано пользователем."}, None
+                    return {"status": "cancelled", "response": "Прервано пользователем.", "text": "Прервано пользователем."}, None
             except Exception:
                 pass
 
             if transcript_path.exists():
                 try:
                     with open(transcript_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
+                        lines = [l.strip() for l in f.readlines() if l.strip()]
+
+                    accumulated_thoughts = []
+                    latest_content = ""
+                    last_step_is_done = False
+
                     for line in lines:
-                        entry = json.loads(line)
-                        if entry.get("type") == "PLANNER_RESPONSE" and entry.get("status") == "DONE":
-                            thought = entry.get("thinking", "")
-                            content = entry.get("content", "")
-                            return {
-                                "status": "completed",
-                                "response": content,
-                                "thought": thought,
-                                "code_action": "",
-                                "model": "Gemini 3.8 Flash (High) [Antigravity Engine]"
-                            }, None
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+
+                        if entry.get("type") == "PLANNER_RESPONSE":
+                            th = (entry.get("thinking") or "").strip()
+                            if th and th not in accumulated_thoughts:
+                                accumulated_thoughts.append(th)
+                            cnt = (entry.get("content") or "").strip()
+                            if cnt:
+                                latest_content = cnt
+
+                    if lines:
+                        try:
+                            last_entry = json.loads(lines[-1])
+                            # Final step: last entry is a completed model response with content, and no pending tool calls
+                            if (last_entry.get("type") == "PLANNER_RESPONSE" and 
+                                last_entry.get("status") == "DONE" and 
+                                latest_content and 
+                                not last_entry.get("tool_calls")):
+                                last_step_is_done = True
+                        except Exception:
+                            pass
+
+                    if last_step_is_done and latest_content:
+                        full_thought = "\n\n".join(accumulated_thoughts)
+                        return {
+                            "status": "completed",
+                            "response": latest_content,
+                            "text": latest_content,
+                            "thought": full_thought,
+                            "code_action": "",
+                            "model": "Gemini 3.8 Flash (High) [Antigravity Engine]"
+                        }, None
                 except Exception:
                     pass
 
