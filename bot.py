@@ -547,8 +547,33 @@ def handle_antigravity_execution(message, prompt_text, media_list=None, business
             full_output += f"💻 <b>Код / Действия:</b>\n<pre>{code_action}</pre>\n\n"
         full_output += reply_body
 
+        # Update chat memory in RAM and Firebase RTDB
+        history = CHAT_MEMORY.get(chat_id)
+        if history is None and FIREBASE_URL:
+            try:
+                r_mem = get_http_session().get(f"{FIREBASE_URL}/chat_memory/{chat_id}.json", timeout=4)
+                if r_mem.status_code == 200 and isinstance(r_mem.json(), list):
+                    history = r_mem.json()
+            except Exception:
+                pass
+        if history is None:
+            history = []
+
+        is_owner = bool((message.from_user.username or '').lower() == CREATOR_USERNAME.lower() or antigravity_bridge.is_creator(message.from_user))
+        user_speaker = f"[{'Владелец аккаунта' if is_owner else 'Собеседник'} @{message.from_user.username or message.from_user.id}]: {prompt_text}"
+        if not history or history[-1].get('content') != user_speaker:
+            history.append({"role": "user", "content": user_speaker})
+        history.append({"role": "model", "content": reply_body})
+
+        limit = CONFIG.get('context_limit', 100)
+        if len(history) > limit:
+            history = history[-limit:]
+        CHAT_MEMORY[chat_id] = history
+        save_chat_memory_async(chat_id, history)
+        ctx_len = len(history)
+
         role_label = "🛠️ DEV" if role == "dev" else "💬 USER"
-        footer = f"⚡ Antigravity [{role_label}] • 🧠 {model_used}"
+        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\n⚡ Antigravity [{role_label}] • 🧠 {model_used}"
         send_long_response(
             full_output,
             footer,
