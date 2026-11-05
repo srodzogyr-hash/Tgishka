@@ -99,15 +99,21 @@ CHAT_MSG_COUNTER = {}
 PENDING_AUTO_REPLY = {}
 ACTIVE_ALARMS = []
 
-# Раздельные множества сообщений бота: обычные ответы ГПТ vs сообщения Автоответчика
+# Раздельные множества сообщений бота: обычные ответы ГПТ vs сообщения Автоответчика vs Antigravity
 BOT_GPT_MESSAGES = set()
 BOT_AUTOREPLY_MESSAGES = set()
+BOT_ANTIGRAVITY_MESSAGES = set()
 MEDIA_GROUP_BUFFER = {}
 
 MESSAGE_CACHE = {}
 MAX_CACHE_SIZE = 500
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
+
+try:
+    import antigravity_bridge
+except Exception as e:
+    print(f"⚠️ Ошибка импорта antigravity_bridge: {e}")
 
 try:
     import chat_manager
@@ -247,6 +253,10 @@ def register_creator_id(user):
             CREATOR_ID = user.id
             CONFIG['creator_id'] = CREATOR_ID
             save_config()
+            try:
+                antigravity_bridge.set_creator_id(CREATOR_ID)
+            except Exception:
+                pass
 
 def remove_old_reply_keyboard(chat_id, force=False):
     global OLD_KEYBOARD_CLEARED
@@ -414,13 +424,16 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
         except Exception:
             pass
 
-def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False):
+def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False, is_antigravity=False):
     reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*|Собеседник[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
     reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
     total = len(raw_chunks)
-    target_set = BOT_AUTOREPLY_MESSAGES if is_autoreply else BOT_GPT_MESSAGES
+    if is_antigravity:
+        target_set = BOT_ANTIGRAVITY_MESSAGES
+    else:
+        target_set = BOT_AUTOREPLY_MESSAGES if is_autoreply else BOT_GPT_MESSAGES
 
     for idx, chunk in enumerate(raw_chunks):
         formatted_chunk = format_markdown_to_html(chunk)
@@ -476,6 +489,54 @@ def send_typing_action(chat_id, business_id=None):
     except Exception:
         pass
 
+def handle_antigravity_execution(message, prompt_text, media_list=None, business_id=None):
+    chat_id = int(message.chat.id)
+    role = antigravity_bridge.get_user_role(message.from_user)
+    if not role:
+        if not business_id:
+            bot.reply_to(message, "⛔ У вас нет доступа к Antigravity. Попросите владельца @wrtnoq выдать доступ: <code>аг+ @ваш_юзер</code>")
+        return
+
+    if not check_cooldown(chat_id):
+        if not business_id:
+            bot.reply_to(message, "жди пока первый запрос загрузится нищук")
+        return
+
+    loading_label = "Antigravity думает..."
+    loading_msg = bot.send_message(chat_id, f"⚡ {loading_label}", business_connection_id=business_id)
+    BOT_ANTIGRAVITY_MESSAGES.add(loading_msg.message_id)
+
+    stop_event = threading.Event()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, loading_label), daemon=True).start()
+
+    chat_log = CHAT_LOG.get(chat_id, [])
+    chat_memory = CHAT_MEMORY.get(chat_id, [])
+
+    reply, err, model_used = antigravity_bridge.ask_antigravity(
+        chat_id,
+        message.from_user,
+        prompt_text,
+        chat_log=chat_log,
+        chat_memory=chat_memory,
+        media_list=media_list
+    )
+    stop_event.set()
+
+    if reply:
+        role_label = "🛠️ DEV" if role == "dev" else "💬 USER"
+        footer = f"⚡ Antigravity [{role_label}] • {model_used}"
+        send_long_response(
+            reply,
+            footer,
+            chat_id,
+            loading_msg.message_id,
+            business_id=business_id,
+            is_autoreply=False,
+            is_antigravity=True
+        )
+    else:
+        safe_edit_message(f"⚠️ Ошибка Antigravity:\n<code>{html.escape(err or 'Сбой вызова')}</code>", chat_id, loading_msg.message_id, business_id=business_id)
+
 def mask_key(key_str):
     if len(key_str) <= 10:
         return "***"
@@ -519,7 +580,14 @@ def get_full_commands_text():
         "• <code>будильник 30 [задача]</code> — через 30 мин бот сам напишет в чат\n"
         "• <code>будильник @юзер 60 [задача]</code> — будильник для юзера из админки\n"
         "• <code>шпион вкл</code> / <code>выкл</code> — перехват удаленных и измененных СМС\n"
-        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота"
+        "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота\n\n"
+        "🔹 <b>5. Antigravity AI Engine (аг):</b>\n"
+        "• <code>аг [запрос]</code> — вызов Antigravity с полным контекстом переписки\n"
+        "• <code>аг+ @юзер</code> — дать доступ человеку как к обычной нейросети\n"
+        "• <code>аг+код @юзер</code> — дать доступ разработчика (изменение кода и файлов)\n"
+        "• <code>аг- @юзер</code> — отозвать выданный доступ\n"
+        "• <code>аг список</code> — посмотреть список доступов к Antigravity\n"
+        "• <code>аг дефолт</code> — включить Antigravity вместо базовых моделей на команду 'гпт'"
     )
 
 # --- КЭШИРОВАНИЕ И РЕЖИМ «ШПИОНА» ---
@@ -1995,6 +2063,60 @@ def handle_admin_text(message):
             safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id)
         return
 
+    # --- КОМАНДЫ УПРАВЛЕНИЯ ANTIGRAVITY ---
+    if text.startswith('аг+код ') or text.startswith('ag+code ') or text.startswith('аг+code ') or text.startswith('ag+код '):
+        target = raw_text.split(maxsplit=1)[1]
+        res = antigravity_bridge.grant_access(message.from_user, target, role='dev')
+        bot.reply_to(message, res)
+        return
+
+    if text.startswith('аг+ ') or text.startswith('ag+ ') or text.startswith('аг+') or text.startswith('ag+'):
+        target = raw_text.split('+', 1)[1].strip()
+        res = antigravity_bridge.grant_access(message.from_user, target, role='user')
+        bot.reply_to(message, res)
+        return
+
+    if text.startswith('аг- ') or text.startswith('ag- ') or text.startswith('аг-') or text.startswith('ag-'):
+        target = raw_text.split('-', 1)[1].strip()
+        res = antigravity_bridge.revoke_access(message.from_user, target)
+        bot.reply_to(message, res)
+        return
+
+    if text in ['аг список', 'аг доступ', 'аг юзеры', 'ag list', 'ag users']:
+        res = antigravity_bridge.list_access(message.from_user)
+        bot.reply_to(message, res)
+        return
+
+    if text in ['аг дефолт', 'аг гпт', 'ag default', 'ag gpt']:
+        res = antigravity_bridge.toggle_default_gpt(message.from_user)
+        bot.reply_to(message, res)
+        return
+
+    if text.startswith('аг ') or text == 'аг' or text.startswith('ag ') or text == 'ag':
+        prompt_text = raw_text[3:].strip() if len(raw_text) > 2 else ""
+        media_list = []
+        if message.reply_to_message:
+            rep = message.reply_to_message
+            if rep.content_type == 'document':
+                m_item, ext_text, doc_err = extract_document_content(rep)
+                if doc_err:
+                    bot.reply_to(message, f"⚠️ {doc_err}")
+                    return
+                if m_item:
+                    media_list.append(m_item)
+                if ext_text:
+                    prompt_text += "\n" + ext_text
+            elif rep.content_type == 'photo':
+                img_b, mime = get_photo_bytes(rep)
+                if img_b:
+                    media_list.append((img_b, mime))
+            elif rep.text and not prompt_text:
+                prompt_text = rep.text
+        if not prompt_text:
+            prompt_text = "Привет! Чем могу помочь?"
+        handle_antigravity_execution(message, prompt_text, media_list, business_id=None)
+        return
+
     if text.startswith('гпт ') or text == 'гпт':
         if not check_cooldown(chat_id):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
@@ -2024,6 +2146,11 @@ def handle_admin_text(message):
             elif rep.text and not prompt_text:
                 prompt_text = rep.text
 
+        # Если включен Antigravity по умолчанию для гпт
+        if antigravity_bridge.is_default_gpt_enabled() and antigravity_bridge.get_user_role(message.from_user):
+            handle_antigravity_execution(message, prompt_text or "Привет!", media_list, business_id=None)
+            return
+
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event), daemon=True).start()
@@ -2045,6 +2172,55 @@ def handle_admin_text(message):
         loading_msg = bot.reply_to(message, "🎓 Обновляю навыки автоответчика...")
         result_html = process_training_dialogue(chat_id, raw_text)
         safe_edit_message(result_html, chat_id, loading_msg.message_id)
+        return
+
+# --- ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ ДЛЯ АВТОРИЗОВАННЫХ ПОЛЬЗОВАТЕЛЕЙ (НЕ CREATOR) ---
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() != CREATOR_USERNAME, content_types=['text', 'photo', 'document'])
+def handle_authorized_user_private(message):
+    text = (message.text or message.caption or "").strip()
+    lower_text = text.lower()
+
+    is_ag = lower_text.startswith('аг ') or lower_text == 'аг' or lower_text.startswith('ag ') or lower_text == 'ag'
+    rep_id = message.reply_to_message.message_id if message.reply_to_message else None
+    is_reply_to_ag = bool(rep_id and rep_id in BOT_ANTIGRAVITY_MESSAGES)
+
+    if is_ag or is_reply_to_ag or (lower_text.startswith('гпт ') and antigravity_bridge.is_default_gpt_enabled()):
+        role = antigravity_bridge.get_user_role(message.from_user)
+        if not role:
+            bot.reply_to(message, "⛔ У вас нет доступа к Antigravity. Обратитесь к @wrtnoq для получения доступа: <code>аг+ @ваш_юзер</code>")
+            return
+
+        prompt_text = text[3:].strip() if (is_ag and len(text) > 2) else (text[4:].strip() if (lower_text.startswith('гпт ') and len(text) > 3) else text)
+        media_list = []
+        if message.content_type == 'document':
+            m_item, ext_text, doc_err = extract_document_content(message)
+            if m_item:
+                media_list.append(m_item)
+            if ext_text:
+                prompt_text += "\n" + ext_text
+        elif message.content_type == 'photo':
+            img_b, mime = get_photo_bytes(message)
+            if img_b:
+                media_list.append((img_b, mime))
+        elif message.reply_to_message:
+            rep = message.reply_to_message
+            if rep.content_type == 'document':
+                m_item, ext_text, doc_err = extract_document_content(rep)
+                if m_item:
+                    media_list.append(m_item)
+                if ext_text:
+                    prompt_text += "\n" + ext_text
+            elif rep.content_type == 'photo':
+                img_b, mime = get_photo_bytes(rep)
+                if img_b:
+                    media_list.append((img_b, mime))
+            elif rep.text and not prompt_text:
+                prompt_text = rep.text
+
+        if not prompt_text:
+            prompt_text = "Привет!"
+
+        handle_antigravity_execution(message, prompt_text, media_list, business_id=None)
         return
 
 # --- ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК АДМИНКИ ---
@@ -2348,7 +2524,89 @@ def handle_business_message(message):
     rep_id = message.reply_to_message.message_id if message.reply_to_message else None
     is_reply_to_gpt = bool(rep_id and rep_id in BOT_GPT_MESSAGES)
     is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
-    is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto
+    is_reply_to_ag = bool(rep_id and rep_id in BOT_ANTIGRAVITY_MESSAGES)
+    is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto or is_reply_to_ag
+
+    if is_owner and (lower_text.startswith('аг+') or lower_text.startswith('ag+')):
+        target = text.split('+', 1)[1].strip()
+        role = 'dev' if ('код' in lower_text or 'code' in lower_text) else 'user'
+        clean_target = target.replace('код', '').replace('code', '').strip()
+        res = antigravity_bridge.grant_access(message.from_user, clean_target, role=role)
+        try:
+            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
+        except Exception:
+            pass
+        if CREATOR_ID:
+            bot.send_message(CREATOR_ID, res)
+        return
+
+    if is_owner and (lower_text.startswith('аг-') or lower_text.startswith('ag-')):
+        target = text.split('-', 1)[1].strip()
+        res = antigravity_bridge.revoke_access(message.from_user, target)
+        try:
+            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
+        except Exception:
+            pass
+        if CREATOR_ID:
+            bot.send_message(CREATOR_ID, res)
+        return
+
+    if is_owner and lower_text in ['аг доступ', 'аг список', 'ag list', 'ag users']:
+        res = antigravity_bridge.list_access(message.from_user)
+        try:
+            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
+        except Exception:
+            pass
+        if CREATOR_ID:
+            bot.send_message(CREATOR_ID, res)
+        return
+
+    if is_owner and lower_text in ['аг дефолт', 'аг гпт', 'ag default', 'ag gpt']:
+        res = antigravity_bridge.toggle_default_gpt(message.from_user)
+        try:
+            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
+        except Exception:
+            pass
+        if CREATOR_ID:
+            bot.send_message(CREATOR_ID, res)
+        return
+
+    is_ag = lower_text.startswith('аг ') or lower_text == 'аг' or lower_text.startswith('ag ') or lower_text == 'ag'
+    if is_ag or is_reply_to_ag or (lower_text.startswith('гпт ') and antigravity_bridge.is_default_gpt_enabled()):
+        ag_role = antigravity_bridge.get_user_role(message.from_user)
+        if ag_role:
+            prompt_text = text[3:].strip() if (is_ag and len(text) > 2) else (text[4:].strip() if (lower_text.startswith('гпт ') and len(text) > 3) else text)
+            media_list = []
+            if message.content_type == 'document':
+                m_item, ext_text, doc_err = extract_document_content(message)
+                if m_item:
+                    media_list.append(m_item)
+                if ext_text:
+                    prompt_text += "\n" + ext_text
+            elif message.content_type == 'photo':
+                img_b, mime = get_photo_bytes(message)
+                if img_b:
+                    media_list.append((img_b, mime))
+            elif message.reply_to_message:
+                rep = message.reply_to_message
+                if rep.content_type == 'document':
+                    m_item, ext_text, doc_err = extract_document_content(rep)
+                    if m_item:
+                        media_list.append(m_item)
+                    if ext_text:
+                        prompt_text += "\n" + ext_text
+                elif rep.content_type == 'photo':
+                    img_b, mime = get_photo_bytes(rep)
+                    if img_b:
+                        media_list.append((img_b, mime))
+                elif rep.text and not prompt_text:
+                    prompt_text = rep.text
+
+            if not prompt_text:
+                prompt_text = "Привет!"
+
+            handle_antigravity_execution(message, prompt_text, media_list, business_id=message.business_connection_id)
+            return
 
     if lower_text in ['сброс', 'гпт сброс', '/reset']:
         reset_single_chat_memory(chat_id)
