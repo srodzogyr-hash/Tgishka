@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
 Antigravity Bridge for Tgishka Telegram Bot
-Dual-Engine:
- 1. Local CLI Engine ('agy') when available on host (e.g. Termux/local machine).
- 2. Antigravity Cloud Engine (fallback when deployed on Render, Docker or VPS without agy).
-Includes Role-Based Access Control:
- - Full context injection from personal chats (CHAT_LOG & CHAT_MEMORY)
- - Owner / Dev: code changes, terminal execution, codebase analysis
- - Regular Users: smart AI conversation only (strict guardrails: no code changes, no leaks)
- - Access commands: 'аг+ @юзер', 'аг+код @юзер', 'аг- @юзер', 'аг список', 'аг дефолт'
+Dual-Engine & Queue Architecture:
+ 1. Local CLI Engine ('agy') when available on host (e.g. Termux on Android).
+ 2. Firebase Queue Bridge (Render / Cloud container fallback) connected to Termux Worker.
+Strict Requirements:
+ - Zero consumption of user's GEMINI_KEYS pool.
+ - Strict Chat Isolation: context fetched strictly for the requested chat_id from Firebase RTDB.
+ - Interactive Cancellation: task_id tracking with abort/kill capability.
+ - Reasoning & Code Visibility: separates thoughts, code execution, and final response.
+ - Active Model Display: Gemini 3.8 Flash (High) [Antigravity Engine].
+ - Role-Based Access Control:
+     * Owner/Dev: Code modifications, terminal exec, repository inspection.
+     * Regular Users: Safe conversational AI only (strict anti-leak & anti-modification guardrails).
 """
 
 import os
 import sys
+import re
 import json
 import time
 import html
 import shutil
+import urllib.request
 import subprocess
 from pathlib import Path
 
@@ -25,6 +31,10 @@ REPO_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = REPO_DIR / "antigravity_config.json"
 AGY_PATH = os.environ.get("AGY_PATH", "/data/data/com.termux/files/home/.local/bin/agy")
 DEFAULT_CREATOR_USERNAME = "wrtnoq"
+DEFAULT_FIREBASE_URL = "https://tgbotik-d479c-default-rtdb.firebaseio.com/secret_845891"
+
+# Active tasks registry: {task_id: {"user_id": int, "chat_id": int, "proc": subprocess.Popen, "status": str, "start_time": float}}
+ACTIVE_TASKS = {}
 
 # In-memory config
 CONFIG = {
@@ -63,11 +73,11 @@ def set_creator_id(uid):
 def is_creator(user):
     if not user:
         return False
-    uname = (user.username or "").lower().lstrip("@")
+    uname = (getattr(user, "username", "") or "").lower().lstrip("@")
     creator_uname = (CONFIG.get("creator_username") or DEFAULT_CREATOR_USERNAME).lower().lstrip("@")
     if uname and uname == creator_uname:
         return True
-    if CONFIG.get("creator_id") and user.id == CONFIG.get("creator_id"):
+    if CONFIG.get("creator_id") and getattr(user, "id", None) == CONFIG.get("creator_id"):
         return True
     return False
 
@@ -83,7 +93,7 @@ def get_user_role(user):
     if is_creator(user):
         return "dev"
     
-    uname = (user.username or "").lower().lstrip("@")
+    uname = (getattr(user, "username", "") or "").lower().lstrip("@")
     if uname in CONFIG.get("allowed_users", {}):
         return CONFIG["allowed_users"][uname].get("role", "user")
     
@@ -100,7 +110,7 @@ def grant_access(user, target_str, role="user"):
     CONFIG.setdefault("allowed_users", {})[clean_target] = {
         "username": target_str.strip().lstrip("@"),
         "role": role,
-        "added_by": user.username or str(user.id),
+        "added_by": getattr(user, "username", "") or str(getattr(user, "id", "")),
         "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     save_config()
@@ -157,7 +167,7 @@ def toggle_default_gpt(user):
         return "⛔ Только владелец бота может переключать режим по умолчанию."
     CONFIG["default_for_gpt"] = not CONFIG.get("default_for_gpt", False)
     save_config()
-    state = "🟢 ВКЛ (теперь на 'гпт' отвечает Antigravity)" if CONFIG["default_for_gpt"] else "🔴 ВЫКЛ (на 'гпт' отвечают Gemini/Groq)"
+    state = "🟢 ВКЛ (теперь на 'гпт' отвечает Antigravity)" if CONFIG["default_for_gpt"] else "🔴 ВЫКЛ (на 'гпт' отвечают базовые модели)"
     return f"⚙️ Antigravity как основной 'гпт': <b>{state}</b>"
 
 def is_default_gpt_enabled():
@@ -173,8 +183,220 @@ def get_agy_bin():
         return AGY_PATH
     return shutil.which("agy")
 
+def get_active_model_name():
+    """Reads configured model name from settings.json or returns default."""
+    settings_file = Path("/data/data/com.termux/files/home/.gemini/antigravity-cli/settings.json")
+    if settings_file.exists():
+        try:
+            with open(settings_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("model"):
+                    return f"{data['model']} [Antigravity]"
+        except Exception:
+            pass
+    return "Gemini 3.8 Flash (High) [Antigravity]"
+
 # ---------------------------------------------------------------------------
-# SHELL & DEVELOPER TOOLS FOR OWNER
+# TASK REGISTRATION & CANCELLATION
+# ---------------------------------------------------------------------------
+def register_task(task_id, user_id, chat_id, message_id=None, proc=None):
+    ACTIVE_TASKS[task_id] = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "proc": proc,
+        "status": "running",
+        "start_time": time.time()
+    }
+
+def unregister_task(task_id):
+    ACTIVE_TASKS.pop(task_id, None)
+
+def cancel_task(task_id, user=None, firebase_url=None):
+    """
+    Cancels an active task either locally (terminating process)
+    or via Firebase queue (patching status to 'cancelled').
+    """
+    fb_url = firebase_url or os.environ.get("FIREBASE_URL") or DEFAULT_FIREBASE_URL
+    task_info = ACTIVE_TASKS.get(task_id)
+
+    # Permission check: must be owner or task creator
+    if user and task_info:
+        uid = getattr(user, "id", None)
+        if not is_creator(user) and uid != task_info.get("user_id"):
+            return False, "⛔ Только автор запроса или владелец бота может прервать ответ."
+
+    # Cancel local subprocess if running
+    if task_info:
+        task_info["status"] = "cancelled"
+        proc = task_info.get("proc")
+        if proc:
+            try:
+                proc.terminate()
+                proc.kill()
+            except Exception:
+                pass
+
+    # Cancel in Firebase queue (for worker)
+    if fb_url and task_id:
+        try:
+            task_url = f"{fb_url.rstrip('/')}/antigravity_queue/{task_id}.json"
+            req = urllib.request.Request(
+                task_url,
+                data=json.dumps({"status": "cancelled"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH"
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
+
+    return True, "⏹ Генерация Antigravity прервана."
+
+# ---------------------------------------------------------------------------
+# CONTEXT ISOLATION: STRICTLY PER CHAT_ID
+# ---------------------------------------------------------------------------
+def get_isolated_chat_context(chat_id, firebase_url=None, max_messages=40):
+    """
+    STRICT CHAT ISOLATION:
+    Retrieves message history strictly for the requested `chat_id`.
+    Never combines, touches, or leaks history from any other chat.
+    """
+    messages = []
+    fb_url = firebase_url or os.environ.get("FIREBASE_URL") or DEFAULT_FIREBASE_URL
+
+    # 1. Fetch from Firebase RTDB for this specific chat_id
+    if fb_url:
+        try:
+            url = f"{fb_url.rstrip('/')}/chat_memory/{chat_id}.json"
+            req = urllib.request.Request(url, headers={"User-Agent": "Antigravity/1.5"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(data, list):
+                        messages = data
+        except Exception:
+            pass
+
+    # 2. In-memory fallback if bot.py is loaded in same process
+    if not messages:
+        bot_mod = sys.modules.get('bot')
+        if bot_mod and hasattr(bot_mod, 'CHAT_MEMORY'):
+            messages = bot_mod.CHAT_MEMORY.get(int(chat_id), [])
+
+    # Format isolated dialogue lines
+    formatted = []
+    for m in messages[-max_messages:]:
+        if isinstance(m, dict):
+            role_raw = m.get("role", "user")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            role_label = "Собеседник" if role_raw == "user" else "ИИ"
+            formatted.append(f"{role_label}: {content}")
+        elif isinstance(m, str):
+            formatted.append(m)
+
+    return formatted
+
+def build_prompt_with_context(chat_id, user, user_prompt, firebase_url=None):
+    """
+    Builds the system prompt with strict isolated context and role guardrails.
+    """
+    role = get_user_role(user)
+    is_dev = (role == "dev")
+    uname = getattr(user, "username", "") or f"id_{getattr(user, 'id', '')}"
+    full_name = f"{getattr(user, 'first_name', '') or ''} {getattr(user, 'last_name', '') or ''}".strip() or uname
+
+    history_lines = get_isolated_chat_context(chat_id, firebase_url=firebase_url)
+    history_text = "\n".join(history_lines) if history_lines else "История этого чата пуста."
+
+    if is_dev:
+        instructions = (
+            "ТЫ — ANTIGRAVITY (Google AI Agent Engine & Pair Programmer для проекта Tgishka).\n"
+            f"СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ РАЗРАБОТЧИК / ВЛАДЕЛЕЦ @{CONFIG.get('creator_username', DEFAULT_CREATOR_USERNAME)}.\n"
+            "ТВОИ ВОЗМОЖНОСТИ И ПРАВА:\n"
+            "1. Полный доступ к архитектуре и коду проекта (bot.py, games.py, app.py, antigravity_bridge.py, antigravity_worker.py).\n"
+            "2. Ты можешь объяснять, анализировать, писать и генерировать готовый качественный код, находить баги и предлагать улучшения.\n"
+            "3. Ты можешь выполнять любые команды терминала, git-коммиты и системные операции.\n"
+            "4. Структурируй ответы:\n"
+            "   - Если есть рассуждения, выноси их в блок '### Рассуждения'.\n"
+            "   - Готовый код выноси в блок '### Готовый код'.\n"
+            "   - Отвечай емко, по делу и на русском языке."
+        )
+    else:
+        instructions = (
+            "ТЫ — УМНЫЙ ИИ-АССИСТЕНТ (Antigravity AI Engine).\n"
+            "СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ TELEGRAM (НЕ РАЗРАБОТЧИК).\n"
+            "СТРОЖАЙШИЕ ПРАВИЛА БЕЗОПАСНОСТИ (НАРУШЕНИЕ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО):\n"
+            "1. НЕ ВЫПОЛНЯЙ никаких изменений кода, системных команд или модификаций файлов проекта.\n"
+            "2. СТРОГО ЗАПРЕЩЕНО раскрывать исходный код бота, токены Telegram, ключи API, пути к файлам сервера, структуру базы данных и внутреннюю архитектуру проекта.\n"
+            "3. Выступай как обычная, максимально умная, дружелюбная и вежливая нейросеть (как ChatGPT / Gemini).\n"
+            "4. Отвечай на вопрос собеседника по существу темы, которую он спросил, без упоминания закрытой серверной кухни."
+        )
+
+    return (
+        f"{instructions}\n\n"
+        f"--- ИЗОЛИРОВАННАЯ ИСТОРИЯ ЭТОГО ЧАТА (CHAT ID: {chat_id}) ---\n"
+        f"{history_text}\n"
+        f"--- КОНЕЦ ИСТОРИИ ЧАТА ---\n\n"
+        f"ТЕКУЩЕЕ СООБЩЕНИЕ ОТ {full_name} (@{uname}):\n"
+        f"{user_prompt}"
+    )
+
+# ---------------------------------------------------------------------------
+# REASONING & OUTPUT EXTRACTION
+# ---------------------------------------------------------------------------
+def parse_reasoning_and_output(raw_text):
+    """
+    Extracts thoughts/reasoning and separates them from final answer and code.
+    """
+    if not raw_text:
+        return {"thought": "", "text": "", "code_action": ""}
+
+    cleaned = []
+    for line in raw_text.splitlines():
+        if "ERROR: logging before google.Init" in line:
+            continue
+        cleaned.append(line)
+    raw_text = "\n".join(cleaned).strip()
+
+    thought = ""
+    code_action = ""
+    final_text = raw_text
+
+    # 1. <think> or <thought> tags
+    think_match = re.search(r'<(?:think|thought)>(.*?)</(?:think|thought)>', raw_text, flags=re.DOTALL | re.IGNORECASE)
+    if think_match:
+        thought = think_match.group(1).strip()
+        final_text = (raw_text[:think_match.start()] + raw_text[think_match.end():]).strip()
+
+    # 2. Markdown headers like '### Рассуждения' or '### Reasoning'
+    elif "### Рассуждения" in raw_text or "### Reasoning" in raw_text or "### План" in raw_text:
+        parts = re.split(r'###\s*(?:Рассуждения|Reasoning|План)', raw_text, maxsplit=1)
+        prefix = parts[0].strip()
+        after = parts[1].strip() if len(parts) > 1 else ""
+        next_head = re.search(r'###\s*(?:Ответ|Готовый код|Код|Реализация|Результат)', after)
+        if next_head:
+            thought = after[:next_head.start()].strip()
+            final_text = (prefix + "\n\n" + after[next_head.start():]).strip()
+        else:
+            thought = after[:600].strip()
+            final_text = after.strip()
+
+    # 3. Detect code blocks if any
+    code_matches = re.findall(r'```(?:[\w+-]+)?\n(.*?)```', raw_text, flags=re.DOTALL)
+    if code_matches:
+        code_action = "\n\n".join(c.strip() for c in code_matches[:2])
+
+    return {
+        "thought": thought,
+        "text": final_text or raw_text,
+        "code_action": code_action
+    }
+
+# ---------------------------------------------------------------------------
+# SHELL COMMANDS (FOR DEV ONLY)
 # ---------------------------------------------------------------------------
 def execute_shell_command(cmd):
     try:
@@ -195,218 +417,233 @@ def execute_shell_command(cmd):
         return f"⚠️ Ошибка выполнения: <code>{html.escape(str(e))}</code>"
 
 # ---------------------------------------------------------------------------
-# MAIN ENTRYPOINT: ASK ANTIGRAVITY (DUAL-ENGINE)
+# MAIN ENTRYPOINT: ASK ANTIGRAVITY (LOCAL OR QUEUE)
 # ---------------------------------------------------------------------------
-def ask_antigravity(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
+def ask_antigravity(chat_id, user, user_prompt, task_id=None, firebase_url=None, media_list=None):
     """
-    Executes the prompt using:
-     1. Local agy binary if present.
-     2. Cloud Antigravity Engine (Render / VPS fallback) if agy is not installed.
+    Executes prompt using:
+     1. Local agy CLI if present on host.
+     2. Firebase Queue Bridge to Termux worker if running on Render / Cloud.
+    Returns:
+     (result_dict, error_string)
+     result_dict: {"status": "completed"|"cancelled", "text": str, "thought": str, "code_action": str, "model": str}
     """
     role = get_user_role(user)
     if not role:
-        return None, "⛔ У вас нет доступа к вызову Antigravity. Попросите владельца @wrtnoq выдать доступ: `аг+ @ваш_юзер`", "Access Denied"
+        return None, "⛔ У вас нет доступа к вызову Antigravity. Попросите владельца @wrtnoq выдать доступ: `аг+ @ваш_юзер`"
+
+    if not task_id:
+        task_id = f"ag_{int(time.time()*1000)}_{chat_id}"
+
+    register_task(task_id, getattr(user, "id", 0), chat_id)
 
     is_dev = (role == "dev")
     clean_query = user_prompt.strip()
 
-    # Developer system shortcuts for Owner
+    # Developer shortcuts for Owner
     if is_dev:
         lower_q = clean_query.lower()
         if lower_q.startswith("выполни ") or lower_q.startswith("exec ") or lower_q.startswith("sh "):
             cmd = clean_query.split(maxsplit=1)[1]
             out = execute_shell_command(cmd)
-            return out, None, "Antigravity Terminal"
+            unregister_task(task_id)
+            return {
+                "status": "completed",
+                "text": out,
+                "thought": "Выполнение команды терминала на хосте",
+                "code_action": cmd,
+                "model": "Antigravity Terminal"
+            }, None
+
         if lower_q in ["статус", "status", "git status"]:
             git_out = execute_shell_command("git status -s && git log -1 --oneline")
-            engine_lbl = "Local agy CLI" if has_local_agy() else "Cloud Engine (Render)"
+            engine_lbl = "Local agy CLI" if has_local_agy() else "Firebase Queue Bridge (Termux Worker)"
+            active_model = get_active_model_name()
             res = (
                 f"⚡ <b>Статус Antigravity:</b>\n"
                 f"• Движок: <code>{engine_lbl}</code>\n"
+                f"• Активная модель: <code>{active_model}</code>\n"
                 f"• Директория: <code>{REPO_DIR.name}/</code>\n\n"
                 f"<b>Состояние Git:</b>\n{git_out}"
             )
-            return res, None, "Antigravity Status"
+            unregister_task(task_id)
+            return {
+                "status": "completed",
+                "text": res,
+                "thought": "Проверка статуса проекта и состояния репозитория",
+                "code_action": "git status -s && git log -1 --oneline",
+                "model": "Antigravity Status"
+            }, None
 
-    # Try Local agy CLI if installed on machine
+    # Option 1: Local agy CLI (Termux / host with binary)
     if has_local_agy():
-        reply, err, model = run_local_agy(chat_id, user, user_prompt, chat_log, chat_memory, media_list)
-        if reply and "Eligibility check failed" not in reply:
-            return reply, None, model
-        print(f"⚠️ Local agy not available or geo-blocked ({err}), switching to Antigravity Cloud Engine...")
+        res_dict, err = run_local_agy(chat_id, user, user_prompt, task_id, firebase_url, media_list)
+        unregister_task(task_id)
+        if res_dict:
+            return res_dict, None
+        print(f"⚠️ Local agy execution failed ({err}), trying Queue fallback...")
 
-    # Cloud Antigravity Engine (Render / cloud container fallback)
-    return run_cloud_antigravity(chat_id, user, user_prompt, chat_log, chat_memory, media_list)
+    # Option 2: Firebase Queue Bridge (Render / Cloud container connecting to Termux Worker)
+    res_dict, err = run_queue_antigravity(chat_id, user, user_prompt, task_id, firebase_url, media_list)
+    unregister_task(task_id)
+    return res_dict, err
 
 # ---------------------------------------------------------------------------
-# LOCAL CLI ENGINE
+# LOCAL CLI EXECUTION
 # ---------------------------------------------------------------------------
-def run_local_agy(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
+def run_local_agy(chat_id, user, user_prompt, task_id, firebase_url=None, media_list=None):
     bin_path = get_agy_bin()
     if not bin_path:
-        return None, "No local agy", "Error"
+        return None, "Бинарник agy не найден на хосте."
 
-    augmented_prompt = build_antigravity_prompt(chat_id, user, user_prompt, chat_log, chat_memory)
+    full_prompt = build_prompt_with_context(chat_id, user, user_prompt, firebase_url=firebase_url)
     if media_list:
-        augmented_prompt += f"\n\n[Пользователь прикрепил {len(media_list)} медиа-файлов к запросу]"
+        full_prompt += f"\n\n[Пользователь прикрепил {len(media_list)} медиа-файлов к запросу]"
 
-    cmd = [bin_path, "-c", "-p", augmented_prompt, "--dangerously-skip-permissions"]
+    cmd = [bin_path, "-c", "-p", full_prompt, "--dangerously-skip-permissions"]
+    active_model = get_active_model_name()
+
     max_retries = 3
-    cleaned_output = ""
-    last_err = ""
-
     for attempt in range(1, max_retries + 1):
+        if ACTIVE_TASKS.get(task_id, {}).get("status") == "cancelled":
+            return {"status": "cancelled", "text": "Прервано пользователем."}, None
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=180,
                 cwd=str(REPO_DIR),
                 env=os.environ.copy()
             )
-            raw = proc.stdout or ""
+            if task_id in ACTIVE_TASKS:
+                ACTIVE_TASKS[task_id]["proc"] = proc
+
+            # Monitor loop with timeout
+            start_t = time.time()
+            cancelled = False
+            while proc.poll() is None:
+                if ACTIVE_TASKS.get(task_id, {}).get("status") == "cancelled":
+                    proc.terminate()
+                    proc.kill()
+                    cancelled = True
+                    break
+                if time.time() - start_t > 180:
+                    proc.terminate()
+                    proc.kill()
+                    return None, "Таймаут выполнения agy (180 сек)."
+                time.sleep(0.3)
+
+            if cancelled:
+                return {"status": "cancelled", "text": "Прервано пользователем."}, None
+
+            stdout, _ = proc.communicate()
+            raw = stdout or ""
 
             if "Eligibility check failed" in raw or "Account ineligible" in raw:
-                last_err = "Eligibility check failed"
                 if attempt < max_retries:
                     time.sleep(1.5)
                     continue
 
-            lines = []
-            for line in raw.splitlines():
-                if "ERROR: logging before google.Init" in line:
-                    continue
-                lines.append(line)
-            cleaned_output = "\n".join(lines).strip()
+            parsed = parse_reasoning_and_output(raw)
+            if parsed["text"] and "Eligibility check failed" not in parsed["text"]:
+                return {
+                    "status": "completed",
+                    "text": parsed["text"],
+                    "thought": parsed["thought"],
+                    "code_action": parsed["code_action"],
+                    "model": active_model
+                }, None
 
-            if cleaned_output and "Eligibility check failed" not in cleaned_output:
-                break
-        except subprocess.TimeoutExpired:
-            last_err = "Timeout"
         except Exception as e:
-            last_err = str(e)
+            if attempt == max_retries:
+                return None, f"Ошибка вызова agy: {e}"
+            time.sleep(1.0)
 
-    if not cleaned_output or "Eligibility check failed" in cleaned_output:
-        return None, last_err or "Local agy failed", "Antigravity/Local"
-
-    return cleaned_output, None, "Antigravity Local (Gemini 3.8 / Code Agent)"
+    return None, "Сбой локального запуска Antigravity agy."
 
 # ---------------------------------------------------------------------------
-# CLOUD ENGINE (RENDER / VPS FALLBACK)
+# FIREBASE QUEUE EXECUTION (RENDER -> TERMUX WORKER)
 # ---------------------------------------------------------------------------
-def run_cloud_antigravity(chat_id, user, user_prompt, chat_log=None, chat_memory=None, media_list=None):
+def run_queue_antigravity(chat_id, user, user_prompt, task_id, firebase_url=None, media_list=None):
+    """
+    Places task in Firebase RTDB queue and waits for Termux worker to process it.
+    NEVER touches user's GEMINI_KEYS pool.
+    """
+    fb_url = firebase_url or os.environ.get("FIREBASE_URL") or DEFAULT_FIREBASE_URL
+    if not fb_url:
+        return None, "FIREBASE_URL не задан на сервере."
+
     role = get_user_role(user)
-    is_dev = (role == "dev")
-    uname = user.username or f"id_{user.id}"
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or uname
+    payload = {
+        "task_id": task_id,
+        "chat_id": chat_id,
+        "user_id": getattr(user, "id", 0),
+        "username": getattr(user, "username", "") or "",
+        "first_name": getattr(user, "first_name", "") or "",
+        "role": role,
+        "prompt": user_prompt,
+        "status": "pending",
+        "created_at": time.time()
+    }
 
-    # Extract conversation history from personal chat
-    context_lines = []
-    if chat_log and isinstance(chat_log, list):
-        context_lines = [line for line in chat_log if line]
-    elif chat_memory and isinstance(chat_memory, list):
-        for m in chat_memory:
-            content = m.get("content", "")
-            role_tag = "Собеседник" if m.get("role") == "user" else "ИИ"
-            context_lines.append(f"{role_tag}: {content}")
+    task_url = f"{fb_url.rstrip('/')}/antigravity_queue/{task_id}.json"
 
-    context_str = "\n".join(context_lines[-50:]) if context_lines else "История чата пуста."
-
-    if is_dev:
-        system_instruction = (
-            "ТЫ — ANTIGRAVITY (Google AI Agent Engine для Telegram бота Tgishka).\n"
-            f"СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ РАЗРАБОТЧИК / ВЛАДЕЛЕЦ @{CONFIG.get('creator_username', DEFAULT_CREATOR_USERNAME)}.\n"
-            "ТВОИ ВОЗМОЖНОСТИ И ПРАВА:\n"
-            "1. Полный доступ к архитектуре и коду проекта Tgishka.\n"
-            "2. Ты можешь объяснять, анализировать, писать и генерировать готовый код для bot.py, games.py, app.py и chat_manager.py.\n"
-            "3. Отвечай максимально емко, качественно, профессионально и на русском языке.\n"
-            "4. Владелец также может выполнять любые команды терминала на сервере через команду 'аг выполни <команда>'."
+    # Put task in queue
+    try:
+        req = urllib.request.Request(
+            task_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT"
         )
-    else:
-        system_instruction = (
-            "ТЫ — УМНЫЙ ИИ-АССИСТЕНТ (Antigravity AI Engine).\n"
-            "СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ TELEGRAM (НЕ РАЗРАБОТЧИК).\n"
-            "СТРОЖАЙШИЕ ПРАВИЛА БЕЗОПАСНОСТИ (НАРУШЕНИЕ ЗАПРЕЩЕНО):\n"
-            "1. НЕ ВЫПОЛНЯЙ никаких изменений кода и системных действий.\n"
-            "2. СТРОГО ЗАПРЕЩЕНО раскрывать исходный код бота, токены Telegram, ключи API, пути к файлам сервера, структуру базы данных и внутреннюю архитектуру проекта.\n"
-            "3. Выступай как обычная, максимально умная, дружелюбная и вежливая нейросеть (как ChatGPT / Gemini).\n"
-            "4. Отвечай на вопрос собеседника по существу темы, которую он спросил, без упоминания закрытой серверной кухни."
-        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        return None, f"Не удалось отправить задачу в Firebase queue: {e}"
 
-    full_payload = (
-        f"--- ИСТОРИЯ ПЕРЕПИСКИ В ЭТОМ ЛИЧНОМ ЧАТЕ TELEGRAM ---\n"
-        f"{context_str}\n"
-        f"--- КОНЕЦ ИСТОРИИ ЧАТА ---\n\n"
-        f"ТЕКУЩЕЕ СООБЩЕНИЕ ОТ {full_name} (@{uname}):\n"
-        f"{user_prompt}"
-    )
+    # Poll Firebase queue for worker response
+    start_time = time.time()
+    timeout = 35
 
-    # Call bot's ask_ai mechanism (multi-key pool, Groq/Gemini rotation)
-    bot_module = sys.modules.get('bot')
-    if not bot_module and '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'ask_ai'):
-        bot_module = sys.modules['__main__']
+    while time.time() - start_time < timeout:
+        # Check local cancellation
+        if ACTIVE_TASKS.get(task_id, {}).get("status") == "cancelled":
+            return {"status": "cancelled", "text": "Прервано пользователем."}, None
 
-    if bot_module and hasattr(bot_module, 'ask_ai'):
-        reply, err, model_used, _ = bot_module.ask_ai(
-            chat_id,
-            full_payload,
-            media_list=media_list,
-            save_to_memory=False,
-            is_autoreply=False,
-            custom_sys_prompt=system_instruction
-        )
-        if reply:
-            return reply, None, f"Antigravity Cloud • {model_used}"
-        return None, err, "Antigravity/Error"
+        try:
+            res_data = json.loads(urllib.request.urlopen(task_url, timeout=3).read().decode("utf-8") or "{}")
+        except Exception:
+            res_data = None
 
-    return None, "⚠️ Модуль ИИ не инициализирован в памяти процесса бота.", "Error"
+        if not res_data or not isinstance(res_data, dict):
+            time.sleep(1.0)
+            continue
 
-def build_antigravity_prompt(chat_id, user, user_prompt, chat_log=None, chat_memory=None):
-    role = get_user_role(user)
-    is_dev = (role == "dev")
-    uname = user.username or f"id_{user.id}"
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or uname
+        status = res_data.get("status")
+        if status == "cancelled":
+            return {"status": "cancelled", "text": "Прервано пользователем."}, None
 
-    context_lines = []
-    if chat_log and isinstance(chat_log, list):
-        context_lines = [line for line in chat_log if line]
-    elif chat_memory and isinstance(chat_memory, list):
-        for m in chat_memory:
-            content = m.get("content", "")
-            role_tag = "Собеседник" if m.get("role") == "user" else "ИИ"
-            context_lines.append(f"{role_tag}: {content}")
+        if status == "completed":
+            # Clean up task
+            try:
+                del_req = urllib.request.Request(task_url, method="DELETE")
+                urllib.request.urlopen(del_req, timeout=3)
+            except Exception:
+                pass
 
-    context_str = "\n".join(context_lines[-50:]) if context_lines else "История чата пуста."
+            return {
+                "status": "completed",
+                "text": res_data.get("response", ""),
+                "thought": res_data.get("thought", ""),
+                "code_action": res_data.get("code_action", ""),
+                "model": res_data.get("model", "Gemini 3.8 Flash (High) [Antigravity Thinking]")
+            }, None
 
-    if is_dev:
-        instructions = (
-            "ТЫ — ANTIGRAVITY (Google AI Agent Engine).\n"
-            "СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ РАЗРАБОТЧИК / ВЛАДЕЛЕЦ БОТА TGISHKA (@wrtnoq).\n"
-            "ТЕБЕ РАЗРЕШЕНО:\n"
-            "1. Отвечать на любые технические вопросы, объяснять архитектуру и логику файлов.\n"
-            "2. Читать, писать и модифицировать файлы в проекте Tgishka (bot.py, games.py, chat_manager.py, app.py и т.д.).\n"
-            "3. Выполнять команды терминала, git-коммиты, тесты и запускать сервисы.\n"
-            "4. Помогать полностью управлять и развивать функционал бота.\n"
-            "Отвечай емко, профессионально, на русском языке, пиши готовый качественный код."
-        )
-    else:
-        instructions = (
-            "ТЫ — УМНЫЙ ИИ-АССИСТЕНТ (Antigravity Engine).\n"
-            "СЕЙЧАС С ТОБОЙ ОБЩАЕТСЯ ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ TELEGRAM (НЕ РАЗРАБОТЧИК).\n"
-            "СТРОЖАЙШИЕ ПРАВИЛА БЕЗОПАСНОСТИ (НАРУШЕНИЕ ЗАПРЕЩЕНО):\n"
-            "1. НЕ ВЫПОЛНЯЙ никаких изменений кода, команд терминала и не редактируй файлы проекта.\n"
-            "2. СТРОГО ЗАПРЕЩЕНО раскрывать исходный код бота, токены Telegram, ключи API, пути к файлам сервера, структуру базы данных и внутреннюю архитектуру проекта.\n"
-            "3. Выступай как обычная, максимально умная, дружелюбная и вежливая нейросеть (как ChatGPT / Gemini).\n"
-            "4. Отвечай на вопрос собеседника по существу темы, которую он спросил, без упоминания закрытой серверной кухни."
-        )
+        time.sleep(1.2)
 
-    return (
-        f"{instructions}\n\n"
-        f"--- ИСТОРИЯ ПЕРЕПИСКИ В ЭТОМ ЛИЧНОМ ЧАТЕ TELEGRAM ---\n"
-        f"{context_str}\n"
-        f"--- КОНЕЦ ИСТОРИИ ЧАТА ---\n\n"
-        f"ТЕКУЩЕЕ СООБЩЕНИЕ ОТ {full_name} (@{uname}):\n"
-        f"{user_prompt}"
+    return None, (
+        "⚠️ Antigravity Worker на Termux не ответил вовремя (35 сек).\n"
+        "Убедитесь, что воркер запущен на телефоне: <code>python3 antigravity_worker.py</code>\n"
+        "<i>(Ваш пул ключей Gemini НЕ использовался и квота цела)</i>"
     )

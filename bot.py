@@ -389,6 +389,12 @@ def format_markdown_to_html(text):
     escaped = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', escaped)
     escaped = re.sub(r'(?m)^#{1,6}\s+(.+)$', r'<b>\1</b>', escaped)
     escaped = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', escaped)
+    # Restore valid tags for blockquotes, code, bold, italics
+    escaped = escaped.replace('&lt;blockquote&gt;', '<blockquote>').replace('&lt;/blockquote&gt;', '</blockquote>')
+    escaped = escaped.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+    escaped = escaped.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+    escaped = escaped.replace('&lt;code&gt;', '<code>').replace('&lt;/code&gt;', '</code>')
+    escaped = escaped.replace('&lt;pre&gt;', '<pre>').replace('&lt;/pre&gt;', '</pre>')
     return escaped
 
 def split_text_into_chunks(text, max_len=3600):
@@ -426,7 +432,8 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
 
 def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False, is_antigravity=False):
     reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*|Собеседник[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
-    reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not is_antigravity:
+        reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
     total = len(raw_chunks)
@@ -502,31 +509,48 @@ def handle_antigravity_execution(message, prompt_text, media_list=None, business
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
         return
 
+    task_id = f"ag_{int(time.time()*1000)}_{chat_id}"
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🛑 Прервать", callback_data=f"ag_stop_{task_id}"))
+
     loading_label = "Antigravity думает..."
-    loading_msg = bot.send_message(chat_id, f"⚡ {loading_label}", business_connection_id=business_id)
+    loading_msg = bot.send_message(chat_id, f"⚡ {loading_label}", reply_markup=kb, business_connection_id=business_id)
     BOT_ANTIGRAVITY_MESSAGES.add(loading_msg.message_id)
 
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, loading_label), daemon=True).start()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, loading_label, kb), daemon=True).start()
 
-    chat_log = CHAT_LOG.get(chat_id, [])
-    chat_memory = CHAT_MEMORY.get(chat_id, [])
-
-    reply, err, model_used = antigravity_bridge.ask_antigravity(
+    res_dict, err = antigravity_bridge.ask_antigravity(
         chat_id,
         message.from_user,
         prompt_text,
-        chat_log=chat_log,
-        chat_memory=chat_memory,
+        task_id=task_id,
+        firebase_url=FIREBASE_URL,
         media_list=media_list
     )
     stop_event.set()
 
-    if reply:
+    if res_dict:
+        if res_dict.get("status") == "cancelled":
+            safe_edit_message("⏹ <b>Ответ Antigravity прерван пользователем.</b>", chat_id, loading_msg.message_id, business_id=business_id)
+            return
+
+        thought = (res_dict.get("thought") or "").strip()
+        code_action = (res_dict.get("code_action") or "").strip()
+        reply_body = (res_dict.get("text") or "").strip()
+        model_used = res_dict.get("model") or "Gemini 3.8 Flash (High) [Antigravity Thinking]"
+
+        full_output = ""
+        if thought:
+            full_output += f"💭 <b>Размышление:</b>\n<blockquote>{thought}</blockquote>\n\n"
+        if code_action and role == "dev":
+            full_output += f"💻 <b>Код / Действия:</b>\n<pre>{code_action}</pre>\n\n"
+        full_output += reply_body
+
         role_label = "🛠️ DEV" if role == "dev" else "💬 USER"
-        footer = f"⚡ Antigravity [{role_label}] • {model_used}"
+        footer = f"⚡ Antigravity [{role_label}] • 🧠 {model_used}"
         send_long_response(
-            reply,
+            full_output,
             footer,
             chat_id,
             loading_msg.message_id,
@@ -535,7 +559,8 @@ def handle_antigravity_execution(message, prompt_text, media_list=None, business
             is_antigravity=True
         )
     else:
-        safe_edit_message(f"⚠️ Ошибка Antigravity:\n<code>{html.escape(err or 'Сбой вызова')}</code>", chat_id, loading_msg.message_id, business_id=business_id)
+        err_msg = err or "Сбой вызова Antigravity"
+        safe_edit_message(f"⚠️ Ошибка Antigravity:\n{err_msg}", chat_id, loading_msg.message_id, business_id=business_id)
 
 def mask_key(key_str):
     if len(key_str) <= 10:
@@ -1479,7 +1504,7 @@ def generate_image(prompt):
 
     return None, last_err
 
-def animate_loading(chat_id, message_id, stop_event, business_id=None, text_prefix="Думаю..."):
+def animate_loading(chat_id, message_id, stop_event, business_id=None, text_prefix="Думаю...", reply_markup=None):
     emojis = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
     idx = 0
     while not stop_event.is_set():
@@ -1491,7 +1516,8 @@ def animate_loading(chat_id, message_id, stop_event, business_id=None, text_pref
                 text=f"{emojis[idx % len(emojis)]} {text_prefix}",
                 chat_id=chat_id,
                 message_id=message_id,
-                business_connection_id=business_id
+                business_connection_id=business_id,
+                reply_markup=reply_markup
             )
         except Exception:
             pass
@@ -2222,6 +2248,23 @@ def handle_authorized_user_private(message):
 
         handle_antigravity_execution(message, prompt_text, media_list, business_id=None)
         return
+
+# --- ОБРАБОТЧИК КНОПКИ ПРЕРЫВАНИЯ ANTIGRAVITY ---
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith('ag_stop_'))
+def handle_ag_stop_callback(call):
+    task_id = call.data.replace('ag_stop_', '').strip()
+    user = call.from_user
+    success, msg = antigravity_bridge.cancel_task(task_id, user, firebase_url=FIREBASE_URL)
+    try:
+        bot.answer_callback_query(call.id, msg)
+    except Exception:
+        pass
+    if success:
+        safe_edit_message(
+            "⏹ <b>Ответ Antigravity прерван пользователем.</b>",
+            call.message.chat.id,
+            call.message.message_id
+        )
 
 # --- ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК АДМИНКИ ---
 @bot.callback_query_handler(func=lambda call: True)
