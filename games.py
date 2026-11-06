@@ -204,7 +204,7 @@ def get_updated_full_commands_text():
         "• <code>бункер</code> | <code>мафия</code> | <code>стоп игра</code> — игры с Ведущим Gemini в отдельном окне\n"
         "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — «Хабаровский Лутинг» у Меда\n"
         "• <code>виселица</code> / <code>виселица ии</code> — Поле Чудес (кнопки + буквы/слова в чат)\n"
-        "• <code>кнб</code> — Камень-Ножницы-Бумага\n\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n\n"
         "🔹 <b>4. Био-войны PRO (8 модулей + Залп без спама + Эволюция):</b>\n"
         "• <code>лаба</code> (или <code>био</code>) — твоя Био-Лаборатория PRO (8 модулей прокачки)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — пустить 1 патоген (с уведомлением жертве!)\n"
@@ -230,7 +230,7 @@ def get_chat_commands_text():
         "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — копаться в мусорке у Меда (6 тиров редкости до +2000 🧬)\n"
         "• <code>виселица</code> — Поле Чудес (+200 🧬 за победу, пиши буквы или слова прямо в чат!)\n"
         "• <code>виселица ии</code> — ГПТ загадывает слово по контексту вашего чата (+250 🧬)!\n"
-        "• <code>кнб</code> — Камень-Ножницы-Бумага\n\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n\n"
         "🧬 <b>Био-войны PRO (Коронаирис + Эволюция):</b>\n"
         "• <code>лаба</code> — открыть свою Био-Лабораторию PRO (8 модулей + Реактор + Эпидемия)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — атаковать 1 патогеном\n"
@@ -1328,7 +1328,7 @@ def process_hangman_letter_or_word(cid, biz_id, user, raw_guess, from_chat_text=
     return True
 
 # =====================================================================
-# ✂️ 5. КАМЕНЬ-НОЖНИЦЫ-БУМАГА (ПРОТИВ БОТА И 1 НА 1 В ЧАТЕ)
+# ✂️ 5. КАМЕНЬ-НОЖНИЦЫ-БУМАГА (ДУЭЛЬ 1 НА 1 В ЧАТЕ)
 # =====================================================================
 RPS_GAMES = {}
 RPS_NAMES = {'r': '🪨 Камень', 's': '✂️ Ножницы', 'p': '📄 Бумага'}
@@ -1343,13 +1343,10 @@ def send_rps_menu(chat_id, biz_id=None, user=None):
         InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_pvp_{cid}_s"),
         InlineKeyboardButton("📄 Бумага", callback_data=f"rps_pvp_{cid}_p")
     )
-    kb.row(
-        InlineKeyboardButton("🤖 Быстрый бой с Ботом", callback_data=f"rps_botmenu_{cid}")
-    )
     text = (
-        "🪨✂️📄 <b>Камень-Ножницы-Бумага!</b>\n\n"
-        "• <b>Дуэль 1 на 1:</b> оба игрока жмут на кнопки ниже (первый выбор скрыт, пока не нажмет второй!).\n"
-        "• Или нажми «🤖 Быстрый бой с Ботом»."
+        "🪨✂️📄 <b>Камень-Ножницы-Бумага (Дуэль 1 на 1)!</b>\n\n"
+        "• Оба игрока жмут на кнопки ниже (первый выбор скрыт, пока не нажмет второй!).\n"
+        "• Игра с ботом отключена — только честные дуэли между игроками."
     )
     send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
 
@@ -2092,7 +2089,7 @@ def send_public_user_hub(cid, user):
     )
     kb.add(
         InlineKeyboardButton("🎡 Виселица", callback_data=f"hm_new_{cid}_std"),
-        InlineKeyboardButton("✂️ КНБ с Ботом", callback_data=f"rps_botmenu_{cid}")
+        InlineKeyboardButton("🧠 Виселица ИИ", callback_data=f"hm_new_{cid}_ai")
     )
     kb.add(
         InlineKeyboardButton("🏆 Топ игроков", callback_data="pub_top"),
@@ -3023,52 +3020,8 @@ def handle_games_callbacks(call):
             game_cid = int(parts[2])
             rps_rew = int(CONFIG.get('reward_rps', 50))
 
-            if mode == 'botmenu':
-                kb = InlineKeyboardMarkup(row_width=3)
-                kb.row(
-                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
-                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
-                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
-                )
-                safe_edit_message("🤖 <b>Бой против Бота! Выбирай предмет:</b>", cid, msg_id, business_id=biz_id, reply_markup=kb)
-                bot.answer_callback_query(call.id)
-                return
-
-            if mode == 'bot':
-                u_move = parts[3]
-                b_move = random.choice(['r', 's', 'p'])
-                u_name = html.escape(p['name'])
-                if u_move == b_move:
-                    bonus = ""
-                    if 'trickster_glove' in p.get('buffs', []) and random.randint(1, 100) <= 25:
-                        p['bio_res'] += 40
-                        bonus = "\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 даже в ничью!</i>"
-                    res_line = f"🤝 <b>Ничья!</b> Оба выбрали {RPS_NAMES[u_move]}.{bonus}"
-                elif (u_move, b_move) in RPS_WINS:
-                    rew = int(rps_rew * (1.0 + p.get('prestige', 0) * 0.20))
-                    p['bio_res'] += rew
-                    xp_g = add_player_xp(p, 18)
-                    p['wins_rps'] = p.get('wins_rps', 0) + 1
-                    buff_str = try_grant_rare_buff(p) or ""
-                    res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+{rew} 🧬, +{xp_g} XP){buff_str}"
-                else:
-                    res_line = "🤖 <b>Бот победил в этом раунде!</b>"
-
-                save_rpg_firebase()
-                kb = InlineKeyboardMarkup(row_width=3)
-                kb.row(
-                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
-                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
-                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
-                )
-                out = (
-                    f"✂️ <b>Камень-Ножницы-Бумага (с Ботом)</b>\n\n"
-                    f"👤 <b>{u_name}:</b> {RPS_NAMES[u_move]}\n"
-                    f"🤖 <b>Бот:</b> {RPS_NAMES[b_move]}\n\n"
-                    f"{res_line}"
-                )
-                safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
-                bot.answer_callback_query(call.id)
+            if mode in ('botmenu', 'bot'):
+                bot.answer_callback_query(call.id, "⛔ Игра в КНБ с ботом отключена. Доступны только дуэли 1 на 1 в чате!", show_alert=True)
                 return
 
             if mode == 'pvp':
@@ -3104,7 +3057,14 @@ def handle_games_callbacks(call):
                 p2_obj = get_player(room['users'][u2])
 
                 if m1 == m2:
-                    verdict = "🤝 <b>Боевая ничья!</b>"
+                    bonus1, bonus2 = "", ""
+                    if 'trickster_glove' in p1_obj.get('buffs', []) and random.randint(1, 100) <= 25:
+                        p1_obj['bio_res'] += 40
+                        bonus1 = f"\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 игроку {n1}!</i>"
+                    if 'trickster_glove' in p2_obj.get('buffs', []) and random.randint(1, 100) <= 25:
+                        p2_obj['bio_res'] += 40
+                        bonus2 = f"\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 игроку {n2}!</i>"
+                    verdict = f"🤝 <b>Боевая ничья!</b>{bonus1}{bonus2}"
                 elif (m1, m2) in RPS_WINS:
                     rew = int((rps_rew + 15) * (1.0 + p1_obj.get('prestige', 0) * 0.20))
                     p1_obj['bio_res'] += rew
