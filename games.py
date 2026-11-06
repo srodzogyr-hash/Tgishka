@@ -2101,7 +2101,7 @@ def send_public_user_hub(cid, user):
         f"🎖 <b>Твое звание:</b> {rank_title} (Ур. {lvl} | <code>{xp_prog}</code>)\n"
         f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🧪 <b>Патогены:</b> {p.get('patogens', 0)}\n"
         f"🔑 <b>Статус ИИ:</b> {ai_badge}\n\n"
-        f"👇 <b>Выбирай действие на кнопках или пиши команды (<code>лаба</code>, <code>/search</code>, <code>виселица</code>, <code>кнб</code>, <code>профиль</code>):</b>"
+        f"👇 <b>Выбирай действие на кнопках или пиши команды (<code>лаба</code>, <code>/search</code>, <code>виселица</code>, <code>профиль</code>):</b>"
     )
     send_logged_pm(cid, text, reply_markup=kb, target_user=user)
 
@@ -2573,6 +2573,15 @@ def handle_all_game_commands(message):
         return
 
     if low in ('кнб', 'цуефа'):
+        if not biz_id and cid > 0:
+            send_logged_pm(
+                cid,
+                "⛔ <b>Игра в КНБ с ботом отключена!</b>\n\n"
+                "Дуэли «Камень-Ножницы-Бумага» доступны только между двумя живыми игроками в совместных беседах или бизнес-диалогах.",
+                business_connection_id=biz_id,
+                target_user=user
+            )
+            return
         send_rps_menu(cid, biz_id=biz_id, user=user)
         return
 
@@ -3025,6 +3034,9 @@ def handle_games_callbacks(call):
                 return
 
             if mode == 'pvp':
+                if not biz_id and game_cid > 0:
+                    bot.answer_callback_query(call.id, "⛔ Игра в КНБ с ботом отключена! Доступны только дуэли 1 на 1 в совместных чатах.", show_alert=True)
+                    return
                 move = parts[3]
                 room = RPS_GAMES.setdefault(game_cid, {'biz_id': biz_id, 'moves': {}, 'names': {}, 'users': {}})
                 uid = str(user.id)
