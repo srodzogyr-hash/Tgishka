@@ -1,3 +1,4 @@
+import os
 import html
 import re
 import time
@@ -1349,10 +1350,13 @@ def send_rps_menu(chat_id, biz_id=None, user=None):
         InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_pvp_{cid}_s"),
         InlineKeyboardButton("📄 Бумага", callback_data=f"rps_pvp_{cid}_p")
     )
+    kb.row(
+        InlineKeyboardButton("🤖 Быстрый бой с Ботом", callback_data=f"rps_botmenu_{cid}")
+    )
     text = (
-        "🪨✂️📄 <b>Камень-Ножницы-Бумага (Дуэль 1 на 1)!</b>\n\n"
-        "• Оба игрока жмут на кнопки ниже (первый выбор скрыт, пока не нажмет второй!).\n"
-        "• Игра с ботом отключена — только честные дуэли между игроками."
+        "🪨✂️📄 <b>Камень-Ножницы-Бумага!</b>\n\n"
+        "• <b>Дуэль 1 на 1:</b> жмите на кнопки выше (первый ход скрыт, пока не нажмет второй игрок!).\n"
+        "• <b>Бой с Ботом:</b> жми «🤖 Быстрый бой с Ботом» для одиночной игры с призами."
     )
     send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
 
@@ -1395,13 +1399,19 @@ def send_durak_invite(chat_id, biz_id=None, user=None, target_user=None):
     room = durak_engine.get_or_create_room(room_id, creator_id=uid, creator_name=uname, bot_model=cur_model)
 
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        InlineKeyboardButton("🃏 Войти за стол (WebApp)", web_app=WebAppInfo(url=game_url))
-    )
-    kb.row(
-        InlineKeyboardButton("🌐 Играть в браузере", url=game_url),
-        InlineKeyboardButton("⚙️ Модель ИИ", callback_data=f"durak_model_menu_{cid}")
-    )
+    if not biz_id and cid > 0:
+        kb.row(
+            InlineKeyboardButton("🃏 Войти за стол (WebApp)", web_app=WebAppInfo(url=game_url))
+        )
+        kb.row(
+            InlineKeyboardButton("🌐 В браузере", url=game_url),
+            InlineKeyboardButton("⚙️ Модель ИИ", callback_data=f"durak_model_menu_{cid}")
+        )
+    else:
+        kb.row(
+            InlineKeyboardButton("🃏 Открыть стол Дурака", url=game_url),
+            InlineKeyboardButton("⚙️ Модель ИИ", callback_data=f"durak_model_menu_{cid}")
+        )
 
     text = (
         "🃏 <b>ДУРАК ОНЛАЙН — Карточный стол Tgishka!</b>\n\n"
@@ -2070,7 +2080,8 @@ GAME_TRIGGERS = {
     'команды', 'помощь', 'хелп', '/help',
     '/search', 'лут', 'мусорка', 'лутинг',
     'бункер', 'игра бункер', 'мафия', 'игра мафия', 'стоп игра', 'игра стоп',
-    'игра-модели', 'модели игры', 'модели ведущего'
+    'игра-модели', 'модели игры', 'модели ведущего',
+    'дурак', 'дурак онлайн', '/durak', 'дурак модель', '/durak_model', 'модель дурак'
 }
 
 GAME_PREFIXES = (
@@ -2078,7 +2089,8 @@ GAME_PREFIXES = (
     'приз бункер ', 'приз виселица ', 'приз кнб ', 'шанс заражения ',
     'время игры ', 'раунды игры ', 'доступ ', 'забрать доступ ',
     'написать ', 'диалог ', 'выдать ', 'забрать ', 'опыт ', 'патогены ',
-    'вылечить ', 'обнулить ', 'бан бот ', 'разбан бот ', 'рассылка ', 'профиль '
+    'вылечить ', 'обнулить ', 'бан бот ', 'разбан бот ', 'рассылка ', 'профиль ',
+    'дурак ', '/durak '
 )
 
 def is_game_command(text):
@@ -2183,6 +2195,10 @@ def send_public_user_hub(cid, user):
         InlineKeyboardButton("🗑 Лутать мусорку", callback_data="loot_again")
     )
     kb.add(
+        InlineKeyboardButton("🃏 Дурак Онлайн", callback_data=f"durak_invite_{cid}"),
+        InlineKeyboardButton("✂️ КНБ (Камень-Ножницы)", callback_data=f"rps_menu_{cid}")
+    )
+    kb.add(
         InlineKeyboardButton("🎡 Виселица", callback_data=f"hm_new_{cid}_std"),
         InlineKeyboardButton("🧠 Виселица ИИ", callback_data=f"hm_new_{cid}_ai")
     )
@@ -2196,7 +2212,7 @@ def send_public_user_hub(cid, user):
         f"🎖 <b>Твое звание:</b> {rank_title} (Ур. {lvl} | <code>{xp_prog}</code>)\n"
         f"🧬 <b>Вирусы:</b> <code>{p.get('bio_res', 0)}</code> | 🧪 <b>Патогены:</b> {p.get('patogens', 0)}\n"
         f"🔑 <b>Статус ИИ:</b> {ai_badge}\n\n"
-        f"👇 <b>Выбирай действие на кнопках или пиши команды (<code>лаба</code>, <code>/search</code>, <code>виселица</code>, <code>профиль</code>):</b>"
+        f"👇 <b>Выбирай действие на кнопках или пиши команды (<code>дурак</code>, <code>лаба</code>, <code>кнб</code>, <code>/search</code>, <code>виселица</code>, <code>профиль</code>):</b>"
     )
     send_logged_pm(cid, text, reply_markup=kb, target_user=user)
 
@@ -2668,15 +2684,6 @@ def handle_all_game_commands(message):
         return
 
     if low in ('кнб', 'цуефа'):
-        if not biz_id and cid > 0:
-            send_logged_pm(
-                cid,
-                "⛔ <b>Игра в КНБ с ботом отключена!</b>\n\n"
-                "Дуэли «Камень-Ножницы-Бумага» доступны только между двумя живыми игроками в совместных беседах или бизнес-диалогах.",
-                business_connection_id=biz_id,
-                target_user=user
-            )
-            return
         send_rps_menu(cid, biz_id=biz_id, user=user)
         return
 
@@ -3134,14 +3141,63 @@ def handle_games_callbacks(call):
             game_cid = int(parts[2])
             rps_rew = int(CONFIG.get('reward_rps', 50))
 
-            if mode in ('botmenu', 'bot'):
-                bot.answer_callback_query(call.id, "⛔ Игра в КНБ с ботом отключена. Доступны только дуэли 1 на 1 в чате!", show_alert=True)
+            if mode == 'menu':
+                send_rps_menu(cid, biz_id=biz_id, user=user)
+                bot.answer_callback_query(call.id)
+                return
+
+            if mode == 'botmenu':
+                kb = InlineKeyboardMarkup(row_width=3)
+                kb.row(
+                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
+                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
+                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
+                )
+                safe_edit_message("🤖 <b>Бой против Бота! Выбирай предмет:</b>", cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id)
+                return
+
+            if mode == 'bot':
+                u_move = parts[3]
+                b_move = random.choice(['r', 's', 'p'])
+                u_name = html.escape(p['name'])
+                if u_move == b_move:
+                    bonus = ""
+                    if 'trickster_glove' in p.get('buffs', []) and random.randint(1, 100) <= 25:
+                        p['bio_res'] += 40
+                        bonus = "\n🧤 <i>«Ловкость Шулера» принесла +40 🧬 даже в ничью!</i>"
+                    res_line = f"🤝 <b>Ничья!</b> Оба выбрали {RPS_NAMES[u_move]}.{bonus}"
+                elif (u_move, b_move) in RPS_WINS:
+                    rew = int(rps_rew * (1.0 + p.get('prestige', 0) * 0.20))
+                    p['bio_res'] += rew
+                    xp_g = add_player_xp(p, 18)
+                    p['wins_rps'] = p.get('wins_rps', 0) + 1
+                    buff_str = try_grant_rare_buff(p) or ""
+                    res_line = f"🏆 <b>{u_name} победил(а) бота!</b> (+{rew} 🧬, +{xp_g} XP){buff_str}"
+                else:
+                    res_line = "🤖 <b>Бот победил в этом раунде!</b>"
+
+                save_rpg_firebase()
+                kb = InlineKeyboardMarkup(row_width=3)
+                kb.row(
+                    InlineKeyboardButton("🪨 Камень", callback_data=f"rps_bot_{game_cid}_r"),
+                    InlineKeyboardButton("✂️ Ножницы", callback_data=f"rps_bot_{game_cid}_s"),
+                    InlineKeyboardButton("📄 Бумага", callback_data=f"rps_bot_{game_cid}_p")
+                )
+                kb.row(
+                    InlineKeyboardButton("🔙 В меню КНБ", callback_data=f"rps_menu_{game_cid}")
+                )
+                out = (
+                    f"✂️ <b>Камень-Ножницы-Бумага (с Ботом)</b>\n\n"
+                    f"👤 <b>{u_name}:</b> {RPS_NAMES[u_move]}\n"
+                    f"🤖 <b>Бот:</b> {RPS_NAMES[b_move]}\n\n"
+                    f"{res_line}"
+                )
+                safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
+                bot.answer_callback_query(call.id)
                 return
 
             if mode == 'pvp':
-                if not biz_id and game_cid > 0:
-                    bot.answer_callback_query(call.id, "⛔ Игра в КНБ с ботом отключена! Доступны только дуэли 1 на 1 в совместных чатах.", show_alert=True)
-                    return
                 move = parts[3]
                 room = RPS_GAMES.setdefault(game_cid, {'biz_id': biz_id, 'moves': {}, 'names': {}, 'users': {}})
                 uid = str(user.id)
@@ -3219,6 +3275,11 @@ def handle_games_callbacks(call):
 
         # --- ОБРАБОТЧИКИ ДУРАКА ОНЛАЙН ---
         if data.startswith('durak_'):
+            if data.startswith('durak_invite_'):
+                send_durak_invite(cid, biz_id=biz_id, user=user)
+                bot.answer_callback_query(call.id)
+                return
+
             if data.startswith('durak_model_menu_'):
                 send_durak_model_selection(cid, biz_id=biz_id, user=user, msg_id_to_edit=msg_id)
                 bot.answer_callback_query(call.id)

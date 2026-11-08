@@ -4,8 +4,9 @@
     'use strict';
 
     // 1. ИНИЦИАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЯ И КОМНАТЫ
-    const pathParts = window.location.pathname.split('/');
-    const roomId = pathParts[pathParts.length - 1] || 'default';
+    const cleanPath = window.location.pathname.replace(/\/+$/, '');
+    const pathParts = cleanPath.split('/');
+    const roomId = pathParts[pathParts.length - 1] || 'lobby';
 
     let tgUser = null;
     let userId = null;
