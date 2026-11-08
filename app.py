@@ -5,8 +5,89 @@ import time
 import importlib
 from flask import Flask, render_template, request, jsonify, Response
 import chat_manager
+import durak_engine
 
 app = Flask(__name__)
+
+# --- ДУРАК ОНЛАЙН (WEB APP & API) ---
+@app.route('/durak')
+@app.route('/durak/<room_id>')
+def durak_page(room_id='lobby'):
+    try:
+        return render_template('durak.html', room_id=room_id)
+    except Exception as e:
+        return f"Error loading Durak template: {e}", 500
+
+@app.route('/api/durak/<room_id>/state', methods=['GET'])
+def api_durak_state(room_id):
+    uid = request.args.get('uid')
+    room = durak_engine.get_or_create_room(room_id)
+    return jsonify(room.get_state(uid))
+
+@app.route('/api/durak/<room_id>/join', methods=['POST'])
+def api_durak_join(room_id):
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get('user_id') or 'guest')
+    name = (data.get('name') or 'Игрок').strip()
+    avatar = data.get('avatar')
+    room = durak_engine.get_or_create_room(room_id, creator_id=uid, creator_name=name)
+    ok, msg = room.add_player(uid, name, avatar=avatar)
+    return jsonify({'ok': ok, 'message': msg})
+
+@app.route('/api/durak/<room_id>/start', methods=['POST'])
+def api_durak_start(room_id):
+    room = durak_engine.get_or_create_room(room_id)
+    ok, msg = room.start_game()
+    return jsonify({'ok': ok, 'message': msg})
+
+@app.route('/api/durak/<room_id>/add_bot', methods=['POST'])
+def api_durak_add_bot(room_id):
+    room = durak_engine.get_or_create_room(room_id)
+    ok, msg = room.add_bot()
+    return jsonify({'ok': ok, 'message': msg})
+
+@app.route('/api/durak/<room_id>/action', methods=['POST'])
+def api_durak_action(room_id):
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get('user_id') or '')
+    action = data.get('action')
+    room = durak_engine.get_or_create_room(room_id)
+
+    if action == 'play_card':
+        card = data.get('card')
+        target_idx = data.get('target_index')
+        ok, msg = room.play_card(uid, card, target_attack_idx=target_idx)
+        return jsonify({'ok': ok, 'message': msg})
+
+    elif action == 'pass':
+        ok, msg = room.pass_turn(uid)
+        return jsonify({'ok': ok, 'message': msg})
+
+    elif action == 'take':
+        ok, msg = room.take_cards(uid)
+        return jsonify({'ok': ok, 'message': msg})
+
+    elif action == 'chat':
+        text = (data.get('text') or '').strip()
+        sender_name = (data.get('sender_name') or 'Игрок').strip()
+        if text:
+            room.send_chat_message(uid, sender_name, text)
+        return jsonify({'ok': True})
+
+    return jsonify({'ok': False, 'message': 'Неизвестное действие'}), 400
+
+@app.route('/api/durak/<room_id>/set_model', methods=['POST'])
+def api_durak_set_model(room_id):
+    data = request.get_json(silent=True) or {}
+    bot_model = data.get('bot_model')
+    if bot_model:
+        room = durak_engine.get_or_create_room(room_id)
+        room.bot_model = bot_model
+        for p in room.players:
+            if p.is_bot:
+                p.bot_model = bot_model
+        return jsonify({'ok': True, 'bot_model': bot_model})
+    return jsonify({'ok': False}), 400
 
 # --- WEB UI & HEALTH ROUTES ---
 @app.route('/')

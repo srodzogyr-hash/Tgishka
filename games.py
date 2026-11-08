@@ -5,7 +5,8 @@ import random
 import threading
 import requests
 import sys
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+import durak_engine
 
 main = sys.modules.get('bot') or sys.modules['__main__']
 
@@ -37,6 +38,7 @@ DEFAULT_MOD_CONFIG = {
     'reward_bunker': 1000,
     'reward_hangman': 200,
     'reward_rps': 50,
+    'durak_bot_model': 'gemini-3.8-flash',
     'vaccine_cost': 80,
     'quarantine_cost': 250,
     'base_patogen_minutes': 15,
@@ -204,7 +206,9 @@ def get_updated_full_commands_text():
         "• <code>бункер</code> | <code>мафия</code> | <code>стоп игра</code> — игры с Ведущим Gemini в отдельном окне\n"
         "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — «Хабаровский Лутинг» у Меда\n"
         "• <code>виселица</code> / <code>виселица ии</code> — Поле Чудес (кнопки + буквы/слова в чат)\n"
-        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n"
+        "• <code>дурак</code> — Дурак Онлайн (карточный стол WebApp, игра с ботом или друзьями)\n"
+        "• <code>дурак модель</code> — выбор модели ИИ для бота в Дураке (Gemini 3.8 / 3.6 / Groq / Classic)\n\n"
         "🔹 <b>4. Био-войны PRO (8 модулей + Залп без спама + Эволюция):</b>\n"
         "• <code>лаба</code> (или <code>био</code>) — твоя Био-Лаборатория PRO (8 модулей прокачки)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — пустить 1 патоген (с уведомлением жертве!)\n"
@@ -230,7 +234,9 @@ def get_chat_commands_text():
         "• <code>/search</code> (или <code>лут</code> / <code>мусорка</code>) — копаться в мусорке у Меда (6 тиров редкости до +2000 🧬)\n"
         "• <code>виселица</code> — Поле Чудес (+200 🧬 за победу, пиши буквы или слова прямо в чат!)\n"
         "• <code>виселица ии</code> — ГПТ загадывает слово по контексту вашего чата (+250 🧬)!\n"
-        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n\n"
+        "• <code>кнб</code> — Камень-Ножницы-Бумага (Дуэль 1 на 1)\n"
+        "• <code>дурак</code> — Дурак Онлайн (карточный стол WebApp, игра с ботом или друзьями)\n"
+        "• <code>дурак модель</code> — выбор модели ИИ для бота в Дураке\n\n"
         "🧬 <b>Био-войны PRO (Коронаирис + Эволюция):</b>\n"
         "• <code>лаба</code> — открыть свою Био-Лабораторию PRO (8 модулей + Реактор + Эпидемия)\n"
         "• <code>заразить</code> (или <code>заразить @юзер</code>) — атаковать 1 патогеном\n"
@@ -1349,6 +1355,95 @@ def send_rps_menu(chat_id, biz_id=None, user=None):
         "• Игра с ботом отключена — только честные дуэли между игроками."
     )
     send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
+
+# =====================================================================
+# 🃏 5.1. «ДУРАК ОНЛАЙН» (WEB APP / КАРТОЧНЫЙ СТОЛ С БОТАМИ И ИИ)
+# =====================================================================
+
+def get_web_base_url():
+    url = os.environ.get('WEB_APP_URL') or os.environ.get('RENDER_EXTERNAL_URL')
+    if url:
+        return url.rstrip('/')
+    return "https://tgishka.onrender.com"
+
+def get_durak_model_name(code):
+    names = {
+        'gemini-3.8-flash': '🧠 Gemini 3.8 Flash (High)',
+        'gemini-3.6-flash': '⚡ Gemini 3.6 Flash',
+        'gemini-3.1-pro': '💎 Gemini 3.1 Pro',
+        'groq/openai/gpt-oss-120b': '🚀 Groq (GPT-OSS 120B)',
+        'groq/qwen/qwen3.8-27b': '🐲 Groq (Qwen 27B)',
+        'classic': '🏎️ Быстрый офлайн алгоритм (Classic Pro)'
+    }
+    return names.get(code, code)
+
+def send_durak_invite(chat_id, biz_id=None, user=None, target_user=None):
+    cid = int(chat_id)
+    uname = (user.first_name if user else "Игрок")
+    uid = str(user.id if user else "0")
+
+    if biz_id or cid < 0:
+        room_id = f"group_{abs(cid)}"
+    else:
+        room_id = f"room_{uid}_{int(time.time()) % 10000}"
+
+    base_url = get_web_base_url()
+    game_url = f"{base_url}/durak/{room_id}"
+    cur_model = CONFIG.get('durak_bot_model', 'gemini-3.8-flash')
+    model_name = get_durak_model_name(cur_model)
+
+    room = durak_engine.get_or_create_room(room_id, creator_id=uid, creator_name=uname, bot_model=cur_model)
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("🃏 Войти за стол (WebApp)", web_app=WebAppInfo(url=game_url))
+    )
+    kb.row(
+        InlineKeyboardButton("🌐 Играть в браузере", url=game_url),
+        InlineKeyboardButton("⚙️ Модель ИИ", callback_data=f"durak_model_menu_{cid}")
+    )
+
+    text = (
+        "🃏 <b>ДУРАК ОНЛАЙН — Карточный стол Tgishka!</b>\n\n"
+        "• <b>Режим:</b> Классический Подкидной Дурак (колода 36 карт).\n"
+        "• <b>Стол:</b> Зеленое сукно, анимации, сброс, козырь, дуэли и чат с эмодзи.\n"
+        "• <b>Участники:</b> От 2 до 6 игроков (дуэль с друзьями или против ботов).\n"
+        f"• <b>Интеллект бота:</b> <code>{model_name}</code>\n\n"
+        "<i>👇 Нажмите на кнопку ниже, чтобы открыть стол в Telegram или скопировать ссылку для друзей! В лобби можно добавить одного или сразу нескольких ботов.</i>"
+    )
+
+    send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
+
+def send_durak_model_selection(chat_id, biz_id=None, user=None, msg_id_to_edit=None):
+    cid = int(chat_id)
+    cur_model = CONFIG.get('durak_bot_model', 'gemini-3.8-flash')
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    models = [
+        ('gemini-3.8-flash', '🧠 Gemini 3.8 Flash (High) [Рекомендуется]'),
+        ('gemini-3.6-flash', '⚡ Gemini 3.6 Flash'),
+        ('groq/openai/gpt-oss-120b', '🚀 Groq (GPT-OSS 120B)'),
+        ('groq/qwen/qwen3.8-27b', '🐲 Groq (Qwen 27B)'),
+        ('gemini-3.1-pro', '💎 Gemini 3.1 Pro'),
+        ('classic', '🏎️ Быстрый тактический алгоритм (Offline Pro)')
+    ]
+
+    for m_code, m_title in models:
+        check = " ✅" if m_code == cur_model else ""
+        kb.add(InlineKeyboardButton(f"{m_title}{check}", callback_data=f"durak_setm_{cid}_{m_code}"))
+
+    kb.add(InlineKeyboardButton("🔙 Назад к столу", callback_data=f"durak_back_{cid}"))
+
+    text = (
+        "⚙️ <b>Выбор модели ИИ для бота в «Дураке Онлайн»:</b>\n\n"
+        f"Текущая модель: <code>{get_durak_model_name(cur_model)}</code>\n\n"
+        "Выбранная модель управляет тактикой ботов за столом и генерирует забавные реплики/блеф в чат партии!"
+    )
+
+    if msg_id_to_edit:
+        safe_edit_message(text, cid, msg_id_to_edit, business_id=biz_id, reply_markup=kb)
+    else:
+        send_logged_pm(cid, text, business_connection_id=biz_id, reply_markup=kb, target_user=user)
 
 # =====================================================================
 # 🎭 6. СЮЖЕТНЫЕ ИИ-ИГРЫ: «БУНКЕР» И «МАФИЯ: ДОПРОС» (ПРИЗ 1000 🧬!)
@@ -2585,6 +2680,15 @@ def handle_all_game_commands(message):
         send_rps_menu(cid, biz_id=biz_id, user=user)
         return
 
+    # 9. Дурак Онлайн и выбор модели ИИ
+    if low in ('дурак модель', '/durak_model', 'модель дурак') or low.startswith(('дурак модель', '/durak_model')):
+        send_durak_model_selection(cid, biz_id=biz_id, user=user)
+        return
+
+    if low in ('дурак', 'дурак онлайн', '/durak') or low.startswith(('дурак ', '/durak ')):
+        send_durak_invite(cid, biz_id=biz_id, user=user)
+        return
+
     if cid in STORY_GAMES and not STORY_GAMES[cid].get('finished'):
         record_story_player_message(message)
         return
@@ -2601,6 +2705,7 @@ def handle_all_game_commands(message):
     call.data.startswith('biorefresh_') or call.data.startswith('biocollect_') or
     call.data.startswith('bioquar_') or call.data.startswith('bioepid_') or
     call.data.startswith('hm_') or call.data.startswith('rps_') or
+    call.data.startswith('durak_') or
     call.data.startswith('sg_') or call.data.startswith('sethostmodel_') or
     call.data.startswith('mod_') or call.data.startswith('cfg_') or
     call.data in ('panel_img_models', 'loot_again', 'pub_top', 'pub_help')
@@ -3110,6 +3215,35 @@ def handle_games_callbacks(call):
                 )
                 safe_edit_message(out, cid, msg_id, business_id=biz_id, reply_markup=kb)
                 bot.answer_callback_query(call.id, "Вскрываемся!")
+                return
+
+        # --- ОБРАБОТЧИКИ ДУРАКА ОНЛАЙН ---
+        if data.startswith('durak_'):
+            if data.startswith('durak_model_menu_'):
+                send_durak_model_selection(cid, biz_id=biz_id, user=user, msg_id_to_edit=msg_id)
+                bot.answer_callback_query(call.id)
+                return
+
+            if data.startswith('durak_back_'):
+                send_durak_invite(cid, biz_id=biz_id, user=user)
+                try:
+                    bot.delete_message(cid, msg_id)
+                except Exception:
+                    pass
+                bot.answer_callback_query(call.id)
+                return
+
+            if data.startswith('durak_setm_'):
+                parts = data.split('_')
+                prefix = f"durak_setm_{parts[2]}_"
+                chosen_m = data[len(prefix):]
+                CONFIG['durak_bot_model'] = chosen_m
+                save_config()
+                durak_engine.DEFAULT_BOT_MODEL = chosen_m
+                m_title = get_durak_model_name(chosen_m)
+                bot.answer_callback_query(call.id, f"✅ Выбрана: {m_title}", show_alert=True)
+                send_durak_model_selection(cid, biz_id=biz_id, user=user, msg_id_to_edit=msg_id)
+                return
     except Exception as e:
         print(f"⚠️ Ошибка в handle_games_callbacks: {e}")
 
