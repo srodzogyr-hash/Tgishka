@@ -997,8 +997,7 @@ def fetch_all_models():
     agy_models = []
     if 'antigravity_bridge' in sys.modules:
         try:
-            if antigravity_bridge.has_local_agy():
-                agy_models = list(antigravity_bridge.ANTIGRAVITY_MODELS)
+            agy_models = list(antigravity_bridge.ANTIGRAVITY_MODELS)
         except Exception:
             pass
 
@@ -2970,11 +2969,14 @@ def handle_business_message(message):
 import games
 
 # --- ЗАПУСК ---
-if __name__ == '__main__':
+def start_bot_polling():
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
 
-    print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Groq без матерного блока).')
+    print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Groq без матерного блока).', flush=True)
     bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+
+if os.environ.get('NO_BOT_POLLING') != '1':
+    start_bot_polling()

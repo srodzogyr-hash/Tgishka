@@ -172,9 +172,12 @@ def run_bot():
             if hasattr(bot_module, 'bot'):
                 chat_manager.set_bot_instance(bot_module.bot)
 
+            if hasattr(bot_module, 'start_bot_polling'):
+                bot_module.start_bot_polling()
+
         except Exception as e:
             print(f"--> [SERVER] ОШИБКА БОТА: {e}. Перезапуск через 5 сек...", flush=True)
-            time.sleep(5)
+        time.sleep(5)
 
 if __name__ == '__main__':
     print("--> ЗАПУСК СЕРВЕРА RENDER & ПАНЕЛИ ЧАТОВ...", flush=True)

@@ -113,9 +113,6 @@ def ask_antigravity(chat_id, prompt, media_list=None, save_to_memory=True, model
     chat_id = int(chat_id)
     agy_bin = get_agy_bin()
 
-    if not has_local_agy():
-        return None, "Движок Antigravity (agy) не найден на устройстве. Убедитесь, что agy установлен в ~/.local/bin/agy", "Antigravity [Not Found]", 0
-
     # Ensure clean model ID (e.g. gemini-3.8-flash-high or gemini-3.8-flash-low)
     clean_model = model_id.replace("agy/", "").replace("antigravity/", "").strip()
     if not clean_model:
@@ -124,6 +121,23 @@ def ask_antigravity(chat_id, prompt, media_list=None, save_to_memory=True, model
         clean_model = "gemini-3.8-flash-low"
     elif "high" in clean_model:
         clean_model = "gemini-3.8-flash-high"
+
+    if not has_local_agy():
+        # Бесшовный фоллбэк на облаке/Render через Gemini API
+        bot_mod = sys.modules.get("bot")
+        if bot_mod and hasattr(bot_mod, "ask_gemini"):
+            effort = "High Reasoning" if "high" in clean_model else "Low / Fast"
+            reply, err, model_used, ctx_len = bot_mod.ask_gemini(
+                chat_id,
+                prompt,
+                media_list=media_list,
+                save_to_memory=save_to_memory,
+                custom_sys_prompt=custom_sys_prompt,
+                preferred_model="gemini-3.8-flash"
+            )
+            model_label = f"⚡ Antigravity • Gemini 3.8 Flash ({effort})"
+            return reply, err, model_label, ctx_len
+        return None, "Движок Antigravity (agy) не найден на устройстве.", "Antigravity [Not Found]", 0
 
     init_sandbox()
 
