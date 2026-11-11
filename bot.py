@@ -1,10 +1,14 @@
+import sys
 import html
 import io
 import os
 import re
+import json
 import base64
 import time
 import random
+import urllib.request
+import urllib.parse
 import zipfile
 import xml.etree.ElementTree as ET
 import requests
@@ -432,15 +436,11 @@ def safe_edit_message(text, chat_id, message_id, business_id=None, reply_markup=
 
 def send_long_response(reply_text, footer_text, chat_id, loading_msg_id=None, business_id=None, reply_to_msg_id=None, is_autoreply=False, is_antigravity=False):
     reply_text = re.sub(r'^\[(Бот|Ассистент|ИИ|Владелец[^\]]*|Собеседник[^\]]*)\]:\s*', '', reply_text.strip(), flags=re.IGNORECASE)
-    if not is_antigravity:
-        reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    reply_text = re.sub(r'<think>.*?</think>', '', reply_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     raw_chunks = split_text_into_chunks(reply_text, max_len=3600)
     total = len(raw_chunks)
-    if is_antigravity:
-        target_set = BOT_ANTIGRAVITY_MESSAGES
-    else:
-        target_set = BOT_AUTOREPLY_MESSAGES if is_autoreply else BOT_GPT_MESSAGES
+    target_set = BOT_AUTOREPLY_MESSAGES if is_autoreply else BOT_GPT_MESSAGES
 
     for idx, chunk in enumerate(raw_chunks):
         formatted_chunk = format_markdown_to_html(chunk)
@@ -496,96 +496,165 @@ def send_typing_action(chat_id, business_id=None):
     except Exception:
         pass
 
-def handle_antigravity_execution(message, prompt_text, media_list=None, business_id=None):
-    chat_id = int(message.chat.id)
-    role = antigravity_bridge.get_user_role(message.from_user)
-    if not role:
-        if not business_id:
-            bot.reply_to(message, "⛔ У вас нет доступа к Antigravity. Попросите владельца @wrtnoq выдать доступ: <code>аг+ @ваш_юзер</code>")
+# --- ИНСТРУМЕНТ: ПОИСК В ИНТЕРНЕТЕ ---
+def perform_web_search(query, max_results=5):
+    """
+    Выполняет поиск в интернете через DuckDuckGo HTML и Wikipedia.
+    Возвращает список результатов: [{'title': ..., 'snippet': ..., 'url': ...}]
+    """
+    clean_q = (query or '').strip()
+    if not clean_q:
+        return []
+
+    results = []
+    # 1. DuckDuckGo HTML
+    try:
+        url = 'https://html.duckduckgo.com/html/'
+        data = urllib.parse.urlencode({'q': clean_q}).encode('utf-8')
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=9) as resp:
+            html_text = resp.read().decode('utf-8', errors='ignore')
+
+        titles = re.findall(r'<a[^>]+class=[\"\'\s]*result__a[\"\'\s]*[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', html_text, re.DOTALL)
+        snippets = re.findall(r'<a[^>]+class=[\"\'\s]*result__snippet[\"\'\s]*[^>]*>(.*?)</a>', html_text, re.DOTALL)
+
+        for i in range(min(len(titles), len(snippets), max_results)):
+            link = titles[i][0]
+            if 'uddg=' in link:
+                m = re.search(r'uddg=([^&]+)', link)
+                if m:
+                    link = urllib.parse.unquote(m.group(1))
+            title_text = re.sub(r'<[^>]+>', '', titles[i][1]).strip()
+            snippet_text = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+            if title_text and snippet_text:
+                results.append({'title': title_text, 'snippet': snippet_text, 'url': link})
+    except Exception as e:
+        print(f"⚠️ Ошибка поиска DuckDuckGo: {e}")
+
+    # 2. Wikipedia API fallback
+    if len(results) < 2:
+        try:
+            wiki_url = f"https://ru.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(clean_q)}&limit=3&namespace=0&format=json"
+            w_req = urllib.request.Request(wiki_url, headers={'User-Agent': 'TgishkaBot/1.0'})
+            with urllib.request.urlopen(w_req, timeout=5) as r:
+                w_data = json.loads(r.read())
+                w_titles = w_data[1]
+                w_snippets = w_data[2]
+                w_links = w_data[3]
+                for i in range(len(w_titles)):
+                    t = w_titles[i]
+                    s = w_snippets[i] or t
+                    l = w_links[i]
+                    results.append({'title': f"[Википедия] {t}", 'snippet': s, 'url': l})
+        except Exception as e:
+            print(f"⚠️ Ошибка поиска Wikipedia: {e}")
+
+    return results
+
+def handle_web_search(chat_id, query, message, business_id=None):
+    clean_q = (query or '').strip()
+    if not clean_q:
+        msg_text = "⚠️ Укажите запрос для поиска, например: <code>поиск новости ИИ 2026</code>"
+        if business_id:
+            bot.send_message(chat_id, msg_text, business_connection_id=business_id)
+        else:
+            bot.reply_to(message, msg_text)
         return
 
-    if not check_cooldown(chat_id):
-        if not business_id:
-            bot.reply_to(message, "жди пока первый запрос загрузится нищук")
-        return
-
-    task_id = f"ag_{int(time.time()*1000)}_{chat_id}"
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🛑 Прервать", callback_data=f"ag_stop_{task_id}"))
-
-    loading_label = "Antigravity думает..."
-    loading_msg = bot.send_message(chat_id, f"⚡ {loading_label}", reply_markup=kb, business_connection_id=business_id)
-    BOT_ANTIGRAVITY_MESSAGES.add(loading_msg.message_id)
+    loading_msg = bot.send_message(
+        chat_id,
+        "🔍 <b>Ищу в интернете...</b>",
+        business_connection_id=business_id,
+        reply_to_message_id=message.message_id
+    )
+    if business_id:
+        BOT_GPT_MESSAGES.add(loading_msg.message_id)
 
     stop_event = threading.Event()
-    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, loading_label, kb), daemon=True).start()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, "Ищу в интернете..."), daemon=True).start()
 
-    res_dict, err = antigravity_bridge.ask_antigravity(
+    search_data = perform_web_search(clean_q, max_results=5)
+    if not search_data:
+        stop_event.set()
+        safe_edit_message("⚠️ По вашему запросу ничего не найдено в интернете.", chat_id, loading_msg.message_id, business_id=business_id)
+        return
+
+    context_lines = [f"Пользователь запросил поиск: «{clean_q}»\nВот актуальные результаты поиска из интернета:"]
+    for idx, item in enumerate(search_data, 1):
+        context_lines.append(f"{idx}. <b>{item['title']}</b>\n{item['snippet']}\nИсточник: {item['url']}")
+    context_lines.append("\nНа основе этих свежих данных подробно и структурированно ответь пользователю на русском языке. При необходимости укажи полезные ссылки.")
+
+    search_prompt = "\n\n".join(context_lines)
+    reply, err, model_used, ctx_len = ask_ai(chat_id, search_prompt, is_autoreply=False)
+    stop_event.set()
+
+    if reply:
+        footer = f"🌐 Поиск в интернете • context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, loading_msg.message_id, business_id=business_id, is_autoreply=False)
+    else:
+        safe_edit_message(f"⚠️ Ошибка обработки результатов поиска:\n<code>{html.escape(err or 'Сбой ИИ')}</code>", chat_id, loading_msg.message_id, business_id=business_id)
+
+# --- ИНСТРУМЕНТ: АНАЛИЗ ПОЛНОГО ВИДЕО ---
+def handle_video_analysis(chat_id, video_msg, custom_prompt="", business_id=None):
+    chat_id = int(chat_id)
+    video = getattr(video_msg, 'video', None)
+    if not video:
+        return
+
+    # Проверка лимита Telegram Bot API (20 МБ)
+    if getattr(video, 'file_size', 0) and video.file_size > 20 * 1024 * 1024:
+        msg_text = "⚠️ Видео превышает лимит Telegram Bot API (максимум 20 МБ для скачивания ботом)."
+        if business_id:
+            bot.send_message(chat_id, msg_text, business_connection_id=business_id)
+        else:
+            bot.reply_to(video_msg, msg_text)
+        return
+
+    loading_msg = bot.send_message(
         chat_id,
-        message.from_user,
-        prompt_text,
-        task_id=task_id,
-        firebase_url=FIREBASE_URL,
-        media_list=media_list
+        "🎬 <b>Анализирую видео...</b>",
+        business_connection_id=business_id,
+        reply_to_message_id=video_msg.message_id
+    )
+    if business_id:
+        BOT_GPT_MESSAGES.add(loading_msg.message_id)
+
+    stop_event = threading.Event()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, business_id, "Анализирую видео..."), daemon=True).start()
+
+    try:
+        f_info = bot.get_file(video.file_id)
+        video_bytes = bot.download_file(f_info.file_path)
+    except Exception as e:
+        stop_event.set()
+        safe_edit_message(f"⚠️ Не удалось скачать видео: {e}", chat_id, loading_msg.message_id, business_id=business_id)
+        return
+
+    mime_type = getattr(video, 'mime_type', None) or 'video/mp4'
+    prompt = (custom_prompt or "").strip()
+    if not prompt:
+        prompt = (
+            "Внимательно изучи это видео. Подробно опиши, что происходит в видеоряде, кто или что показано, "
+            "перескажи суть диалогов или речи, опиши звуки/музыку и сделай краткий вывод."
+        )
+
+    reply, err, model_used, ctx_len = ask_ai(
+        chat_id,
+        prompt,
+        media_list=[(video_bytes, mime_type)],
+        is_autoreply=False
     )
     stop_event.set()
 
-    if res_dict:
-        if res_dict.get("status") == "cancelled":
-            safe_edit_message("⏹ <b>Ответ Antigravity прерван пользователем.</b>", chat_id, loading_msg.message_id, business_id=business_id)
-            return
-
-        thought = (res_dict.get("thought") or "").strip()
-        code_action = (res_dict.get("code_action") or "").strip()
-        reply_body = (res_dict.get("text") or res_dict.get("response") or "").strip()
-        model_used = res_dict.get("model") or "Gemini 3.8 Flash (High) [Antigravity Thinking]"
-
-        full_output = ""
-        if thought:
-            full_output += f"💭 <b>Размышление:</b>\n<blockquote>{thought}</blockquote>\n\n"
-        if code_action and role == "dev":
-            full_output += f"💻 <b>Код / Действия:</b>\n<pre>{code_action}</pre>\n\n"
-        full_output += reply_body
-
-        # Update chat memory in RAM and Firebase RTDB
-        history = CHAT_MEMORY.get(chat_id)
-        if history is None and FIREBASE_URL:
-            try:
-                r_mem = get_http_session().get(f"{FIREBASE_URL}/chat_memory/{chat_id}.json", timeout=4)
-                if r_mem.status_code == 200 and isinstance(r_mem.json(), list):
-                    history = r_mem.json()
-            except Exception:
-                pass
-        if history is None:
-            history = []
-
-        is_owner = bool((message.from_user.username or '').lower() == CREATOR_USERNAME.lower() or antigravity_bridge.is_creator(message.from_user))
-        user_speaker = f"[{'Владелец аккаунта' if is_owner else 'Собеседник'} @{message.from_user.username or message.from_user.id}]: {prompt_text}"
-        if not history or history[-1].get('content') != user_speaker:
-            history.append({"role": "user", "content": user_speaker})
-        history.append({"role": "model", "content": reply_body})
-
-        limit = CONFIG.get('context_limit', 100)
-        if len(history) > limit:
-            history = history[-limit:]
-        CHAT_MEMORY[chat_id] = history
-        save_chat_memory_async(chat_id, history)
-        ctx_len = len(history)
-
-        role_label = "🛠️ DEV" if role == "dev" else "💬 USER"
-        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\n⚡ Antigravity [{role_label}] • 🧠 {model_used}"
-        send_long_response(
-            full_output,
-            footer,
-            chat_id,
-            loading_msg.message_id,
-            business_id=business_id,
-            is_autoreply=False,
-            is_antigravity=True
-        )
+    if reply:
+        footer = f"🎬 Анализ видео • context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, loading_msg.message_id, business_id=business_id, is_autoreply=False)
     else:
-        err_msg = err or "Сбой вызова Antigravity"
-        safe_edit_message(f"⚠️ Ошибка Antigravity:\n{err_msg}", chat_id, loading_msg.message_id, business_id=business_id)
+        safe_edit_message(f"⚠️ Ошибка анализа видео:\n<code>{html.escape(err or 'Сбой ИИ')}</code>", chat_id, loading_msg.message_id, business_id=business_id)
 
 def mask_key(key_str):
     if len(key_str) <= 10:
@@ -631,13 +700,11 @@ def get_full_commands_text():
         "• <code>будильник @юзер 60 [задача]</code> — будильник для юзера из админки\n"
         "• <code>шпион вкл</code> / <code>выкл</code> — перехват удаленных и измененных СМС\n"
         "• <code>запретить @юзер</code> / <code>разрешить @юзер</code> — ЧС для бота\n\n"
-        "🔹 <b>5. Antigravity AI Engine (аг):</b>\n"
-        "• <code>аг [запрос]</code> — вызов Antigravity с полным контекстом переписки\n"
-        "• <code>аг+ @юзер</code> — дать доступ человеку как к обычной нейросети\n"
-        "• <code>аг+код @юзер</code> — дать доступ разработчика (изменение кода и файлов)\n"
-        "• <code>аг- @юзер</code> — отозвать выданный доступ\n"
-        "• <code>аг список</code> — посмотреть список доступов к Antigravity\n"
-        "• <code>аг дефолт</code> — включить Antigravity вместо базовых моделей на команду 'гпт'"
+        "🔹 <b>5. Инструменты (Поиск, Фото, Видео):</b>\n"
+        "• <code>поиск [запрос]</code> (или <code>гугл [запрос]</code>) — умный поиск в интернете с анализом данных\n"
+        "• <code>нарисуй [описание]</code> — генерация фото и артов (Flux / Imagen)\n"
+        "• <code>видео / кружок</code> — отправь видео или ответь 'гпт [вопрос]' для полного анализа видеоряда и звука\n"
+        "• В <code>модели</code> можно включить ⚡ <b>Antigravity High/Low</b> (без лимитов API)!"
     )
 
 # --- КЭШИРОВАНИЕ И РЕЖИМ «ШПИОНА» ---
@@ -888,7 +955,16 @@ def ask_ai(chat_id, prompt, media_list=None, save_to_memory=True, is_autoreply=F
     target_model = CONFIG.get('auto_reply_model', 'groq/openai/gpt-oss-120b') if is_autoreply else ACTIVE_MODEL
     sys_prompt = custom_sys_prompt or (build_autoreply_system_instruction() if is_autoreply else build_gpt_system_instruction())
 
-    if target_model.startswith('groq/'):
+    if target_model.startswith('agy/') or target_model.startswith('antigravity/'):
+        return antigravity_bridge.ask_antigravity(
+            chat_id,
+            prompt,
+            media_list=media_list,
+            save_to_memory=save_to_memory,
+            model_id=target_model,
+            custom_sys_prompt=sys_prompt
+        )
+    elif target_model.startswith('groq/'):
         return ask_groq(
             chat_id,
             prompt,
@@ -918,6 +994,14 @@ def fetch_all_models():
     skip_keywords = ['3.7', '2.5', '2.0', 'tts', 'whisper', 'guard', 'safeguard', 'lyria', 'embedding', 'imagen', 'aqa', 'robotics', 'banana', 'audio']
     s = get_http_session()
 
+    agy_models = []
+    if 'antigravity_bridge' in sys.modules:
+        try:
+            if antigravity_bridge.has_local_agy():
+                agy_models = list(antigravity_bridge.ANTIGRAVITY_MODELS)
+        except Exception:
+            pass
+
     if GEMINI_KEYS:
         url = f"{GEMINI_API_BASE}/models"
         try:
@@ -945,8 +1029,8 @@ def fetch_all_models():
             pass
 
     if not all_models:
-        return MODEL_HIERARCHY + GROQ_AUTOREPLY_FALLBACKS
-    return sorted(list(set(all_models)))
+        return agy_models + MODEL_HIERARCHY + GROQ_AUTOREPLY_FALLBACKS
+    return agy_models + sorted(list(set(all_models)))
 
 def ask_gemini(chat_id, prompt, media_list=None, save_to_memory=True, custom_sys_prompt=None, preferred_model=None):
     global CURRENT_KEY_INDEX
@@ -1494,13 +1578,30 @@ def trigger_buffered_auto_reply(chat_id, message):
 
 # --- РИСОВАНИЕ ---
 def generate_image(prompt):
+    clean_p = (prompt or '').strip()
+    if not clean_p:
+        return None, "Укажите описание картинки, например: <code>нарисуй кота в космосе</code>"
+
+    # 1. Генерация через Pollinations (Flux model: высокое качество, без лимитов ключей)
+    try:
+        encoded_prompt = urllib.parse.quote(clean_p)
+        poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
+        req = urllib.request.Request(poll_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = resp.read()
+            if data and len(data) > 5000:
+                return data, None
+    except Exception as e:
+        print(f"⚠️ Ошибка генерации Pollinations: {e}")
+
+    # 2. Запасной вариант через Gemini Imagen
     if not GEMINI_KEYS:
-        return None, "Нет ключей Gemini для генерации фото."
+        return None, "Не удалось сгенерировать изображение (сервис недоступен)."
 
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
     url = f"{GEMINI_API_BASE}/models/{model}:predict" if 'imagen' in model else f"{GEMINI_API_BASE}/models/{model}:generateContent"
-    payload = {"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
-              {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
+    payload = {"instances": [{"prompt": clean_p}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
+              {"contents": [{"role": "user", "parts": [{"text": clean_p}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
 
     last_err = "Неизвестная ошибка"
     s = get_http_session()
@@ -1550,7 +1651,7 @@ def animate_loading(chat_id, message_id, stop_event, business_id=None, text_pref
 
 # --- ФОРМИРОВАНИЕ ПАНЕЛИ УПРАВЛЕНИЯ И СТАТУСА КЛЮЧЕЙ ---
 def get_current_working_model():
-    if ACTIVE_MODEL.startswith('groq/'):
+    if ACTIVE_MODEL.startswith('groq/') or ACTIVE_MODEL.startswith('agy/') or ACTIVE_MODEL.startswith('antigravity/'):
         return ACTIVE_MODEL
     now = time.time()
     models = MODEL_HIERARCHY[MODEL_HIERARCHY.index(ACTIVE_MODEL):] if ACTIVE_MODEL in MODEL_HIERARCHY else [ACTIVE_MODEL] + MODEL_HIERARCHY
@@ -1714,11 +1815,33 @@ def send_panel(message):
     text, kb = build_panel_view()
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['voice', 'video_note', 'audio'])
-def handle_admin_voice(message):
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['voice', 'video_note', 'audio', 'video', 'photo'])
+def handle_admin_media(message):
     register_creator_id(message.from_user)
     remove_old_reply_keyboard(message.chat.id)
-    handle_voice_transcription(message.chat.id, message, business_id=None)
+    if message.content_type == 'video':
+        caption = (message.caption or "").strip()
+        if caption.lower().startswith('гпт '):
+            caption = caption[4:].strip()
+        handle_video_analysis(message.chat.id, message, custom_prompt=caption, business_id=None)
+    elif message.content_type == 'photo':
+        caption = (message.caption or "").strip()
+        if caption.lower().startswith('гпт '):
+            caption = caption[4:].strip()
+        img_b, mime = get_photo_bytes(message)
+        media_list = [(img_b, mime)] if img_b else None
+        loading_msg = bot.reply_to(message, "🕐 Смотрю фото...")
+        stop_event = threading.Event()
+        threading.Thread(target=animate_loading, args=(message.chat.id, loading_msg.message_id, stop_event, None, "Смотрю фото..."), daemon=True).start()
+        reply, err, model_used, ctx_len = ask_ai(message.chat.id, caption or "Опиши это изображение.", media_list, is_autoreply=False)
+        stop_event.set()
+        if reply:
+            footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+            send_long_response(reply, footer, message.chat.id, loading_msg.message_id, is_autoreply=False)
+        else:
+            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err or 'Сбой ИИ')}</code>", message.chat.id, loading_msg.message_id)
+    else:
+        handle_voice_transcription(message.chat.id, message, business_id=None)
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() == CREATOR_USERNAME, content_types=['document'])
 def handle_admin_document(message):
@@ -2095,14 +2218,15 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🧹 Память во всех чатах (у тебя и у собеседников) полностью очищена!\ncontext: 0/{CONFIG.get('context_limit', 100)}")
         return
 
-    if text.startswith('нарисуй '):
+    if text.startswith('нарисуй ') or text.startswith('фото ') or text.startswith('арт ') or text.startswith('картинка ') or text.startswith('/img '):
         if not check_cooldown(chat_id):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
             return
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img)\s+', '', raw_text, flags=re.IGNORECASE).strip()
         loading_msg = bot.reply_to(message, "🕐 Рисую...")
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую..."), daemon=True).start()
-        img, err = generate_image(raw_text[8:].strip())
+        img, err = generate_image(img_prompt)
         stop_event.set()
         if img:
             try:
@@ -2111,61 +2235,12 @@ def handle_admin_text(message):
             except Exception:
                 pass
         else:
-            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, loading_msg.message_id)
+            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err or 'Сбой генерации')}</code>", chat_id, loading_msg.message_id)
         return
 
-    # --- КОМАНДЫ УПРАВЛЕНИЯ ANTIGRAVITY ---
-    if text.startswith('аг+код ') or text.startswith('ag+code ') or text.startswith('аг+code ') or text.startswith('ag+код '):
-        target = raw_text.split(maxsplit=1)[1]
-        res = antigravity_bridge.grant_access(message.from_user, target, role='dev')
-        bot.reply_to(message, res)
-        return
-
-    if text.startswith('аг+ ') or text.startswith('ag+ ') or text.startswith('аг+') or text.startswith('ag+'):
-        target = raw_text.split('+', 1)[1].strip()
-        res = antigravity_bridge.grant_access(message.from_user, target, role='user')
-        bot.reply_to(message, res)
-        return
-
-    if text.startswith('аг- ') or text.startswith('ag- ') or text.startswith('аг-') or text.startswith('ag-'):
-        target = raw_text.split('-', 1)[1].strip()
-        res = antigravity_bridge.revoke_access(message.from_user, target)
-        bot.reply_to(message, res)
-        return
-
-    if text in ['аг список', 'аг доступ', 'аг юзеры', 'ag list', 'ag users']:
-        res = antigravity_bridge.list_access(message.from_user)
-        bot.reply_to(message, res)
-        return
-
-    if text in ['аг дефолт', 'аг гпт', 'ag default', 'ag gpt']:
-        res = antigravity_bridge.toggle_default_gpt(message.from_user)
-        bot.reply_to(message, res)
-        return
-
-    if text.startswith('аг ') or text == 'аг' or text.startswith('ag ') or text == 'ag':
-        prompt_text = raw_text[3:].strip() if len(raw_text) > 2 else ""
-        media_list = []
-        if message.reply_to_message:
-            rep = message.reply_to_message
-            if rep.content_type == 'document':
-                m_item, ext_text, doc_err = extract_document_content(rep)
-                if doc_err:
-                    bot.reply_to(message, f"⚠️ {doc_err}")
-                    return
-                if m_item:
-                    media_list.append(m_item)
-                if ext_text:
-                    prompt_text += "\n" + ext_text
-            elif rep.content_type == 'photo':
-                img_b, mime = get_photo_bytes(rep)
-                if img_b:
-                    media_list.append((img_b, mime))
-            elif rep.text and not prompt_text:
-                prompt_text = rep.text
-        if not prompt_text:
-            prompt_text = "Привет! Чем могу помочь?"
-        handle_antigravity_execution(message, prompt_text, media_list, business_id=None)
+    if text.startswith('поиск ') or text.startswith('гугл ') or text.startswith('инет ') or text.startswith('найди ') or text.startswith('/search '):
+        query = re.sub(r'^(поиск|гугл|инет|найди|/search)\s+', '', raw_text, flags=re.IGNORECASE).strip()
+        handle_web_search(chat_id, query, message, business_id=None)
         return
 
     if text.startswith('гпт ') or text == 'гпт':
@@ -2194,13 +2269,11 @@ def handle_admin_text(message):
             elif rep.content_type in ['voice', 'video_note', 'audio']:
                 handle_voice_transcription(chat_id, rep, prompt_text, business_id=None)
                 return
+            elif rep.content_type == 'video':
+                handle_video_analysis(chat_id, rep, prompt_text, business_id=None)
+                return
             elif rep.text and not prompt_text:
                 prompt_text = rep.text
-
-        # Если включен Antigravity по умолчанию для гпт
-        if antigravity_bridge.is_default_gpt_enabled() and antigravity_bridge.get_user_role(message.from_user):
-            handle_antigravity_execution(message, prompt_text or "Привет!", media_list, business_id=None)
-            return
 
         loading_msg = bot.reply_to(message, "🕐 Думаю...")
         stop_event = threading.Event()
@@ -2225,71 +2298,96 @@ def handle_admin_text(message):
         safe_edit_message(result_html, chat_id, loading_msg.message_id)
         return
 
-# --- ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ ДЛЯ АВТОРИЗОВАННЫХ ПОЛЬЗОВАТЕЛЕЙ (НЕ CREATOR) ---
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() != CREATOR_USERNAME, content_types=['text', 'photo', 'document'])
+# --- ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ (НЕ CREATOR) ---
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and (m.from_user.username or '').lower() != CREATOR_USERNAME, content_types=['text', 'photo', 'document', 'voice', 'video_note', 'video'])
 def handle_authorized_user_private(message):
     text = (message.text or message.caption or "").strip()
     lower_text = text.lower()
+    chat_id = int(message.chat.id)
 
-    is_ag = lower_text.startswith('аг ') or lower_text == 'аг' or lower_text.startswith('ag ') or lower_text == 'ag'
-    rep_id = message.reply_to_message.message_id if message.reply_to_message else None
-    is_reply_to_ag = bool(rep_id and rep_id in BOT_ANTIGRAVITY_MESSAGES)
+    # 1. Поиск в интернете
+    if lower_text.startswith('поиск ') or lower_text.startswith('гугл ') or lower_text.startswith('найди ') or lower_text.startswith('/search '):
+        query = re.sub(r'^(поиск|гугл|найди|/search)\s+', '', text, flags=re.IGNORECASE).strip()
+        handle_web_search(chat_id, query, message, business_id=None)
+        return
 
-    if is_ag or is_reply_to_ag or (lower_text.startswith('гпт ') and antigravity_bridge.is_default_gpt_enabled()):
-        role = antigravity_bridge.get_user_role(message.from_user)
-        if not role:
-            bot.reply_to(message, "⛔ У вас нет доступа к Antigravity. Обратитесь к @wrtnoq для получения доступа: <code>аг+ @ваш_юзер</code>")
-            return
+    # 2. Рисование картинок
+    if lower_text.startswith('нарисуй ') or lower_text.startswith('фото ') or lower_text.startswith('арт ') or lower_text.startswith('/img '):
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|/img)\s+', '', text, flags=re.IGNORECASE).strip()
+        loading_msg = bot.reply_to(message, "🕐 Рисую...")
+        stop_event = threading.Event()
+        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую..."), daemon=True).start()
+        img, err = generate_image(img_prompt)
+        stop_event.set()
+        if img:
+            try:
+                bot.delete_message(chat_id, loading_msg.message_id)
+                bot.send_photo(chat_id, img)
+            except Exception:
+                pass
+        else:
+            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err or 'Сбой генерации')}</code>", chat_id, loading_msg.message_id)
+        return
 
-        prompt_text = text[3:].strip() if (is_ag and len(text) > 2) else (text[4:].strip() if (lower_text.startswith('гпт ') and len(text) > 3) else text)
-        media_list = []
-        if message.content_type == 'document':
-            m_item, ext_text, doc_err = extract_document_content(message)
+    # 3. Видеосообщение
+    if message.content_type == 'video':
+        caption = text[4:].strip() if lower_text.startswith('гпт ') else text
+        handle_video_analysis(chat_id, message, custom_prompt=caption, business_id=None)
+        return
+
+    # 4. Аудио / кружок
+    if message.content_type in ['voice', 'video_note', 'audio']:
+        handle_voice_transcription(chat_id, message, business_id=None)
+        return
+
+    # 5. ГПТ / Вопрос
+    prompt_text = text[4:].strip() if lower_text.startswith('гпт ') else text
+    media_list = []
+    if message.content_type == 'document':
+        m_item, ext_text, doc_err = extract_document_content(message)
+        if m_item:
+            media_list.append(m_item)
+        if ext_text:
+            prompt_text += "\n" + ext_text
+    elif message.content_type == 'photo':
+        img_b, mime = get_photo_bytes(message)
+        if img_b:
+            media_list.append((img_b, mime))
+    elif message.reply_to_message:
+        rep = message.reply_to_message
+        if rep.content_type == 'document':
+            m_item, ext_text, doc_err = extract_document_content(rep)
             if m_item:
                 media_list.append(m_item)
             if ext_text:
                 prompt_text += "\n" + ext_text
-        elif message.content_type == 'photo':
-            img_b, mime = get_photo_bytes(message)
+        elif rep.content_type == 'photo':
+            img_b, mime = get_photo_bytes(rep)
             if img_b:
                 media_list.append((img_b, mime))
-        elif message.reply_to_message:
-            rep = message.reply_to_message
-            if rep.content_type == 'document':
-                m_item, ext_text, doc_err = extract_document_content(rep)
-                if m_item:
-                    media_list.append(m_item)
-                if ext_text:
-                    prompt_text += "\n" + ext_text
-            elif rep.content_type == 'photo':
-                img_b, mime = get_photo_bytes(rep)
-                if img_b:
-                    media_list.append((img_b, mime))
-            elif rep.text and not prompt_text:
-                prompt_text = rep.text
+        elif rep.content_type == 'video':
+            handle_video_analysis(chat_id, rep, custom_prompt=prompt_text, business_id=None)
+            return
+        elif rep.content_type in ['voice', 'video_note', 'audio']:
+            handle_voice_transcription(chat_id, rep, prompt_text, business_id=None)
+            return
+        elif rep.text and not prompt_text:
+            prompt_text = rep.text
 
-        if not prompt_text:
-            prompt_text = "Привет!"
+    if not prompt_text:
+        prompt_text = "Привет!"
 
-        handle_antigravity_execution(message, prompt_text, media_list, business_id=None)
-        return
+    loading_msg = bot.reply_to(message, "🕐 Думаю...")
+    stop_event = threading.Event()
+    threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event), daemon=True).start()
+    reply, err, model_used, ctx_len = ask_ai(chat_id, prompt_text, media_list, is_autoreply=False)
+    stop_event.set()
 
-# --- ОБРАБОТЧИК КНОПКИ ПРЕРЫВАНИЯ ANTIGRAVITY ---
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith('ag_stop_'))
-def handle_ag_stop_callback(call):
-    task_id = call.data.replace('ag_stop_', '').strip()
-    user = call.from_user
-    success, msg = antigravity_bridge.cancel_task(task_id, user, firebase_url=FIREBASE_URL)
-    try:
-        bot.answer_callback_query(call.id, msg)
-    except Exception:
-        pass
-    if success:
-        safe_edit_message(
-            "⏹ <b>Ответ Antigravity прерван пользователем.</b>",
-            call.message.chat.id,
-            call.message.message_id
-        )
+    if reply:
+        footer = f"context: {ctx_len}/{CONFIG.get('context_limit', 100)}\nmodel: {model_used}"
+        send_long_response(reply, footer, chat_id, loading_msg.message_id, is_autoreply=False)
+    else:
+        safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err or 'Сбой ИИ')}</code>", chat_id, loading_msg.message_id)
 
 # --- ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК АДМИНКИ ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -2592,89 +2690,13 @@ def handle_business_message(message):
     rep_id = message.reply_to_message.message_id if message.reply_to_message else None
     is_reply_to_gpt = bool(rep_id and rep_id in BOT_GPT_MESSAGES)
     is_reply_to_auto = bool(rep_id and rep_id in BOT_AUTOREPLY_MESSAGES)
-    is_reply_to_ag = bool(rep_id and rep_id in BOT_ANTIGRAVITY_MESSAGES)
-    is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto or is_reply_to_ag
+    is_reply_to_any_bot = is_reply_to_gpt or is_reply_to_auto
 
-    if is_owner and (lower_text.startswith('аг+') or lower_text.startswith('ag+')):
-        target = text.split('+', 1)[1].strip()
-        role = 'dev' if ('код' in lower_text or 'code' in lower_text) else 'user'
-        clean_target = target.replace('код', '').replace('code', '').strip()
-        res = antigravity_bridge.grant_access(message.from_user, clean_target, role=role)
-        try:
-            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
-        except Exception:
-            pass
-        if CREATOR_ID:
-            bot.send_message(CREATOR_ID, res)
+    # Поиск в интернете через бизнес-чат
+    if lower_text.startswith('поиск ') or lower_text.startswith('гугл ') or lower_text.startswith('найди ') or lower_text.startswith('/search '):
+        query = re.sub(r'^(поиск|гугл|найди|/search)\s+', '', text, flags=re.IGNORECASE).strip()
+        handle_web_search(chat_id, query, message, business_id=message.business_connection_id)
         return
-
-    if is_owner and (lower_text.startswith('аг-') or lower_text.startswith('ag-')):
-        target = text.split('-', 1)[1].strip()
-        res = antigravity_bridge.revoke_access(message.from_user, target)
-        try:
-            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
-        except Exception:
-            pass
-        if CREATOR_ID:
-            bot.send_message(CREATOR_ID, res)
-        return
-
-    if is_owner and lower_text in ['аг доступ', 'аг список', 'ag list', 'ag users']:
-        res = antigravity_bridge.list_access(message.from_user)
-        try:
-            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
-        except Exception:
-            pass
-        if CREATOR_ID:
-            bot.send_message(CREATOR_ID, res)
-        return
-
-    if is_owner and lower_text in ['аг дефолт', 'аг гпт', 'ag default', 'ag gpt']:
-        res = antigravity_bridge.toggle_default_gpt(message.from_user)
-        try:
-            bot.delete_message(chat_id, message.message_id, business_connection_id=message.business_connection_id)
-        except Exception:
-            pass
-        if CREATOR_ID:
-            bot.send_message(CREATOR_ID, res)
-        return
-
-    is_ag = lower_text.startswith('аг ') or lower_text == 'аг' or lower_text.startswith('ag ') or lower_text == 'ag'
-    if is_ag or is_reply_to_ag or (lower_text.startswith('гпт ') and antigravity_bridge.is_default_gpt_enabled()):
-        ag_role = antigravity_bridge.get_user_role(message.from_user)
-        if ag_role:
-            prompt_text = text[3:].strip() if (is_ag and len(text) > 2) else (text[4:].strip() if (lower_text.startswith('гпт ') and len(text) > 3) else text)
-            media_list = []
-            if message.content_type == 'document':
-                m_item, ext_text, doc_err = extract_document_content(message)
-                if m_item:
-                    media_list.append(m_item)
-                if ext_text:
-                    prompt_text += "\n" + ext_text
-            elif message.content_type == 'photo':
-                img_b, mime = get_photo_bytes(message)
-                if img_b:
-                    media_list.append((img_b, mime))
-            elif message.reply_to_message:
-                rep = message.reply_to_message
-                if rep.content_type == 'document':
-                    m_item, ext_text, doc_err = extract_document_content(rep)
-                    if m_item:
-                        media_list.append(m_item)
-                    if ext_text:
-                        prompt_text += "\n" + ext_text
-                elif rep.content_type == 'photo':
-                    img_b, mime = get_photo_bytes(rep)
-                    if img_b:
-                        media_list.append((img_b, mime))
-                elif rep.text and not prompt_text:
-                    prompt_text = rep.text
-
-            if not prompt_text:
-                prompt_text = "Привет!"
-
-            handle_antigravity_execution(message, prompt_text, media_list, business_id=message.business_connection_id)
-            return
 
     if lower_text in ['сброс', 'гпт сброс', '/reset']:
         reset_single_chat_memory(chat_id)
@@ -2773,7 +2795,7 @@ def handle_business_message(message):
 
     # 4. ЗАПИСЬ В ИСТОРИЮ ЧАТА С РОЛЬЮ АВТОРА
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
-    is_draw = lower_text.startswith('нарисуй ')
+    is_draw = lower_text.startswith('нарисуй ') or lower_text.startswith('фото ') or lower_text.startswith('арт ') or lower_text.startswith('картинка ') or lower_text.startswith('/img ')
     clean_for_log = text[4:].strip() if is_gpt else text
     record_chat_log(message, is_owner, custom_text=clean_for_log, add_to_memory=not (is_gpt or is_draw or is_reply_to_any_bot))
 
@@ -2830,11 +2852,12 @@ def handle_business_message(message):
         text = text[4:].strip()
 
     if is_draw:
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img)\s+', '', text, flags=re.IGNORECASE).strip()
         msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
         BOT_GPT_MESSAGES.add(msg.message_id)
         stop_event = threading.Event()
         threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую..."), daemon=True).start()
-        img, err = generate_image(text[8:])
+        img, err = generate_image(img_prompt)
         stop_event.set()
         if img:
             try:
@@ -2845,11 +2868,19 @@ def handle_business_message(message):
             except Exception:
                 pass
         else:
-            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err)}</code>", chat_id, msg.message_id, message.business_connection_id)
+            safe_edit_message(f"⚠️ Ошибка:\n<code>{html.escape(err or 'Сбой генерации')}</code>", chat_id, msg.message_id, message.business_connection_id)
         return
 
-    if message.reply_to_message and message.reply_to_message.content_type in ['voice', 'video_note', 'audio']:
-        handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
+    if message.reply_to_message:
+        if message.reply_to_message.content_type in ['voice', 'video_note', 'audio']:
+            handle_voice_transcription(chat_id, message.reply_to_message, text, business_id=message.business_connection_id)
+            return
+        elif message.reply_to_message.content_type == 'video':
+            handle_video_analysis(chat_id, message.reply_to_message, custom_prompt=text, business_id=message.business_connection_id)
+            return
+
+    if message.content_type == 'video':
+        handle_video_analysis(chat_id, message, custom_prompt=text, business_id=message.business_connection_id)
         return
 
     # 6. ОБРАБОТКА ВЫЗОВА
@@ -2939,10 +2970,11 @@ def handle_business_message(message):
 import games
 
 # --- ЗАПУСК ---
-try:
-    bot.delete_webhook(drop_pending_updates=True)
-except Exception:
-    pass
+if __name__ == '__main__':
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
 
-print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Groq без матерного блока).')
-bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+    print(f'⚡ БОТ ЗАПУЩЕН! ГПТ: {ACTIVE_MODEL} | Автоответчик: {CONFIG.get("auto_reply_model")} (Groq без матерного блока).')
+    bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)

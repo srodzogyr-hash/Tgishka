@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 chats_data.json
 .env
+.agy_sandbox/
