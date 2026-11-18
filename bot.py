@@ -1575,29 +1575,21 @@ def trigger_buffered_auto_reply(chat_id, message):
     PENDING_AUTO_REPLY[chat_id] = {'timer': timer}
     timer.start()
 
-# --- РИСОВАНИЕ ---
+# --- РИСОВАНИЕ (СТРОГО GEMINI IMAGEN) ---
 def generate_image(prompt):
     clean_p = (prompt or '').strip()
     if not clean_p:
         return None, "Укажите описание картинки, например: <code>нарисуй кота в космосе</code>"
 
-    # 1. Генерация через Pollinations (Flux model: высокое качество, без лимитов ключей)
-    try:
-        encoded_prompt = urllib.parse.quote(clean_p)
-        poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
-        req = urllib.request.Request(poll_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = resp.read()
-            if data and len(data) > 5000:
-                return data, None
-    except Exception as e:
-        print(f"⚠️ Ошибка генерации Pollinations: {e}")
-
-    # 2. Запасной вариант через Gemini Imagen
     if not GEMINI_KEYS:
-        return None, "Не удалось сгенерировать изображение (сервис недоступен)."
+        return None, "Не найдено ключей Gemini для генерации изображений."
 
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
+    if not model or 'imagen' not in model and 'image' not in model:
+        model = DEFAULT_IMAGE_MODEL
+        CONFIG['image_model'] = DEFAULT_IMAGE_MODEL
+        save_config()
+
     url = f"{GEMINI_API_BASE}/models/{model}:predict" if 'imagen' in model else f"{GEMINI_API_BASE}/models/{model}:generateContent"
     payload = {"instances": [{"prompt": clean_p}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
               {"contents": [{"role": "user", "parts": [{"text": clean_p}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
@@ -1627,7 +1619,7 @@ def generate_image(prompt):
         except Exception as e:
             last_err = str(e)
 
-    return None, last_err
+    return None, f"Ошибка Gemini Imagen ({last_err}). Повторите через несколько секунд."
 
 def animate_loading(chat_id, message_id, stop_event, business_id=None, text_prefix="Думаю...", reply_markup=None):
     emojis = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]

@@ -270,57 +270,10 @@ def _enhanced_build_panel_view():
 main.build_panel_view = _enhanced_build_panel_view
 
 # =====================================================================
-# 🎨 1. БЕСПЛАТНАЯ РИСОВАЛКА FLUX
+# 🎨 1. РИСОВАНИЕ (СТРОГО GEMINI IMAGEN)
 # =====================================================================
-FREE_IMAGE_MODELS = ['flux', 'flux-realism', 'flux-anime', 'flux-3d', 'turbo']
-if CONFIG.get('image_model') not in FREE_IMAGE_MODELS:
-    CONFIG['image_model'] = 'flux'
-
-def enhance_image_prompt(ru_prompt):
-    sys_t = (
-        "Translate the user's image description into English and make it a vivid, detailed prompt "
-        "for the FLUX image generator. Output ONLY the final English prompt without quotes."
-    )
-    if GROQ_API_KEY:
-        try:
-            headers = {'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'}
-            payload = {
-                'model': 'openai/gpt-oss-20b',
-                'messages': [{'role': 'system', 'content': sys_t}, {'role': 'user', 'content': ru_prompt}],
-                'temperature': 0.5
-            }
-            r = get_http_session().post(f'{GROQ_API_BASE}/chat/completions', headers=headers, json=payload, timeout=7)
-            if r.status_code == 200:
-                ans = r.json()['choices'][0]['message']['content'].strip()
-                ans = re.sub(r'<think>.*?</think>', '', ans, flags=re.DOTALL | re.IGNORECASE).strip()
-                if ans:
-                    return ans
-        except Exception:
-            pass
-    return ru_prompt
-
-def free_generate_image(prompt):
-    raw_prompt = (prompt or "").strip()
-    if not raw_prompt:
-        return None, "Напиши описание картинки!"
-    model = CONFIG.get('image_model', 'flux')
-    if model not in FREE_IMAGE_MODELS:
-        model = 'flux'
-    eng_prompt = enhance_image_prompt(raw_prompt)
-    seed = random.randint(1, 9999999)
-    encoded = requests.utils.quote(eng_prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?model={model}&width=1024&height=1024&seed={seed}&nologo=true"
-    s = get_http_session()
-    for _ in range(2):
-        try:
-            r = s.get(url, timeout=40)
-            if r.status_code == 200 and r.content and len(r.content) > 1000:
-                return r.content, None
-        except Exception:
-            time.sleep(1)
-    return None, "Сервер рисования перегружен, повтори через 5 секунд."
-
-main.generate_image = free_generate_image
+if CONFIG.get('image_model') not in ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']:
+    CONFIG['image_model'] = 'imagen-3.0-generate-001'
 
 # =====================================================================
 # 🏆 2. ДОЛГОСРОЧНАЯ РПГ-ПРОГРЕССИЯ (ЭКСПОНЕНЦИАЛЬНЫЙ XP, 30 ЗВАНИЙ, 12 АРТЕФАКТОВ, ПРЕСТИЖ)
@@ -2715,7 +2668,7 @@ def handle_all_game_commands(message):
     call.data.startswith('durak_') or
     call.data.startswith('sg_') or call.data.startswith('sethostmodel_') or
     call.data.startswith('mod_') or call.data.startswith('cfg_') or
-    call.data in ('panel_img_models', 'loot_again', 'pub_top', 'pub_help')
+    call.data in ('loot_again', 'pub_top', 'pub_help')
 ))
 def handle_games_callbacks(call):
     global ADMIN_LIVE_CHAT_UID
@@ -2993,18 +2946,6 @@ def handle_games_callbacks(call):
                 bot.answer_callback_query(call.id, "Игра остановлена")
                 return
 
-        if data == 'panel_img_models':
-            if not is_owner:
-                return
-            cur_m = CONFIG.get('image_model', 'flux')
-            kb = InlineKeyboardMarkup(row_width=1)
-            for m in FREE_IMAGE_MODELS:
-                mark = "✅ " if m == cur_m else ""
-                kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
-            kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-            safe_edit_message("🎨 <b>Выбери бесплатную FLUX-модель для рисования:</b>", cid, msg_id, reply_markup=kb)
-            bot.answer_callback_query(call.id)
-            return
 
         if data.startswith('biorefresh_'):
             text, kb = build_lab_view(p)
