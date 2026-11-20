@@ -22,6 +22,25 @@ except ImportError:
 
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
+# --- АВТОЗАГРУЗКА .ENV ФАЙЛА ---
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+_load_dotenv()
+
 # --- НАСТРОЙКИ И ЗАГРУЗКА ПУЛА КЛЮЧЕЙ (ДО 15 ШТ.) ---
 TOKEN = os.environ.get('TG_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')  # Ключ Groq
@@ -111,6 +130,12 @@ MEDIA_GROUP_BUFFER = {}
 
 MESSAGE_CACHE = {}
 MAX_CACHE_SIZE = 500
+
+if not TOKEN or not isinstance(TOKEN, str) or not TOKEN.strip():
+    print("❌ [ОШИБКА] Переменная TG_TOKEN не задана!", flush=True)
+    print("👉 Откройте /data/data/com.termux/files/home/play/Tgishka/.env и укажите ваш токен Telegram-бота:", flush=True)
+    print("   TG_TOKEN=123456789:ABCdef...", flush=True)
+    sys.exit(1)
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
 

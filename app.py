@@ -7,6 +7,25 @@ from flask import Flask, render_template, request, jsonify, Response
 import chat_manager
 import durak_engine
 
+# --- АВТОЗАГРУЗКА .ENV ФАЙЛА ---
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+_load_dotenv()
+
 app = Flask(__name__)
 
 # --- ДУРАК ОНЛАЙН (WEB APP & API) ---
@@ -156,7 +175,7 @@ def api_status():
     return jsonify({
         'status': 'online' if bot_active else 'starting',
         'chats_count': len(chat_manager.CHATS),
-        'port': os.environ.get('PORT', 8080)
+        'port': os.environ.get('PORT', 5000)
     })
 
 # --- ЗАПУСК БОТА В ФОНЕ С ПЕРЕЗАПУСКОМ ---
@@ -182,5 +201,5 @@ def run_bot():
 if __name__ == '__main__':
     print("--> ЗАПУСК СЕРВЕРА RENDER & ПАНЕЛИ ЧАТОВ...", flush=True)
     threading.Thread(target=run_bot, daemon=True).start()
-    port = int(os.environ.get('PORT', 8080))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
