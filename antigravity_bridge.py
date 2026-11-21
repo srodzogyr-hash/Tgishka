@@ -327,6 +327,7 @@ def generate_antigravity_image(prompt, input_image_bytes=None):
 
     cmd = [
         agy_bin,
+        "--model", "gemini-3.8-flash-low",
         "--dangerously-skip-permissions",
         "-p", cli_prompt
     ]
@@ -340,12 +341,26 @@ def generate_antigravity_image(prompt, input_image_bytes=None):
             timeout=180
         )
 
-        # 1. Проверяем, записал ли файл прямо по целевому пути
+        # 1. Проверяем целевой файл в рабочей директории
         if target_file.exists() and target_file.stat().st_size > 1000:
             with open(target_file, "rb") as f:
                 return f.read(), None
 
-        # 2. Ищем самый свежий созданный файл в brain артефактах Antigravity
+        # 2. Проверяем любые созданные изображения в рабочей директории
+        ws_candidates = []
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+            for p in img_ws.glob(ext):
+                try:
+                    if (not input_image_bytes or p.name != source_file.name) and p.stat().st_mtime >= start_time - 2 and p.stat().st_size > 1000:
+                        ws_candidates.append((p.stat().st_mtime, p))
+                except Exception:
+                    pass
+        if ws_candidates:
+            ws_candidates.sort(key=lambda x: x[0], reverse=True)
+            with open(ws_candidates[0][1], "rb") as f:
+                return f.read(), None
+
+        # 3. Ищем самый свежий созданный файл в brain артефактах Antigravity
         brain_dir = Path("/data/data/com.termux/files/home/.gemini/antigravity-cli/brain")
         if brain_dir.exists():
             candidates = []
@@ -363,8 +378,8 @@ def generate_antigravity_image(prompt, input_image_bytes=None):
                 with open(newest_file, "rb") as f:
                     return f.read(), None
 
-        # 3. Ищем путь в текстовом выводе CLI
-        raw_out = (proc.stdout or "") + " " + (proc.stderr or "")
+        # 4. Ищем путь в текстовом выводе CLI
+        raw_out = (proc.stdout or "")
         match = re.search(r'(/[\w\.\-]+(?:/[\w\.\-]+)+\.(?:png|jpg|jpeg|webp))', raw_out)
         if match:
             found_path = Path(match.group(1))
@@ -372,11 +387,32 @@ def generate_antigravity_image(prompt, input_image_bytes=None):
                 with open(found_path, "rb") as f:
                     return f.read(), None
 
-        err_detail = proc.stderr.strip() or proc.stdout.strip()
-        if err_detail:
-            err_snippet = err_detail.splitlines()[-1][:120]
-            return None, f"Движок не сохранил изображение ({err_snippet}). Повторите попытку."
-        return None, "Движок не сохранил итоговое изображение. Попробуйте еще раз."
+        # 5. Обработка ошибок и статуса квоты из ответа Antigravity
+        clean_err_lines = []
+        for line in (proc.stderr or "").splitlines():
+            l_str = line.strip()
+            if not l_str or "logging before google.Init" in l_str or "server_zerog.go" in l_str or "YOLO mode" in l_str:
+                continue
+            clean_err_lines.append(l_str)
+
+        stdout_text = (proc.stdout or "").strip()
+        combined_text = (stdout_text + " " + " ".join(clean_err_lines)).lower()
+
+        if "429" in combined_text or "resource_exhausted" in combined_text or "квота" in combined_text or "exhausted your capacity" in combined_text:
+            return None, "Лимит генерации Antigravity (Google Nano Banana) временно исчерпан на серверах Google (сброс квоты через ~3 часа). Никакие внешние API-ключи не используются."
+
+        if stdout_text:
+            meaningful = [
+                l for l in stdout_text.splitlines() 
+                if l.strip() and not l.strip().startswith("ERROR:") and not l.strip().startswith("⠋") and not l.strip().startswith("⠙")
+            ]
+            if meaningful:
+                return None, f"Antigravity: {' '.join(meaningful[:2])[:180]}"
+
+        if clean_err_lines:
+            return None, f"Antigravity: {clean_err_lines[-1][:120]}"
+
+        return None, "Движок Antigravity не сохранил итоговое изображение. Попробуйте еще раз."
 
     except subprocess.TimeoutExpired:
         return None, "Время генерации изображения истекло (180 сек). Повторите попытку."

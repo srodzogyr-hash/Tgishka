@@ -1595,63 +1595,23 @@ def trigger_buffered_auto_reply(chat_id, message):
     PENDING_AUTO_REPLY[chat_id] = {'timer': timer}
     timer.start()
 
-# --- РИСОВАНИЕ И РЕДАКТИРОВАНИЕ КАРТИНОК (NANO BANANA / ANTIGRAVITY) ---
+# --- РИСОВАНИЕ И РЕДАКТИРОВАНИЕ КАРТИНОК (ANTIGRAVITY NANO BANANA) ---
 def generate_image(prompt, input_image_bytes=None):
     clean_p = (prompt or '').strip()
     if not clean_p:
         return None, "Укажите описание картинки, например: <code>нарисуй кота в космосе</code>"
 
-    # 1. Основной локальный движок Antigravity (image-generator / Nano Banana)
+    # Генерация и модификация изображений происходят ИСКЛЮЧИТЕЛЬНО через встроенный
+    # движок Antigravity (image-generator / Nano Banana) на телефоне.
+    # Внешние Gemini API-ключи полностью исключены из этого процесса.
     try:
         import antigravity_bridge
         img_bytes, err = antigravity_bridge.generate_antigravity_image(clean_p, input_image_bytes=input_image_bytes)
         if img_bytes and len(img_bytes) > 2000:
             return img_bytes, None
-        if err:
-            print(f"⚠️ Antigravity Image Generator: {err}")
+        return None, (err or "Локальный движок Antigravity не вернул изображение.")
     except Exception as e:
-        print(f"⚠️ Ошибка Antigravity image generator: {e}")
-
-    # 2. Запасной облачный вариант (Google AI Studio Nano Banana API)
-    if not GEMINI_KEYS:
-        return None, "Не удалось сгенерировать изображение (локальный движок не ответил)."
-
-    model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
-    if not model or 'image' not in model:
-        model = DEFAULT_IMAGE_MODEL
-
-    url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
-    parts = []
-    if input_image_bytes:
-        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(input_image_bytes).decode('utf-8')}})
-    parts.append({"text": clean_p})
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"responseModalities": ["IMAGE"]}
-    }
-
-    last_err = "Неизвестная ошибка"
-    s = get_http_session()
-    for key_idx, api_key in enumerate(GEMINI_KEYS):
-        try:
-            r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 40))
-            if r.status_code == 429:
-                last_err = f"Лимит (429) на ключе #{key_idx + 1}"
-                continue
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-
-            data = r.json()
-            if 'candidates' in data and data['candidates']:
-                for part in data['candidates'][0].get('content', {}).get('parts', []):
-                    if 'inline_data' in part:
-                        return base64.b64decode(part['inline_data']['data']), None
-            last_err = "Модель не вернула изображение."
-        except Exception as e:
-            last_err = str(e)
-
-    return None, f"Ошибка Nano Banana ({last_err}). Повторите через минуту."
+        return None, f"Ошибка вызова Antigravity: {e}"
 
 def animate_loading(chat_id, message_id, stop_event, business_id=None, text_prefix="Думаю...", reply_markup=None):
     emojis = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
@@ -2004,7 +1964,7 @@ def handle_admin_text(message):
         return
 
     if text in ['фото-модели', 'фото модели']:
-        image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
+        image_models = ['gemini-2.5-flash-image', 'gemini-3.1-flash-image', 'gemini-3-pro-image']
         kb = InlineKeyboardMarkup(row_width=1)
         for m in image_models:
             mark = "✅ " if m == CONFIG.get('image_model') else ""

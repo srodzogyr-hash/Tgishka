@@ -2418,15 +2418,15 @@ def handle_all_game_commands(message):
             send_logged_pm(cid, "🔒 <b>Доступ к нейросети в ЛС закрыт.</b>\nЗато тебе доступны все игры и Био-войны! Напиши <code>/start</code>, <code>лаба</code>, <code>/search</code> или <code>виселица</code>.", target_user=user)
             return
         if low.startswith('нарисуй '):
-            wait_m = bot.send_message(cid, "🎨 Рисую через FLUX...")
-            img, err = free_generate_image(raw_text[8:].strip())
+            wait_m = bot.send_message(cid, "🎨 Рисую через Antigravity...")
+            img, err = main.generate_image(raw_text[8:].strip())
             if img:
                 try:
                     bot.delete_message(cid, wait_m.message_id)
                 except Exception:
                     pass
                 bot.send_photo(cid, img)
-                log_bot_pm_interaction(user, "[Бот сгенерировал картинку FLUX]", from_bot=True)
+                log_bot_pm_interaction(user, "[Бот сгенерировал картинку Antigravity]", from_bot=True)
             else:
                 safe_edit_message(f"⚠️ {err}", cid, wait_m.message_id)
             return
