@@ -275,3 +275,110 @@ def ask_antigravity(chat_id, prompt, media_list=None, save_to_memory=True, model
         return None, "Время ожидания ответа Antigravity истекло (90 сек). Повторите запрос.", clean_model, len(history)
     except Exception as e:
         return None, f"Ошибка вызова Antigravity: {e}", clean_model, len(history)
+
+def generate_antigravity_image(prompt, input_image_bytes=None):
+    """
+    Генерирует или редактирует изображение через встроенный движок Antigravity (Nano Banana / image-generator).
+    Работает локально на телефоне без сторонних сервисов и без лимитов ключей.
+    """
+    clean_p = (prompt or '').strip()
+    if not clean_p:
+        return None, "Укажите описание картинки (например: нарисуй кота в космосе)"
+
+    agy_bin = get_agy_bin()
+    if not has_local_agy():
+        return None, "Локальный движок Antigravity (agy) не найден."
+
+    start_time = time.time()
+    img_ws = SANDBOX_DIR / "image_workspace"
+    img_ws.mkdir(parents=True, exist_ok=True)
+
+    ws_rules = img_ws / "GEMINI.md"
+    if not ws_rules.exists():
+        try:
+            with open(ws_rules, "w", encoding="utf-8") as f:
+                f.write(
+                    "You are an expert AI image artist and visual designer.\n"
+                    "When asked to generate or edit an image, always invoke the image-generator subagent immediately.\n"
+                )
+        except Exception:
+            pass
+
+    target_file = img_ws / f"img_{int(start_time)}_{uuid.uuid4().hex[:6]}.png"
+
+    if input_image_bytes:
+        source_file = img_ws / f"source_{int(start_time)}_{uuid.uuid4().hex[:6]}.jpg"
+        try:
+            with open(source_file, "wb") as f:
+                f.write(input_image_bytes)
+        except Exception as e:
+            return None, f"Не удалось сохранить исходное фото: {e}"
+
+        cli_prompt = (
+            f"Use the image-generator subagent to edit the image located at {source_file.resolve()} "
+            f"according to the user's instructions: '{clean_p}'. "
+            f"Save the generated image to {target_file.resolve()} and report the saved path."
+        )
+    else:
+        cli_prompt = (
+            f"Use the image-generator subagent to generate a high quality image: '{clean_p}'. "
+            f"Save the generated image to {target_file.resolve()} and report the saved path."
+        )
+
+    cmd = [
+        agy_bin,
+        "--dangerously-skip-permissions",
+        "-p", cli_prompt
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(img_ws),
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+
+        # 1. Проверяем, записал ли файл прямо по целевому пути
+        if target_file.exists() and target_file.stat().st_size > 1000:
+            with open(target_file, "rb") as f:
+                return f.read(), None
+
+        # 2. Ищем самый свежий созданный файл в brain артефактах Antigravity
+        brain_dir = Path("/data/data/com.termux/files/home/.gemini/antigravity-cli/brain")
+        if brain_dir.exists():
+            candidates = []
+            for ext in ("*.jpg", "*.png", "*.jpeg", "*.webp"):
+                for p in brain_dir.rglob(ext):
+                    try:
+                        mtime = p.stat().st_mtime
+                        if mtime >= start_time - 5 and p.stat().st_size > 10000:
+                            candidates.append((mtime, p))
+                    except Exception:
+                        pass
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                newest_file = candidates[0][1]
+                with open(newest_file, "rb") as f:
+                    return f.read(), None
+
+        # 3. Ищем путь в текстовом выводе CLI
+        raw_out = (proc.stdout or "") + " " + (proc.stderr or "")
+        match = re.search(r'(/[\w\.\-]+(?:/[\w\.\-]+)+\.(?:png|jpg|jpeg|webp))', raw_out)
+        if match:
+            found_path = Path(match.group(1))
+            if found_path.exists() and found_path.stat().st_size > 1000:
+                with open(found_path, "rb") as f:
+                    return f.read(), None
+
+        err_detail = proc.stderr.strip() or proc.stdout.strip()
+        if err_detail:
+            err_snippet = err_detail.splitlines()[-1][:120]
+            return None, f"Движок не сохранил изображение ({err_snippet}). Повторите попытку."
+        return None, "Движок не сохранил итоговое изображение. Попробуйте еще раз."
+
+    except subprocess.TimeoutExpired:
+        return None, "Время генерации изображения истекло (180 сек). Повторите попытку."
+    except Exception as e:
+        return None, f"Ошибка вызова Antigravity: {e}"

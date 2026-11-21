@@ -3,3 +3,4 @@ __pycache__/
 chats_data.json
 .env
 .agy_sandbox/
+tgishka.log

@@ -81,7 +81,7 @@ GROQ_AUTOREPLY_FALLBACKS = [
     'groq/openai/gpt-oss-20b'
 ]
 
-DEFAULT_IMAGE_MODEL = 'imagen-3.0-generate-001'
+DEFAULT_IMAGE_MODEL = 'gemini-2.5-flash-image'
 DEFAULT_CONTEXT_LIMIT = 100
 DEFAULT_SYSTEM_PROMPT = "Ты — умный и полезный ИИ-ассистент. Отвечай четко, по делу и на русском языке."
 
@@ -524,7 +524,7 @@ def send_typing_action(chat_id, business_id=None):
 # --- ИНСТРУМЕНТ: ПОИСК В ИНТЕРНЕТЕ ---
 def perform_web_search(query, max_results=5):
     """
-    Выполняет поиск в интернете через DuckDuckGo HTML и Wikipedia.
+    Выполняет быстрый поиск в интернете через DuckDuckGo Lite и Wikipedia API.
     Возвращает список результатов: [{'title': ..., 'snippet': ..., 'url': ...}]
     """
     clean_q = (query or '').strip()
@@ -532,40 +532,35 @@ def perform_web_search(query, max_results=5):
         return []
 
     results = []
-    # 1. DuckDuckGo HTML
+    # 1. DuckDuckGo Lite (быстрый, не блокируется, возвращает реальные результаты)
     try:
-        url = 'https://html.duckduckgo.com/html/'
+        url = 'https://lite.duckduckgo.com/lite/'
         data = urllib.parse.urlencode({'q': clean_q}).encode('utf-8')
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         req = urllib.request.Request(url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=9) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             html_text = resp.read().decode('utf-8', errors='ignore')
 
-        titles = re.findall(r'<a[^>]+class=[\"\'\s]*result__a[\"\'\s]*[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', html_text, re.DOTALL)
-        snippets = re.findall(r'<a[^>]+class=[\"\'\s]*result__snippet[\"\'\s]*[^>]*>(.*?)</a>', html_text, re.DOTALL)
-
-        for i in range(min(len(titles), len(snippets), max_results)):
-            link = titles[i][0]
-            if 'uddg=' in link:
-                m = re.search(r'uddg=([^&]+)', link)
-                if m:
-                    link = urllib.parse.unquote(m.group(1))
-            title_text = re.sub(r'<[^>]+>', '', titles[i][1]).strip()
-            snippet_text = re.sub(r'<[^>]+>', '', snippets[i]).strip()
-            if title_text and snippet_text:
-                results.append({'title': title_text, 'snippet': snippet_text, 'url': link})
+        snippets = re.findall(r'<td class=[\'"]result-snippet[\'"]>(.*?)</td>', html_text, re.DOTALL)
+        links = re.findall(r'<a rel=[\'"]nofollow[\'"][^>]*href=[\'"]([^"\']+)[\'"][^>]*>(.*?)</a>', html_text, re.DOTALL)
+        for i in range(min(len(links), max_results)):
+            url_target = links[i][0]
+            title = html.unescape(re.sub(r'<[^>]+>', '', links[i][1])).strip()
+            snip = html.unescape(re.sub(r'<[^>]+>', '', snippets[i])).strip() if i < len(snippets) else ''
+            if title and url_target.startswith('http'):
+                results.append({'title': title, 'snippet': snip, 'url': url_target})
     except Exception as e:
-        print(f"⚠️ Ошибка поиска DuckDuckGo: {e}")
+        print(f"⚠️ Ошибка поиска DuckDuckGo Lite: {e}")
 
     # 2. Wikipedia API fallback
     if len(results) < 2:
         try:
             wiki_url = f"https://ru.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(clean_q)}&limit=3&namespace=0&format=json"
             w_req = urllib.request.Request(wiki_url, headers={'User-Agent': 'TgishkaBot/1.0'})
-            with urllib.request.urlopen(w_req, timeout=5) as r:
+            with urllib.request.urlopen(w_req, timeout=4) as r:
                 w_data = json.loads(r.read())
                 w_titles = w_data[1]
                 w_snippets = w_data[2]
@@ -1600,30 +1595,46 @@ def trigger_buffered_auto_reply(chat_id, message):
     PENDING_AUTO_REPLY[chat_id] = {'timer': timer}
     timer.start()
 
-# --- РИСОВАНИЕ (СТРОГО GEMINI IMAGEN) ---
-def generate_image(prompt):
+# --- РИСОВАНИЕ И РЕДАКТИРОВАНИЕ КАРТИНОК (NANO BANANA / ANTIGRAVITY) ---
+def generate_image(prompt, input_image_bytes=None):
     clean_p = (prompt or '').strip()
     if not clean_p:
         return None, "Укажите описание картинки, например: <code>нарисуй кота в космосе</code>"
 
+    # 1. Основной локальный движок Antigravity (image-generator / Nano Banana)
+    try:
+        import antigravity_bridge
+        img_bytes, err = antigravity_bridge.generate_antigravity_image(clean_p, input_image_bytes=input_image_bytes)
+        if img_bytes and len(img_bytes) > 2000:
+            return img_bytes, None
+        if err:
+            print(f"⚠️ Antigravity Image Generator: {err}")
+    except Exception as e:
+        print(f"⚠️ Ошибка Antigravity image generator: {e}")
+
+    # 2. Запасной облачный вариант (Google AI Studio Nano Banana API)
     if not GEMINI_KEYS:
-        return None, "Не найдено ключей Gemini для генерации изображений."
+        return None, "Не удалось сгенерировать изображение (локальный движок не ответил)."
 
     model = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
-    if not model or 'imagen' not in model and 'image' not in model:
+    if not model or 'image' not in model:
         model = DEFAULT_IMAGE_MODEL
-        CONFIG['image_model'] = DEFAULT_IMAGE_MODEL
-        save_config()
 
-    url = f"{GEMINI_API_BASE}/models/{model}:predict" if 'imagen' in model else f"{GEMINI_API_BASE}/models/{model}:generateContent"
-    payload = {"instances": [{"prompt": clean_p}], "parameters": {"sampleCount": 1}} if 'imagen' in model else \
-              {"contents": [{"role": "user", "parts": [{"text": clean_p}]}], "generationConfig": {"responseModalities": ["IMAGE"]}}
+    url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
+    parts = []
+    if input_image_bytes:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(input_image_bytes).decode('utf-8')}})
+    parts.append({"text": clean_p})
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"responseModalities": ["IMAGE"]}
+    }
 
     last_err = "Неизвестная ошибка"
     s = get_http_session()
     for key_idx, api_key in enumerate(GEMINI_KEYS):
         try:
-            r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 30))
+            r = s.post(url, headers=get_gemini_headers(api_key), json=payload, timeout=(4, 40))
             if r.status_code == 429:
                 last_err = f"Лимит (429) на ключе #{key_idx + 1}"
                 continue
@@ -1632,19 +1643,15 @@ def generate_image(prompt):
                 continue
 
             data = r.json()
-            if 'imagen' in model:
-                if 'predictions' in data and data['predictions']:
-                    return base64.b64decode(data['predictions'][0]['bytesBase64Encoded']), None
-            else:
-                if 'candidates' in data and data['candidates']:
-                    for part in data['candidates'][0]['content']['parts']:
-                        if 'inline_data' in part:
-                            return base64.b64decode(part['inline_data']['data']), None
+            if 'candidates' in data and data['candidates']:
+                for part in data['candidates'][0].get('content', {}).get('parts', []):
+                    if 'inline_data' in part:
+                        return base64.b64decode(part['inline_data']['data']), None
             last_err = "Модель не вернула изображение."
         except Exception as e:
             last_err = str(e)
 
-    return None, f"Ошибка Gemini Imagen ({last_err}). Повторите через несколько секунд."
+    return None, f"Ошибка Nano Banana ({last_err}). Повторите через минуту."
 
 def animate_loading(chat_id, message_id, stop_event, business_id=None, text_prefix="Думаю...", reply_markup=None):
     emojis = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
@@ -2234,15 +2241,24 @@ def handle_admin_text(message):
         bot.reply_to(message, f"🧹 Память во всех чатах (у тебя и у собеседников) полностью очищена!\ncontext: 0/{CONFIG.get('context_limit', 100)}")
         return
 
-    if text.startswith('нарисуй ') or text.startswith('фото ') or text.startswith('арт ') or text.startswith('картинка ') or text.startswith('/img '):
+    draw_prefixes = ('нарисуй ', 'фото ', 'арт ', 'картинка ', '/img ', 'измени ', 'перерисуй ', 'добавь ')
+    if any(text.startswith(p) for p in draw_prefixes):
         if not check_cooldown(chat_id):
             bot.reply_to(message, "жди пока первый запрос загрузится нищук")
             return
-        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img)\s+', '', raw_text, flags=re.IGNORECASE).strip()
-        loading_msg = bot.reply_to(message, "🕐 Рисую...")
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img|измени|перерисуй|добавь)\s+', '', raw_text, flags=re.IGNORECASE).strip()
+
+        input_image_bytes = None
+        if message.reply_to_message and message.reply_to_message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message.reply_to_message)
+        elif message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message)
+
+        action_label = "Редактирую фото..." if input_image_bytes else "Рисую..."
+        loading_msg = bot.reply_to(message, f"🕐 {action_label}")
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую..."), daemon=True).start()
-        img, err = generate_image(img_prompt)
+        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, action_label), daemon=True).start()
+        img, err = generate_image(img_prompt, input_image_bytes=input_image_bytes)
         stop_event.set()
         if img:
             try:
@@ -2327,13 +2343,22 @@ def handle_authorized_user_private(message):
         handle_web_search(chat_id, query, message, business_id=None)
         return
 
-    # 2. Рисование картинок
-    if lower_text.startswith('нарисуй ') or lower_text.startswith('фото ') or lower_text.startswith('арт ') or lower_text.startswith('/img '):
-        img_prompt = re.sub(r'^(нарисуй|фото|арт|/img)\s+', '', text, flags=re.IGNORECASE).strip()
-        loading_msg = bot.reply_to(message, "🕐 Рисую...")
+    # 2. Рисование и редактирование картинок
+    draw_prefixes = ('нарисуй ', 'фото ', 'арт ', 'картинка ', '/img ', 'измени ', 'перерисуй ', 'добавь ')
+    if any(lower_text.startswith(p) for p in draw_prefixes):
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img|измени|перерисуй|добавь)\s+', '', text, flags=re.IGNORECASE).strip()
+
+        input_image_bytes = None
+        if message.reply_to_message and message.reply_to_message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message.reply_to_message)
+        elif message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message)
+
+        action_label = "Редактирую фото..." if input_image_bytes else "Рисую..."
+        loading_msg = bot.reply_to(message, f"🕐 {action_label}")
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, "Рисую..."), daemon=True).start()
-        img, err = generate_image(img_prompt)
+        threading.Thread(target=animate_loading, args=(chat_id, loading_msg.message_id, stop_event, None, action_label), daemon=True).start()
+        img, err = generate_image(img_prompt, input_image_bytes=input_image_bytes)
         stop_event.set()
         if img:
             try:
@@ -2523,13 +2548,26 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_img_models':
-        image_models = ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']
+        models_info = [
+            ('gemini-2.5-flash-image', '🍌 Nano Banana (Быстрая 2.5)'),
+            ('gemini-3.1-flash-image', '🍌 Nano Banana 2 (Детали 3.1)'),
+            ('gemini-3-pro-image', '🍌 Nano Banana Pro (Максимум)')
+        ]
+        cur_img_m = CONFIG.get('image_model', DEFAULT_IMAGE_MODEL)
         kb = InlineKeyboardMarkup(row_width=1)
-        for m in image_models:
-            mark = "✅ " if m == CONFIG.get('image_model') else ""
-            kb.add(InlineKeyboardButton(f"{mark}{m}", callback_data=f"setimg_{m}"))
+        for m_id, label in models_info:
+            mark = "✅ " if m_id == cur_img_m else ""
+            kb.add(InlineKeyboardButton(f"{mark}{label}", callback_data=f"setimg_{m_id}"))
         kb.add(InlineKeyboardButton("🔙 Назад в панель", callback_data="panel_refresh"))
-        safe_edit_message("🎨 <b>Выбери модель рисования:</b>", chat_id, msg_id, reply_markup=kb)
+        safe_edit_message(
+            "🎨 <b>Движок рисования и изменения фото (Nano Banana):</b>\n\n"
+            "• Генерация и редактирование фото работают через локальный движок Antigravity на телефоне.\n"
+            "• Без сторонних сервисов и без лимитов ключей.\n"
+            "• Поддерживает команды <code>нарисуй ...</code> и <code>измени ...</code> в ответ на фото.",
+            chat_id,
+            msg_id,
+            reply_markup=kb
+        )
         bot.answer_callback_query(call.id)
 
     elif data == 'panel_show_lists':
@@ -2811,7 +2849,8 @@ def handle_business_message(message):
 
     # 4. ЗАПИСЬ В ИСТОРИЮ ЧАТА С РОЛЬЮ АВТОРА
     is_gpt = lower_text.startswith('гпт ') or lower_text == 'гпт'
-    is_draw = lower_text.startswith('нарисуй ') or lower_text.startswith('фото ') or lower_text.startswith('арт ') or lower_text.startswith('картинка ') or lower_text.startswith('/img ')
+    draw_prefixes = ('нарисуй ', 'фото ', 'арт ', 'картинка ', '/img ', 'измени ', 'перерисуй ', 'добавь ')
+    is_draw = any(lower_text.startswith(p) for p in draw_prefixes)
     clean_for_log = text[4:].strip() if is_gpt else text
     record_chat_log(message, is_owner, custom_text=clean_for_log, add_to_memory=not (is_gpt or is_draw or is_reply_to_any_bot))
 
@@ -2868,12 +2907,19 @@ def handle_business_message(message):
         text = text[4:].strip()
 
     if is_draw:
-        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img)\s+', '', text, flags=re.IGNORECASE).strip()
-        msg = bot.send_message(chat_id, "🕐 Рисую...", business_connection_id=message.business_connection_id)
+        img_prompt = re.sub(r'^(нарисуй|фото|арт|картинка|/img|измени|перерисуй|добавь)\s+', '', text, flags=re.IGNORECASE).strip()
+        input_image_bytes = None
+        if message.reply_to_message and message.reply_to_message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message.reply_to_message)
+        elif message.content_type == 'photo':
+            input_image_bytes, _ = get_photo_bytes(message)
+
+        action_label = "Редактирую фото..." if input_image_bytes else "Рисую..."
+        msg = bot.send_message(chat_id, f"🕐 {action_label}", business_connection_id=message.business_connection_id)
         BOT_GPT_MESSAGES.add(msg.message_id)
         stop_event = threading.Event()
-        threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, "Рисую..."), daemon=True).start()
-        img, err = generate_image(img_prompt)
+        threading.Thread(target=animate_loading, args=(chat_id, msg.message_id, stop_event, message.business_connection_id, action_label), daemon=True).start()
+        img, err = generate_image(img_prompt, input_image_bytes=input_image_bytes)
         stop_event.set()
         if img:
             try:

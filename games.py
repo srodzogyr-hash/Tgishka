@@ -270,10 +270,10 @@ def _enhanced_build_panel_view():
 main.build_panel_view = _enhanced_build_panel_view
 
 # =====================================================================
-# 🎨 1. РИСОВАНИЕ (СТРОГО GEMINI IMAGEN)
+# 🎨 1. РИСОВАНИЕ И РЕДАКТИРОВАНИЕ (NANO BANANA / ANTIGRAVITY)
 # =====================================================================
-if CONFIG.get('image_model') not in ['imagen-3.0-generate-001', 'gemini-2.5-flash-image', 'gemini-3.1-flash-image']:
-    CONFIG['image_model'] = 'imagen-3.0-generate-001'
+if CONFIG.get('image_model') not in ['gemini-2.5-flash-image', 'gemini-3.1-flash-image', 'gemini-3-pro-image']:
+    CONFIG['image_model'] = 'gemini-2.5-flash-image'
 
 # =====================================================================
 # 🏆 2. ДОЛГОСРОЧНАЯ РПГ-ПРОГРЕССИЯ (ЭКСПОНЕНЦИАЛЬНЫЙ XP, 30 ЗВАНИЙ, 12 АРТЕФАКТОВ, ПРЕСТИЖ)
